@@ -304,6 +304,21 @@ pub(crate) fn detach_wait_mode_bash(
 
 fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
     let output = format_foreground_result(&snapshot);
+    if snapshot.sandbox_native
+        && snapshot.sandbox_unavailable
+        && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
+    {
+        return Response::error_with_data(
+            request_id,
+            "sandbox_unavailable",
+            "native sandbox failed before the command could run; set sandbox.enabled=false to disable native sandboxing",
+            json!({
+                "task_id": snapshot.info.task_id,
+                "exit_code": snapshot.exit_code,
+                "output": output,
+            }),
+        );
+    }
     let timed_out = snapshot.info.status == BgTaskStatus::TimedOut;
     Response::success(
         request_id,
@@ -423,7 +438,62 @@ mod tests {
             pty_rows: None,
             pty_cols: None,
             pty_screen: None,
+            scanner_report: Vec::new(),
+            sandbox_native: false,
+            sandbox_unavailable: false,
         }
+    }
+
+    #[test]
+    fn native_launcher_exit_78_is_a_structured_sandbox_error() {
+        let mut snapshot = snapshot(
+            "sandbox_unavailable: backend failed",
+            false,
+            None,
+            BgTaskStatus::Failed,
+            Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE),
+        );
+        snapshot.sandbox_native = true;
+        snapshot.sandbox_unavailable = true;
+
+        let response = foreground_result_response("sandbox-failed", snapshot);
+        assert!(!response.success);
+        assert_eq!(
+            response
+                .data
+                .get("code")
+                .and_then(serde_json::Value::as_str),
+            Some("sandbox_unavailable")
+        );
+        assert!(response
+            .data
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("sandbox.enabled=false")));
+    }
+
+    #[test]
+    fn native_command_exit_78_is_not_misreported_as_launcher_failure() {
+        let mut snapshot = snapshot(
+            "command selected exit 78",
+            false,
+            None,
+            BgTaskStatus::Failed,
+            Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE),
+        );
+        snapshot.sandbox_native = true;
+
+        let response = foreground_result_response("command-exit-78", snapshot);
+        assert!(response.success);
+        assert_eq!(
+            response
+                .data
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64),
+            Some(i64::from(
+                crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE
+            ))
+        );
     }
 
     #[test]

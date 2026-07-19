@@ -1,0 +1,11 @@
+{
+  "sandbox": {
+    "enabled": false,
+    "write_allow": [
+      "/tmp/aft-sandbox-project-write"
+    ],
+    "read_deny": [
+      "/tmp/aft-sandbox-project-secret"
+    ]
+  }
+}

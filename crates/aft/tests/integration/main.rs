@@ -90,6 +90,7 @@ mod query_shape_test;
 mod r_test;
 mod root_keyed_adversarial_test;
 mod safety_test;
+mod sandbox_native_test;
 mod score_floor_drop_test;
 mod search_index_warm_restart_test;
 mod security_test;

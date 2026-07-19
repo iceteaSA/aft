@@ -162,6 +162,33 @@ const CASES: ParityCase[] = [
     project: { bridge: { request_timeout_ms: 1000 } },
   },
   {
+    name: "sandbox_user_policy",
+    user: {
+      sandbox: {
+        enabled: true,
+        write_allow: ["/tmp/aft-sandbox-write"],
+        read_deny: ["/tmp/aft-sandbox-user-secret"],
+      },
+    },
+  },
+  {
+    name: "sandbox_project_deny_only",
+    user: {
+      sandbox: {
+        enabled: true,
+        write_allow: ["/tmp/aft-sandbox-write"],
+        read_deny: ["/tmp/aft-sandbox-user-secret"],
+      },
+    },
+    project: {
+      sandbox: {
+        enabled: false,
+        write_allow: ["/tmp/aft-sandbox-project-write"],
+        read_deny: ["/tmp/aft-sandbox-project-secret"],
+      },
+    },
+  },
+  {
     name: "drop_semantic_backend",
     user: {
       semantic: {

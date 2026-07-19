@@ -12,10 +12,12 @@ pub mod registry;
 pub mod watchdog;
 pub mod watches;
 
+use crate::bash_permissions::PermissionAsk;
 use crate::context::AppContext;
 use crate::protocol::Response;
 use crate::sandbox_spawn::{
-    current_authenticated_principal, resolve_sandbox_spawn, RequestedSandboxTier, SandboxTaskKind,
+    current_authenticated_principal, native_sandbox_enforced, resolve_sandbox_spawn,
+    RequestedSandboxTier, SandboxTaskKind,
 };
 use persistence::BgMode;
 use serde::{Deserialize, Serialize};
@@ -76,6 +78,7 @@ pub fn spawn(
     pty: bool,
     pty_rows: u16,
     pty_cols: u16,
+    scanner_report: Vec<PermissionAsk>,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -117,16 +120,36 @@ pub fn spawn(
         SandboxTaskKind::BashForeground
     };
     let principal = current_authenticated_principal();
+    let requested_tier = if ctx.config().sandbox.enabled {
+        RequestedSandboxTier::Native
+    } else {
+        RequestedSandboxTier::Disabled
+    };
+    let task_bundle_dir = persistence::session_tasks_dir(&storage_dir, session_id);
+    if native_sandbox_enforced(ctx, &principal) {
+        if let Err(error) = std::fs::create_dir_all(&task_bundle_dir) {
+            return Response::error(
+                request_id,
+                "sandbox_unavailable",
+                format!(
+                    "native sandbox failed to create the task artifact directory: {error}; set sandbox.enabled=false to disable native sandboxing"
+                ),
+            );
+        }
+    }
     let spawn_plan =
-        resolve_sandbox_spawn(ctx, &principal, RequestedSandboxTier::Disabled, task_kind);
+        resolve_sandbox_spawn(ctx, &principal, requested_tier, task_kind, &task_bundle_dir);
     if let Some(code) = spawn_plan.refusal_code() {
         return Response::error(
             request_id,
             code,
-            format!("bash process creation refused by sandbox policy: {code}"),
+            spawn_plan
+                .refusal_message()
+                .unwrap_or("bash process creation refused by sandbox policy"),
         );
     }
 
+    let cleanup_plan = spawn_plan.clone();
     let spawn_result = if pty {
         ctx.bash_background().spawn_pty(
             spawn_plan,
@@ -160,18 +183,40 @@ pub fn spawn(
     };
 
     match spawn_result {
-        Ok(task_id) => Response::success(
-            request_id,
-            json!({
-                "task_id": task_id,
-                "status": BgTaskStatus::Running,
-                "mode": if pty { "pty" } else { "pipes" },
-            }),
-        ),
+        Ok(task_id) => {
+            if let Err(error) =
+                ctx.bash_background()
+                    .record_scanner_report(&task_id, session_id, scanner_report)
+            {
+                crate::slog_warn!("{error}");
+            }
+            Response::success(
+                request_id,
+                json!({
+                    "task_id": task_id,
+                    "status": BgTaskStatus::Running,
+                    "mode": if pty { "pty" } else { "pipes" },
+                }),
+            )
+        }
         Err(message) if message.contains("limit exceeded") => {
+            cleanup_plan.cleanup_unspawned();
             Response::error(request_id, "background_task_limit_exceeded", message)
         }
-        Err(message) => Response::error(request_id, "execution_failed", message),
+        Err(message) => {
+            cleanup_plan.cleanup_unspawned();
+            if cleanup_plan.is_native_launcher() {
+                Response::error(
+                    request_id,
+                    "sandbox_unavailable",
+                    format!(
+                        "native sandbox failed before command execution: {message}; set sandbox.enabled=false to disable native sandboxing"
+                    ),
+                )
+            } else {
+                Response::error(request_id, "execution_failed", message)
+            }
+        }
     }
 }
 

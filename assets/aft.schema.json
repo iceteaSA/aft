@@ -212,6 +212,34 @@
       },
       "additionalProperties": false
     },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable native macOS/Linux containment for first-party bash and PTY processes. User-scoped only; project config cannot enable or disable it."
+        },
+        "write_allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional absolute writable directories. User-scoped only; project config cannot add write access."
+        },
+        "read_deny": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional absolute paths sandboxed commands may not read. Project config may add deny entries but cannot remove user or built-in entries."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Native sandbox policy for first-party bash commands. Disabled by default during staged rollout."
+    },
     "bash": {
       "oneOf": [
         {

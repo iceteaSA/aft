@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::bash_permissions::PermissionAsk;
 use crate::compress::caps::DropClass;
 use crate::compress::CompressionResult;
 use crate::context::SharedProgressSender;
@@ -114,6 +115,12 @@ pub struct BgTaskSnapshot {
     pub pty_cols: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pty_screen: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scanner_report: Vec<PermissionAsk>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_native: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -648,6 +655,30 @@ impl BgTaskRegistry {
         }
     }
 
+    pub fn record_scanner_report(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        scanner_report: Vec<PermissionAsk>,
+    ) -> Result<(), String> {
+        if scanner_report.is_empty() {
+            return Ok(());
+        }
+        let task = self.task_for_session(task_id, session_id).ok_or_else(|| {
+            "background task not found while recording scanner report".to_string()
+        })?;
+        let metadata = {
+            let mut state = task
+                .state
+                .lock()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            state.metadata.scanner_report = scanner_report;
+            state.metadata.clone()
+        };
+        self.persist_task(&task.paths, &metadata)
+            .map_err(|error| format!("failed to persist scanner report: {error}"))
+    }
+
     pub fn configure_long_running_reminders(&self, enabled: bool, interval_ms: u64) {
         self.inner
             .long_running_reminder_enabled
@@ -699,6 +730,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        attach_sandbox_metadata(&mut metadata, &spawn_plan);
         self.persist_task(&paths, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
 
@@ -795,6 +827,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
         metadata.pty_cols = Some(cols);
@@ -904,6 +937,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        attach_sandbox_metadata(&mut metadata, &spawn_plan);
         self.persist_task(&paths, &metadata)
             .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
 
@@ -3846,6 +3880,10 @@ impl BgTask {
             pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
             pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
             pty_screen: None,
+            scanner_report: metadata.scanner_report.clone(),
+            sandbox_native: metadata.sandbox_native,
+            sandbox_unavailable: metadata.sandbox_native
+                && self.paths.sandbox_unavailable.is_file(),
         }
     }
 
@@ -3963,6 +4001,11 @@ fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i32> {
     }
 }
 
+fn attach_sandbox_metadata(metadata: &mut PersistedTask, spawn_plan: &SpawnPlan) {
+    metadata.sandbox_native = spawn_plan.is_native_launcher();
+    metadata.sandbox_temp_dir = spawn_plan.temp_dir().map(Path::to_path_buf);
+}
+
 #[cfg(unix)]
 fn write_unix_command_script(command: &str, paths: &TaskPaths) -> Result<PathBuf, String> {
     let stem = paths
@@ -4001,6 +4044,7 @@ fn detached_shell_command(
         shell.as_os_str(),
         &args,
         &paths.json,
+        exit_path,
     )?;
     unsafe {
         cmd.pre_exec(|| {
@@ -4141,12 +4185,15 @@ fn spawn_detached_child(
         let stderr = create_capture_file(&paths.stderr)
             .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
         let command_script = write_unix_command_script(command, paths)?;
-        detached_shell_command(spawn_plan, &command_script, &paths.exit, paths)?
+        let mut command = detached_shell_command(spawn_plan, &command_script, &paths.exit, paths)?;
+        command
             .current_dir(workdir)
             .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut command);
+        command
             .spawn()
             .map_err(|e| format!("failed to spawn background bash command: {e}"))
     }
@@ -4155,7 +4202,7 @@ fn spawn_detached_child(
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
             SpawnPlan::Unsandboxed => {}
-            SpawnPlan::Refused { code } => return Err((*code).to_string()),
+            SpawnPlan::Refused { code, .. } => return Err((*code).to_string()),
             SpawnPlan::Launcher { .. } => return Err("sandbox_unavailable".to_string()),
         }
         // Spawn priority: pwsh → powershell → git-bash → cmd. Same as the

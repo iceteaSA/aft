@@ -60,7 +60,23 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     ) {
         Some(mut snapshot) => {
             maybe_render_pty_screen(&mut snapshot, output_mode.as_deref());
-            Response::success(&req.id, json!(snapshot))
+            if snapshot.sandbox_native
+                && snapshot.sandbox_unavailable
+                && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
+            {
+                Response::error_with_data(
+                    &req.id,
+                    "sandbox_unavailable",
+                    "native sandbox failed before the command could run; set sandbox.enabled=false to disable native sandboxing",
+                    json!({
+                        "task_id": snapshot.info.task_id,
+                        "exit_code": snapshot.exit_code,
+                        "output_preview": snapshot.output_preview,
+                    }),
+                )
+            } else {
+                Response::success(&req.id, json!(snapshot))
+            }
         }
         None => Response::error(
             &req.id,

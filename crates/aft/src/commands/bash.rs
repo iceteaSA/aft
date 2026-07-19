@@ -125,12 +125,16 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .workdir
         .clone()
         .unwrap_or_else(|| default_workdir(ctx));
-    let permission_asks = if params.permissions_requested || ctx.config().bash_permissions {
-        crate::bash_permissions::scan::scan_with_cwd(&params.command, ctx, &workdir)
-    } else {
-        Vec::new()
-    };
-    if !permission_asks.is_empty()
+    let principal = crate::sandbox_spawn::current_authenticated_principal();
+    let native_report_only = crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal);
+    let permission_asks =
+        if native_report_only || params.permissions_requested || ctx.config().bash_permissions {
+            crate::bash_permissions::scan::scan_with_cwd(&params.command, ctx, &workdir)
+        } else {
+            Vec::new()
+        };
+    if !native_report_only
+        && !permission_asks.is_empty()
         && !permissions_granted_cover(&permission_asks, &params.permissions_granted)
     {
         return Response::error_with_data(
@@ -178,6 +182,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .pty_cols
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_PTY_COLS);
+    let scanner_report = native_report_only
+        .then_some(permission_asks)
+        .unwrap_or_default();
     crate::bash_background::spawn(
         &req.id,
         req.session(),
@@ -192,6 +199,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         params.pty,
         pty_rows,
         pty_cols,
+        scanner_report,
     )
 }
 
@@ -721,10 +729,13 @@ mod tests {
             r#"#!/bin/sh
 printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
 mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
-[ "$1" = "--profile-fd" ] || exit 91
-[ "$2" = "9" ] || exit 92
-[ "$3" = "--" ] || exit 93
-shift 3
+[ "$1" = "sandbox-launch" ] || exit 91
+[ "$2" = "--profile-file" ] || exit 92
+[ -f "$3" ] || exit 93
+[ "$4" = "--failure-marker" ] || exit 94
+[ "$6" = "--" ] || exit 95
+rm -f -- "$3"
+shift 6
 exec "$@"
 "#,
         )
@@ -770,9 +781,81 @@ exec "$@"
         let args = fs::read_to_string(&args_log).unwrap();
         let lines: Vec<&str> = args.lines().collect();
         assert_eq!(lines[0], launcher.to_string_lossy());
-        assert_eq!(&lines[1..4], &["--profile-fd", "9", "--"]);
-        assert!(lines.len() >= 6, "wrapped argv missing target: {lines:?}");
+        assert_eq!(lines[1], "sandbox-launch");
+        assert_eq!(lines[2], "--profile-file");
+        assert!(lines[3].ends_with(".sandbox-profile.json"));
+        assert_eq!(lines[4], "--failure-marker");
+        assert!(lines[5].ends_with(".sandbox-unavailable"));
+        assert_eq!(lines[6], "--");
+        assert!(lines.len() >= 9, "wrapped argv missing target: {lines:?}");
 
         stop_spawned_test_task(&ctx, &response);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_exit_78_is_persisted_for_structured_error_mapping() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        use crate::sandbox_profile::SandboxProfile;
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let launcher = project.path().join("unavailable-sandbox-launcher.sh");
+        fs::write(
+            &launcher,
+            "#!/bin/sh\necho 'sandbox_unavailable: test backend failed' >&2\nexit 78\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&launcher, permissions).unwrap();
+
+        let profile = SandboxProfile::build(
+            vec![project.path().to_path_buf()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            storage.path().to_path_buf(),
+        )
+        .unwrap();
+        let plan = SpawnPlan::launcher_for_test(profile, launcher);
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let request = spawn_test_request("sandbox-unavailable", "echo never-runs", false);
+        let response = with_spawn_plan_for_test(plan, || handle(&request, &ctx));
+        assert!(response.success, "launcher spawn failed: {response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+
+        let started = Instant::now();
+        loop {
+            let snapshot = ctx
+                .bash_background()
+                .status(
+                    task_id,
+                    "sandbox-spawn-test",
+                    Some(project.path()),
+                    Some(storage.path()),
+                    4096,
+                )
+                .expect("sandbox task status");
+            if snapshot.info.status.is_terminal() {
+                assert_eq!(
+                    snapshot.exit_code,
+                    Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
+                );
+                assert!(snapshot.output_preview.contains("sandbox_unavailable:"));
+                assert!(snapshot.sandbox_unavailable);
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "launcher failure was not persisted: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

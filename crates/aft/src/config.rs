@@ -140,6 +140,17 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Route first-party bash commands through the native platform sandbox.
+    pub enabled: bool,
+    /// User-approved writable roots in addition to projects, task artifacts, and caches.
+    pub write_allow: Vec<PathBuf>,
+    /// Extra paths that native backends should deny reading.
+    pub read_deny: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -202,6 +213,8 @@ pub struct Config {
     pub foreground_wait_window_ms: u64,
     /// Enable OpenCode-style bash permission prompts (default: false).
     pub bash_permissions: bool,
+    /// Native sandbox policy for first-party bash and PTY processes.
+    pub sandbox: SandboxConfig,
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
     pub semantic: SemanticBackendConfig,
@@ -285,6 +298,7 @@ impl Default for Config {
             bash_long_running_reminder_interval_ms: 600_000,
             foreground_wait_window_ms: default_foreground_wait_window_ms(),
             bash_permissions: false,
+            sandbox: SandboxConfig::default(),
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             inspect: InspectConfig::default(),

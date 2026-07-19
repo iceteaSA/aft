@@ -6,11 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::backup::hash_session;
+use crate::bash_permissions::PermissionAsk;
 use crate::db::bash_tasks::BashTaskRow;
 
 use super::BgTaskStatus;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct TaskPaths {
@@ -20,6 +21,7 @@ pub struct TaskPaths {
     pub stderr: PathBuf,
     pub exit: PathBuf,
     pub pty: PathBuf,
+    pub sandbox_unavailable: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -62,6 +64,15 @@ pub struct PersistedTask {
     pub pty_rows: Option<u16>,
     #[serde(default)]
     pub pty_cols: Option<u16>,
+    /// Dangerous-command findings retained when native containment replaces prompts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scanner_report: Vec<PermissionAsk>,
+    /// True when this task was launched through the native sandbox.
+    #[serde(default)]
+    pub sandbox_native: bool,
+    /// Private per-task temp directory created as part of the native profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_temp_dir: Option<PathBuf>,
     pub status_reason: Option<String>,
 }
 
@@ -111,6 +122,9 @@ impl PersistedTask {
             compressed,
             pty_rows: None,
             pty_cols: None,
+            scanner_report: Vec::new(),
+            sandbox_native: false,
+            sandbox_temp_dir: None,
             status_reason: None,
         }
     }
@@ -222,6 +236,9 @@ impl From<BashTaskRow> for PersistedTask {
             compressed: row.compressed,
             pty_rows: None,
             pty_cols: None,
+            scanner_report: Vec::new(),
+            sandbox_native: false,
+            sandbox_temp_dir: None,
             status_reason: None,
         }
     }
@@ -292,6 +309,7 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPa
         stderr: dir.join(format!("{task_id}.stderr")),
         exit: dir.join(format!("{task_id}.exit")),
         pty: dir.join(format!("{task_id}.pty")),
+        sandbox_unavailable: dir.join(format!("{task_id}.sandbox-unavailable")),
         dir,
     }
 }
@@ -299,11 +317,11 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> TaskPa
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     let content = fs::read_to_string(path)?;
     let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
-    if !matches!(task.schema_version, 2 | 3 | SCHEMA_VERSION) {
+    if !matches!(task.schema_version, 2 | 3 | 4 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported background task schema_version {} (expected 2, 3, or {SCHEMA_VERSION})",
+                "unsupported background task schema_version {} (expected 2, 3, 4, or {SCHEMA_VERSION})",
                 task.schema_version
             ),
         ));
@@ -322,7 +340,28 @@ pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {
 }
 
 pub(super) fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
+    let managed_temp_dir = read_task(&paths.json)
+        .ok()
+        .and_then(|task| task.sandbox_temp_dir)
+        .filter(|path| {
+            crate::sandbox_spawn::is_managed_task_temp_dir(path)
+                && path.parent().is_some_and(|parent| {
+                    let canonical_dir = paths
+                        .dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| paths.dir.clone());
+                    parent == canonical_dir
+                })
+        });
+
     let mut first_error = None;
+    if let Some(temp_dir) = managed_temp_dir {
+        if let Err(error) = fs::remove_dir_all(temp_dir) {
+            if error.kind() != io::ErrorKind::NotFound {
+                first_error = Some(error);
+            }
+        }
+    }
     for path in task_bundle_files(paths) {
         if let Err(error) = remove_file_if_present(&path) {
             if first_error.is_none() {
@@ -350,6 +389,7 @@ pub fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
         paths.stderr.clone(),
         paths.exit.clone(),
         paths.pty.clone(),
+        paths.sandbox_unavailable.clone(),
     ];
     if let Some(stem) = paths.json.file_stem().and_then(|stem| stem.to_str()) {
         // Background bash writes per-task wrapper/command scripts next to the

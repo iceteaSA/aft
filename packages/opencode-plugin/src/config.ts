@@ -183,6 +183,15 @@ const BashFeaturesSchema = z.object({
 
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
+const SandboxConfigSchema = z.object({
+  /** Enable native containment for first-party bash and PTY processes. Default: false. */
+  enabled: z.boolean().optional(),
+  /** Additional absolute directories where sandboxed commands may write. User config only. */
+  write_allow: z.array(z.string()).optional(),
+  /** Additional absolute paths sandboxed commands may not read. Project config may add entries. */
+  read_deny: z.array(z.string()).optional(),
+});
+
 const BridgeConfigSchema = z.object({
   /**
    * Per-request bridge transport timeout in milliseconds. Default: 30000.
@@ -329,6 +338,8 @@ export const AftConfigSchema = z.preprocess(
       inspect: InspectConfigSchema.optional(),
       /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
       backup: BackupConfigSchema.optional(),
+      /** Native first-party bash sandbox. Enabling and write allowances are user-only. */
+      sandbox: SandboxConfigSchema.optional(),
       /**
        * Bash tool family (hoist + rewrite + compress + background execution).
        * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
@@ -498,6 +509,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.backup !== undefined) overrides.backup = config.backup;
+  if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
 
   return overrides;
 }
@@ -1153,6 +1165,18 @@ function mergeInspectConfig(
  * Returns whatever shape best represents the merged state — the resolver
  * (`resolveBashConfig`) handles all three shapes downstream.
  */
+function mergeSandboxConfig(
+  base: AftConfig["sandbox"],
+  project: AftConfig["sandbox"],
+): AftConfig["sandbox"] {
+  const readDeny = [...new Set([...(base?.read_deny ?? []), ...(project?.read_deny ?? [])])];
+  const merged = {
+    ...base,
+    ...(readDeny.length > 0 ? { read_deny: readDeny } : {}),
+  };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
 function mergeBashConfig(
   baseBash: AftConfig["bash"],
   overrideBash: AftConfig["bash"],
@@ -1278,6 +1302,8 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.auto_update !== undefined) stripped.push("auto_update");
   if (override.bridge !== undefined) stripped.push("bridge");
   if (override.backup !== undefined) stripped.push("backup");
+  if (override.sandbox?.enabled !== undefined) stripped.push("sandbox.enabled");
+  if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
@@ -1299,6 +1325,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
+  const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
   const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
@@ -1318,6 +1345,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(lsp ? { lsp } : {}),
     ...(bash !== undefined ? { bash } : {}),
     ...(inspect !== undefined ? { inspect } : {}),
+    ...(sandbox !== undefined ? { sandbox } : {}),
     experimental,
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.

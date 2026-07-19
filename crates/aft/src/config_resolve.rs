@@ -6,14 +6,15 @@
 //! read config documents.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use serde::de;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    BackupConfig, Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
-    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    BackupConfig, Config, InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig,
+    UserServerDef, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::jsonc::strip_jsonc;
 
@@ -92,6 +93,7 @@ pub struct RawAftConfig {
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
     pub backup: Option<RawBackup>,
+    pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
     pub lsp: Option<RawLsp>,
@@ -403,6 +405,14 @@ pub struct RawBackup {
     pub max_file_size: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawSandbox {
+    pub enabled: Option<bool>,
+    pub write_allow: Option<Vec<PathBuf>>,
+    pub read_deny: Option<Vec<PathBuf>>,
+}
+
 /// Resolve raw user/project config tiers into the flat core [`Config`].
 ///
 /// Empty input is NOT special-cased: no config file is equivalent to an empty
@@ -576,6 +586,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.backup.is_some() {
         base.backup = override_config.backup;
     }
+    if override_config.sandbox.is_some() {
+        base.sandbox = override_config.sandbox;
+    }
     if override_config.bash.is_some() {
         base.bash = override_config.bash;
     }
@@ -640,6 +653,27 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
+    base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
+}
+
+fn merge_project_sandbox(
+    base: Option<RawSandbox>,
+    project: Option<RawSandbox>,
+) -> Option<RawSandbox> {
+    let Some(project) = project else {
+        return base;
+    };
+    let mut sandbox = base.unwrap_or_default();
+    if let Some(project_denies) = project.read_deny {
+        let denies = sandbox.read_deny.get_or_insert_with(Vec::new);
+        for path in project_denies {
+            if !denies.contains(&path) {
+                denies.push(path);
+            }
+        }
+    }
+    (sandbox.enabled.is_some() || sandbox.write_allow.is_some() || sandbox.read_deny.is_some())
+        .then_some(sandbox)
 }
 
 fn merge_formatter_map(
@@ -893,6 +927,14 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.backup.is_some() {
         push_drop(dropped, "backup", tier, USER_ONLY_REASON);
     }
+    if let Some(sandbox) = &raw.sandbox {
+        if sandbox.enabled.is_some() {
+            push_drop(dropped, "sandbox.enabled", tier, USER_ONLY_REASON);
+        }
+        if sandbox.write_allow.is_some() {
+            push_drop(dropped, "sandbox.write_allow", tier, USER_ONLY_REASON);
+        }
+    }
     if raw
         .disabled_tools
         .as_ref()
@@ -999,6 +1041,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.semantic = resolve_semantic_config(raw.semantic.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
+    config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config);
 }
@@ -1070,6 +1113,17 @@ fn resolve_backup_config(raw: Option<&RawBackup>) -> BackupConfig {
         }
     }
     backup
+}
+
+fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {
+    let Some(raw) = raw else {
+        return SandboxConfig::default();
+    };
+    SandboxConfig {
+        enabled: raw.enabled.unwrap_or(false),
+        write_allow: raw.write_allow.clone().unwrap_or_default(),
+        read_deny: raw.read_deny.clone().unwrap_or_default(),
+    }
 }
 
 fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
@@ -1678,6 +1732,52 @@ mod tests {
 
         assert!(result.config.search_index);
         assert!(result.dropped.is_empty());
+    }
+
+    #[test]
+    fn project_sandbox_can_add_read_denies_but_not_enable_or_add_writes() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{
+                  "sandbox": {
+                    "enabled": true,
+                    "write_allow": ["/user/write"],
+                    "read_deny": ["/user/secret"]
+                  }
+                }"#,
+            ),
+            tier(
+                "project",
+                r#"{
+                  "sandbox": {
+                    "enabled": false,
+                    "write_allow": ["/project/write"],
+                    "read_deny": ["/project/secret", "/user/secret"]
+                  }
+                }"#,
+            ),
+        ]);
+
+        assert!(result.config.sandbox.enabled);
+        assert_eq!(
+            result.config.sandbox.write_allow,
+            vec![PathBuf::from("/user/write")]
+        );
+        assert_eq!(
+            result.config.sandbox.read_deny,
+            vec![
+                PathBuf::from("/user/secret"),
+                PathBuf::from("/project/secret")
+            ]
+        );
+        assert_eq!(
+            drop_keys(&result),
+            vec![
+                "sandbox.enabled".to_string(),
+                "sandbox.write_allow".to_string()
+            ]
+        );
     }
 
     #[test]

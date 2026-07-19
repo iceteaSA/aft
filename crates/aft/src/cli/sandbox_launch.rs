@@ -3,13 +3,17 @@ use aft::sandbox_profile::SandboxProfile;
 use std::ffi::OsString;
 use std::fmt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
 #[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
@@ -83,17 +87,32 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             return print_support();
         }
 
-        let profile_fd = args
-            .profile_fd
-            .ok_or_else(|| SandboxLaunchError::usage("missing required --profile-fd <fd>"))?;
         if args.command.is_empty() {
             return Err(SandboxLaunchError::usage("missing target command after --"));
         }
 
-        let profile = read_profile(profile_fd)?
-            .canonicalize_for_launch()
-            .map_err(|error| SandboxLaunchError::usage(error.to_string()))?;
-        apply_sandbox(&profile)?;
+        let profile = match (args.profile_fd, args.profile_file.as_deref()) {
+            (Some(fd), None) => read_profile(fd)?,
+            (None, Some(path)) => read_profile_file(path)?,
+            (None, None) => {
+                return Err(SandboxLaunchError::usage(
+                    "missing required --profile-fd <fd> or --profile-file <path>",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(SandboxLaunchError::usage(
+                    "--profile-fd and --profile-file are mutually exclusive",
+                ));
+            }
+        }
+        .canonicalize_for_launch()
+        .map_err(|error| SandboxLaunchError::usage(error.to_string()))?;
+        if let Err(error) = apply_sandbox(&profile) {
+            if let Some(path) = args.failure_marker.as_deref() {
+                let _ = write_failure_marker(path);
+            }
+            return Err(error);
+        }
         exec_target(&args.command)
     }
 }
@@ -102,6 +121,8 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
 #[derive(Debug, Default)]
 struct LaunchArgs {
     profile_fd: Option<i32>,
+    profile_file: Option<PathBuf>,
+    failure_marker: Option<PathBuf>,
     command: Vec<OsString>,
     help: bool,
     support: bool,
@@ -137,6 +158,34 @@ impl LaunchArgs {
                 .and_then(|value| value.strip_prefix("--profile-fd="))
             {
                 parsed.profile_fd = Some(parse_fd(&OsString::from(value))?);
+                continue;
+            }
+            if arg == "--profile-file" {
+                let value = args.next().ok_or_else(|| {
+                    SandboxLaunchError::usage("--profile-file requires a path value")
+                })?;
+                parsed.profile_file = Some(PathBuf::from(value));
+                continue;
+            }
+            if let Some(value) = arg
+                .to_str()
+                .and_then(|value| value.strip_prefix("--profile-file="))
+            {
+                parsed.profile_file = Some(PathBuf::from(value));
+                continue;
+            }
+            if arg == "--failure-marker" {
+                let value = args.next().ok_or_else(|| {
+                    SandboxLaunchError::usage("--failure-marker requires a path value")
+                })?;
+                parsed.failure_marker = Some(PathBuf::from(value));
+                continue;
+            }
+            if let Some(value) = arg
+                .to_str()
+                .and_then(|value| value.strip_prefix("--failure-marker="))
+            {
+                parsed.failure_marker = Some(PathBuf::from(value));
                 continue;
             }
             return Err(SandboxLaunchError::usage(format!(
@@ -186,6 +235,39 @@ fn read_profile(fd: RawFd) -> Result<SandboxProfile, SandboxLaunchError> {
     serde_json::from_slice(&bytes).map_err(|error| {
         SandboxLaunchError::usage(format!("invalid sandbox profile JSON: {error}"))
     })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_profile_file(path: &Path) -> Result<SandboxProfile, SandboxLaunchError> {
+    let mut file = File::open(path).map_err(|error| {
+        SandboxLaunchError::runtime(format!(
+            "failed to open sandbox profile file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        SandboxLaunchError::runtime(format!(
+            "failed to read sandbox profile file {}: {error}",
+            path.display()
+        ))
+    })?;
+    drop(file);
+    let _ = std::fs::remove_file(path);
+    serde_json::from_slice(&bytes).map_err(|error| {
+        SandboxLaunchError::usage(format!("invalid sandbox profile JSON: {error}"))
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_failure_marker(path: &Path) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(b"sandbox_unavailable")?;
+    file.sync_all()
 }
 
 #[cfg(target_os = "macos")]
@@ -276,6 +358,7 @@ fn print_json(value: serde_json::Value) -> Result<(), SandboxLaunchError> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn print_usage() {
     println!("Usage: aft sandbox-launch --profile-fd <fd> -- <command> [args...]");
+    println!("       aft sandbox-launch --profile-file <path> -- <command> [args...]");
     println!("       aft sandbox-launch --support");
 }
 
@@ -299,7 +382,34 @@ mod tests {
         ]))
         .expect("valid launcher arguments");
         assert_eq!(args.profile_fd, Some(9));
+        assert_eq!(args.profile_file, None);
+        assert_eq!(args.failure_marker, None);
         assert_eq!(args.command, os_args(&["/bin/bash", "-c", "true"]));
+    }
+
+    #[test]
+    fn parses_profile_file_and_command() {
+        let args = LaunchArgs::parse(os_args(&[
+            "--profile-file",
+            "/tmp/task.sandbox-profile.json",
+            "--failure-marker",
+            "/tmp/task.sandbox-unavailable",
+            "--",
+            "/bin/sh",
+            "-c",
+            "true",
+        ]))
+        .expect("valid launcher arguments");
+        assert_eq!(
+            args.profile_file,
+            Some(PathBuf::from("/tmp/task.sandbox-profile.json"))
+        );
+        assert_eq!(args.profile_fd, None);
+        assert_eq!(
+            args.failure_marker,
+            Some(PathBuf::from("/tmp/task.sandbox-unavailable"))
+        );
+        assert_eq!(args.command, os_args(&["/bin/sh", "-c", "true"]));
     }
 
     #[test]

@@ -1,12 +1,9 @@
-//! Policy seam for processes that execute agent-provided shell commands.
+//! Policy and process wiring for agent-provided shell commands.
 //!
 //! Every agent bash process reaches [`resolve_sandbox_spawn`] and carries the
 //! resulting [`SpawnPlan`] into one of the two process-creation primitives:
-//! detached pipes or PTY. Foreground orchestration still uses the same detached
-//! registry, so it does not create a third path. This module deliberately keeps
-//! policy disabled for now: production resolution returns
-//! [`SpawnPlan::Unsandboxed`] on every platform, and Windows will continue to do
-//! so when native sandbox policy is introduced.
+//! detached pipes or PTY. Foreground orchestration uses the detached registry
+//! too, so it does not create a third process-creation path.
 //!
 //! AFT also starts processes for its own implementation. Those are outside this
 //! seam because they do not execute an agent command: external formatters,
@@ -24,20 +21,24 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
-use std::fs::OpenOptions;
+use std::fs::{DirBuilder, OpenOptions};
 #[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use portable_pty::CommandBuilder;
 
 use crate::context::AppContext;
 use crate::sandbox_profile::SandboxProfile;
+
+pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
 /// Server-authenticated trust classification for a route bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,7 @@ pub enum AuthenticatedPrincipal {
     },
 }
 
-/// Sandbox tier requested by the caller. Native policy is wired in a later step.
+/// Sandbox tier requested by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestedSandboxTier {
     Disabled,
@@ -91,14 +92,42 @@ pub enum SpawnPlan {
     },
     Refused {
         code: &'static str,
+        message: String,
     },
 }
 
 impl SpawnPlan {
     pub(crate) fn refusal_code(&self) -> Option<&'static str> {
         match self {
-            Self::Refused { code } => Some(code),
+            Self::Refused { code, .. } => Some(code),
             Self::Unsandboxed | Self::Launcher { .. } => None,
+        }
+    }
+
+    pub(crate) fn refusal_message(&self) -> Option<&str> {
+        match self {
+            Self::Refused { message, .. } => Some(message),
+            Self::Unsandboxed | Self::Launcher { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_native_launcher(&self) -> bool {
+        matches!(self, Self::Launcher { .. })
+    }
+
+    pub(crate) fn temp_dir(&self) -> Option<&Path> {
+        match self {
+            Self::Launcher { profile, .. } => Some(&profile.temp_dir),
+            Self::Unsandboxed | Self::Refused { .. } => None,
+        }
+    }
+
+    pub(crate) fn cleanup_unspawned(&self) {
+        let Some(temp_dir) = self.temp_dir() else {
+            return;
+        };
+        if is_managed_task_temp_dir(temp_dir) {
+            let _ = std::fs::remove_dir_all(temp_dir);
         }
     }
 
@@ -113,7 +142,10 @@ impl SpawnPlan {
 
     #[cfg(test)]
     pub(crate) fn refused_for_test(code: &'static str) -> Self {
-        Self::Refused { code }
+        Self::Refused {
+            code,
+            message: format!("bash process creation refused by sandbox policy: {code}"),
+        }
     }
 }
 
@@ -162,35 +194,287 @@ pub(crate) fn current_authenticated_principal() -> AuthenticatedPrincipal {
         .unwrap_or(AuthenticatedPrincipal::FirstParty)
 }
 
+pub(crate) fn principal_is_first_party(principal: &AuthenticatedPrincipal) -> bool {
+    matches!(
+        principal,
+        AuthenticatedPrincipal::FirstParty
+            | AuthenticatedPrincipal::RouteBind {
+                trust: PrincipalTrust::FirstParty,
+                ..
+            }
+    )
+}
+
+/// Whether permission-scanner findings should be recorded instead of prompting.
+pub(crate) fn native_sandbox_enforced(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+) -> bool {
+    cfg!(unix) && ctx.config().sandbox.enabled && principal_is_first_party(principal)
+}
+
 /// Resolve policy for an agent-command process.
 ///
-/// Resolution is total. [`SpawnPlan::Refused`] is available for future policy
-/// that cannot establish a containment backend or authenticated principal. This
-/// plumbing step intentionally returns [`SpawnPlan::Unsandboxed`] for all
-/// production callers, including every Windows caller.
+/// `task_bundle_dir` must be the already-created directory that owns the task's
+/// capture files. The native builder creates a fresh private temp directory
+/// beneath it and includes both directories in the profile.
 pub fn resolve_sandbox_spawn(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
     requested_tier: RequestedSandboxTier,
     task_kind: SandboxTaskKind,
+    task_bundle_dir: &Path,
 ) -> SpawnPlan {
     note_test_observation(ctx, principal, requested_tier, task_kind);
 
+    // This check must remain ahead of every platform and production-policy
+    // branch. Windows tests use it to avoid entering process paths that cannot
+    // consume native launcher plans.
     #[cfg(test)]
     if let Some(plan) = TEST_PLAN_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return plan;
     }
 
-    #[cfg(windows)]
+    if requested_tier == RequestedSandboxTier::Disabled
+        || !ctx.config().sandbox.enabled
+        || !principal_is_first_party(principal)
     {
         return SpawnPlan::Unsandboxed;
     }
 
-    #[cfg(not(windows))]
+    #[cfg(windows)]
     {
-        let _ = (principal, requested_tier, task_kind);
+        warn_windows_unsupported_once();
+        let _ = (ctx, task_kind, task_bundle_dir);
         SpawnPlan::Unsandboxed
     }
+
+    #[cfg(unix)]
+    {
+        let profile = match build_native_profile(ctx, principal, task_bundle_dir) {
+            Ok(profile) => profile,
+            Err(error) => {
+                return SpawnPlan::Refused {
+                    code: "sandbox_unavailable",
+                    message: format!(
+                        "native sandbox setup failed: {error}; set sandbox.enabled=false to disable native sandboxing"
+                    ),
+                };
+            }
+        };
+        let launcher_path = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&profile.temp_dir);
+                return SpawnPlan::Refused {
+                    code: "sandbox_unavailable",
+                    message: format!(
+                        "native sandbox setup failed to locate the aft executable: {error}; set sandbox.enabled=false to disable native sandboxing"
+                    ),
+                };
+            }
+        };
+        SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        }
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (ctx, principal, task_kind, task_bundle_dir);
+        SpawnPlan::Unsandboxed
+    }
+}
+
+#[cfg(windows)]
+fn warn_windows_unsupported_once() {
+    let session = crate::log_ctx::current_session().unwrap_or_else(|| "<unknown-session>".into());
+    if should_warn_windows_unsupported(&session) {
+        crate::slog_warn!("sandbox.enabled is not supported on Windows");
+    }
+}
+
+#[cfg(any(windows, test))]
+fn should_warn_windows_unsupported(session: &str) -> bool {
+    use std::collections::HashSet;
+
+    static WARNED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WARNED_SESSIONS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .is_ok_and(|mut warned| warned.insert(session.to_string()))
+}
+
+#[cfg(unix)]
+fn build_native_profile(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+    task_bundle_dir: &Path,
+) -> Result<SandboxProfile, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "HOME is not set, so credential and cache paths cannot be resolved".to_string()
+        })?;
+    if !home.is_absolute() {
+        return Err(format!("HOME must be absolute: {}", home.display()));
+    }
+
+    let mut project_roots = Vec::new();
+    if let Some(root) = &ctx.config().project_root {
+        project_roots.push(root.clone());
+    }
+    if let AuthenticatedPrincipal::RouteBind { project_root, .. } = principal {
+        if !project_roots.contains(project_root) {
+            project_roots.push(project_root.clone());
+        }
+    }
+    if project_roots.is_empty() {
+        project_roots.push(
+            std::env::current_dir()
+                .map_err(|error| format!("failed to resolve the current project root: {error}"))?,
+        );
+    }
+
+    for root in &project_roots {
+        if !root.is_dir() {
+            return Err(format!(
+                "project root is not an existing directory: {}",
+                root.display()
+            ));
+        }
+    }
+    if !task_bundle_dir.is_dir() {
+        return Err(format!(
+            "task artifact directory is not an existing directory: {}",
+            task_bundle_dir.display()
+        ));
+    }
+
+    let temp_dir = create_task_temp_dir(task_bundle_dir)?;
+    let result = {
+        let mut writable_roots = project_roots.clone();
+        writable_roots.push(task_bundle_dir.to_path_buf());
+        writable_roots.extend(
+            ctx.config()
+                .sandbox
+                .write_allow
+                .iter()
+                .map(|path| expand_home(path, &home)),
+        );
+
+        let mut write_deny_nested = Vec::new();
+        let mut read_deny = vec![
+            home.join(".ssh"),
+            home.join(".aws"),
+            home.join(".gnupg"),
+            home.join(".config/gcloud"),
+            home.join(".azure"),
+            home.join(".config/cortexkit"),
+        ];
+        for root in &project_roots {
+            write_deny_nested.push(root.join(".git"));
+            write_deny_nested.push(root.join(".cortexkit"));
+            read_deny.push(root.join(".git/hooks"));
+        }
+        read_deny.extend(
+            ctx.config()
+                .sandbox
+                .read_deny
+                .iter()
+                .map(|path| expand_home(path, &home)),
+        );
+
+        let mut cache_roots = vec![
+            home.join(".cargo/registry"),
+            home.join(".cargo/git"),
+            home.join(".rustup/downloads"),
+            home.join(".npm"),
+            home.join(".bun/install/cache"),
+            home.join(".cache/pip"),
+            home.join(".cache/uv"),
+            home.join(".cache/go-build"),
+            home.join(".gradle/caches"),
+            home.join(".m2/repository"),
+        ];
+        #[cfg(target_os = "macos")]
+        cache_roots.extend([
+            home.join("Library/Caches/pip"),
+            home.join("Library/Caches/uv"),
+            home.join("Library/Caches/go-build"),
+        ]);
+        cache_roots.retain(|path| path.is_dir());
+
+        let mut socket_deny = vec![PathBuf::from("/var/run/docker.sock")];
+        if let Some(agent_socket) =
+            std::env::var_os("SSH_AUTH_SOCK").filter(|value| !value.is_empty())
+        {
+            socket_deny.push(PathBuf::from(agent_socket));
+        }
+
+        SandboxProfile::build(
+            writable_roots,
+            write_deny_nested,
+            read_deny,
+            socket_deny,
+            cache_roots,
+            temp_dir.clone(),
+        )
+        .map_err(|error| error.to_string())
+    };
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn expand_home(path: &Path, home: &Path) -> PathBuf {
+    let mut components = path.components();
+    if components
+        .next()
+        .is_some_and(|component| component.as_os_str() == "~")
+    {
+        return components.fold(home.to_path_buf(), |resolved, component| {
+            resolved.join(component.as_os_str())
+        });
+    }
+    path.to_path_buf()
+}
+
+#[cfg(unix)]
+fn create_task_temp_dir(task_bundle_dir: &Path) -> Result<PathBuf, String> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..32 {
+        let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = task_bundle_dir.join(format!(".sandbox-tmp-{}-{nonce}", std::process::id()));
+        match DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {
+                return path.canonicalize().map_err(|error| {
+                    format!(
+                        "failed to canonicalize task temp directory {}: {error}",
+                        path.display()
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create task temp directory {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err("failed to allocate a fresh task temp directory after 32 attempts".to_string())
+}
+
+pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(".sandbox-tmp-"))
 }
 
 fn note_test_observation(
@@ -286,11 +570,20 @@ pub(crate) fn detached_command_for_plan(
     program: &OsStr,
     args: &[OsString],
     task_marker: &Path,
+    exit_marker: &Path,
 ) -> Result<Command, String> {
-    let (program, args) = command_argv_for_plan(plan, program, args, task_marker)?;
+    let (program, args) =
+        command_argv_for_plan(plan, program, args, task_marker, Some(exit_marker))?;
     let mut command = crate::effective_path::new_command(program);
     command.args(args);
     Ok(command)
+}
+
+#[cfg(unix)]
+pub(crate) fn apply_sandbox_environment(plan: &SpawnPlan, command: &mut Command) {
+    if let Some(temp_dir) = plan.temp_dir() {
+        command.env("TMPDIR", temp_dir).env("TEMP", temp_dir);
+    }
 }
 
 /// Build a PTY `CommandBuilder` while enforcing the required launch plan.
@@ -302,7 +595,7 @@ pub(crate) fn pty_command_for_plan(
     workdir: &Path,
     env: &HashMap<String, String>,
 ) -> Result<CommandBuilder, String> {
-    let (program, args) = command_argv_for_plan(plan, program, args, task_marker)?;
+    let (program, args) = command_argv_for_plan(plan, program, args, task_marker, None)?;
     let mut command = CommandBuilder::new(program);
     for arg in args {
         command.arg(arg);
@@ -310,6 +603,10 @@ pub(crate) fn pty_command_for_plan(
     command.cwd(workdir.as_os_str());
     for (key, value) in env {
         command.env(key, value);
+    }
+    if let Some(temp_dir) = plan.temp_dir() {
+        command.env("TMPDIR", temp_dir);
+        command.env("TEMP", temp_dir);
     }
     Ok(command)
 }
@@ -319,14 +616,22 @@ fn command_argv_for_plan(
     program: &OsStr,
     args: &[OsString],
     task_marker: &Path,
+    exit_marker: Option<&Path>,
 ) -> Result<(OsString, Vec<OsString>), String> {
     match plan {
         SpawnPlan::Unsandboxed => Ok((program.to_os_string(), args.to_vec())),
-        SpawnPlan::Refused { code } => Err((*code).to_string()),
+        SpawnPlan::Refused { code, .. } => Err((*code).to_string()),
         SpawnPlan::Launcher {
             profile,
             launcher_path,
-        } => launcher_argv(profile, launcher_path, program, args, task_marker),
+        } => launcher_argv(
+            profile,
+            launcher_path,
+            program,
+            args,
+            task_marker,
+            exit_marker,
+        ),
     }
 }
 
@@ -337,27 +642,52 @@ fn launcher_argv(
     program: &OsStr,
     args: &[OsString],
     task_marker: &Path,
+    exit_marker: Option<&Path>,
 ) -> Result<(OsString, Vec<OsString>), String> {
     let profile_path = write_profile_file(profile, task_marker)?;
+    let failure_marker = sandbox_failure_marker_path(task_marker)?;
+    if let Some(exit_marker) = exit_marker {
+        let mut wrapped = vec![
+            OsString::from("-c"),
+            OsString::from(
+                r#"umask 077
+launcher=$1
+profile=$2
+exit_marker=$3
+failure_marker=$4
+shift 4
+"$launcher" sandbox-launch --profile-file "$profile" --failure-marker "$failure_marker" -- "$@"
+code=$?
+if [ "$code" -eq 78 ] && [ ! -e "$exit_marker" ]; then
+  if [ ! -e "$failure_marker" ]; then
+    printf "%s" sandbox_unavailable > "$failure_marker.tmp.$$" && mv -f "$failure_marker.tmp.$$" "$failure_marker"
+  fi
+  printf "%s" "$code" > "$exit_marker.tmp.$$" && mv -f "$exit_marker.tmp.$$" "$exit_marker"
+fi
+exit "$code""#,
+            ),
+            OsString::from("aft-sandbox-supervisor"),
+            launcher_path.as_os_str().to_os_string(),
+            profile_path.into_os_string(),
+            exit_marker.as_os_str().to_os_string(),
+            failure_marker.into_os_string(),
+            program.to_os_string(),
+        ];
+        wrapped.extend_from_slice(args);
+        return Ok((OsString::from("/bin/sh"), wrapped));
+    }
+
     let mut wrapped = vec![
-        OsString::from("-c"),
-        OsString::from(
-            r#"profile_path=$1
-shift
-exec 9<"$profile_path" || exit 78
-rm -f -- "$profile_path"
-exec "$@""#,
-        ),
-        OsString::from("aft-sandbox-spawn"),
+        OsString::from("sandbox-launch"),
+        OsString::from("--profile-file"),
         profile_path.into_os_string(),
-        launcher_path.as_os_str().to_os_string(),
-        OsString::from("--profile-fd"),
-        OsString::from("9"),
+        OsString::from("--failure-marker"),
+        failure_marker.into_os_string(),
         OsString::from("--"),
         program.to_os_string(),
     ];
     wrapped.extend_from_slice(args);
-    Ok((OsString::from("/bin/sh"), wrapped))
+    Ok((launcher_path.as_os_str().to_os_string(), wrapped))
 }
 
 #[cfg(not(unix))]
@@ -367,8 +697,21 @@ fn launcher_argv(
     _program: &OsStr,
     _args: &[OsString],
     _task_marker: &Path,
+    _exit_marker: Option<&Path>,
 ) -> Result<(OsString, Vec<OsString>), String> {
     Err("sandbox_unavailable".to_string())
+}
+
+#[cfg(unix)]
+fn sandbox_failure_marker_path(task_marker: &Path) -> Result<PathBuf, String> {
+    let parent = task_marker
+        .parent()
+        .ok_or_else(|| "sandbox task marker has no parent directory".to_string())?;
+    let stem = task_marker
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("bash-task");
+    Ok(parent.join(format!("{stem}.sandbox-unavailable")))
 }
 
 #[cfg(unix)]
@@ -395,4 +738,104 @@ fn write_profile_file(profile: &SandboxProfile, task_marker: &Path) -> Result<Pa
         .map_err(|error| format!("failed to sync sandbox profile file: {error}"))?;
     std::fs::canonicalize(&path)
         .map_err(|error| format!("failed to canonicalize sandbox profile file: {error}"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn product_profile_file_is_private() {
+        let root = tempfile::tempdir().unwrap();
+        let task_dir = root.path().join("task");
+        let project = root.path().join("project");
+        let temp = root.path().join("temp");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        let profile = SandboxProfile::build(
+            vec![project],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        let marker = task_dir.join("bash-private.json");
+
+        let path = write_profile_file(&profile, &marker).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn context(project_root: PathBuf) -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project_root),
+                sandbox: crate::config::SandboxConfig {
+                    enabled: true,
+                    ..crate::config::SandboxConfig::default()
+                },
+                ..crate::config::Config::default()
+            },
+        )
+    }
+
+    #[test]
+    fn untrusted_principal_never_enters_the_native_launcher() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::Untrusted,
+            route_channel: 7,
+            route_epoch: 1,
+            project_root: project.path().to_path_buf(),
+            harness: "mcp:test".to_string(),
+            session_id: "untrusted-sandbox-test".to_string(),
+            principal_id: Some("unverified".to_string()),
+        };
+
+        let plan = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Native,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+        );
+        assert_eq!(plan, SpawnPlan::Unsandboxed);
+    }
+
+    #[test]
+    fn windows_unsupported_warning_is_once_per_session() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let first = format!("windows-warning-first-{suffix}");
+        let second = format!("windows-warning-second-{suffix}");
+        assert!(should_warn_windows_unsupported(&first));
+        assert!(!should_warn_windows_unsupported(&first));
+        assert!(should_warn_windows_unsupported(&second));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enabled_native_tier_is_unsandboxed_on_windows() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let plan = resolve_sandbox_spawn(
+            &ctx,
+            &AuthenticatedPrincipal::FirstParty,
+            RequestedSandboxTier::Native,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+        );
+        assert_eq!(plan, SpawnPlan::Unsandboxed);
+    }
 }

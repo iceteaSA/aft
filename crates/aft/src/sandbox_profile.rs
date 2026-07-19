@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub const SANDBOX_PROFILE_VERSION: u32 = 1;
 
-/// Versioned policy transferred to `aft sandbox-launch` through an inherited file descriptor.
+/// Versioned policy transferred to `aft sandbox-launch` by descriptor or private task file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxProfile {
