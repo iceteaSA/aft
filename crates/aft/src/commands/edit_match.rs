@@ -1,9 +1,11 @@
 //! Handler for the `edit_match` command: content-based string matching with
 //! disambiguation for multiple occurrences.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::backup::CapturedRegularFile;
 use crate::context::AppContext;
 use crate::edit::{self, validate_syntax};
 use crate::format;
@@ -464,13 +466,18 @@ fn handle_glob_edit_match(
         file_str: String,
         original_source: String,
         new_source: String,
+        capture: Option<CapturedRegularFile>,
         count: usize,
     }
     let mut pending: Vec<PendingEdit> = Vec::new();
 
     for path in &paths {
-        let source = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
+        let (source, capture) = match CapturedRegularFile::read_text(path) {
+            Ok(Some((capture, source))) => (source, Some(capture)),
+            Ok(None) => match std::fs::read_to_string(path) {
+                Ok(source) => (source, None),
+                Err(_) => continue,
+            },
             Err(_) => continue,
         };
 
@@ -498,6 +505,7 @@ fn handle_glob_edit_match(
             file_str,
             original_source: source,
             new_source,
+            capture,
             count,
         });
         total_replacements += count;
@@ -558,6 +566,14 @@ fn handle_glob_edit_match(
         );
     }
 
+    let mut captures = pending
+        .iter()
+        .filter_map(|edit| {
+            edit.capture
+                .clone()
+                .map(|capture| (edit.path.clone(), capture))
+        })
+        .collect::<HashMap<_, _>>();
     let checkpoint_name = {
         let name = unique_glob_checkpoint_name(&req.id);
         let files = pending
@@ -566,9 +582,13 @@ fn handle_glob_edit_match(
             .collect::<Vec<_>>();
         let checkpoint_result = {
             let backup = ctx.backup().lock();
-            ctx.checkpoint()
-                .lock()
-                .create(req.session(), &name, files, &backup)
+            ctx.checkpoint().lock().create_from_captures(
+                req.session(),
+                &name,
+                files,
+                &backup,
+                &mut captures,
+            )
         };
         if let Err(e) = checkpoint_result {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -577,13 +597,20 @@ fn handle_glob_edit_match(
     };
 
     for edit in &pending {
-        if let Err(e) = edit::auto_backup(
-            ctx,
-            req.session(),
-            &edit.path,
-            &format!("glob_edit_match: {}", match_str),
-            Some(op_id),
-        ) {
+        let description = format!("glob_edit_match: {}", match_str);
+        let backup_result = if let Some(capture) = captures.get(&edit.path) {
+            edit::auto_backup_from_capture(
+                ctx,
+                req.session(),
+                &edit.path,
+                &description,
+                Some(op_id),
+                capture,
+            )
+        } else {
+            edit::auto_backup(ctx, req.session(), &edit.path, &description, Some(op_id))
+        };
+        if let Err(e) = backup_result {
             if let Some(name) = &checkpoint_name {
                 delete_glob_checkpoint(ctx, req.session(), name);
             }
@@ -905,8 +932,54 @@ mod tests {
     use crate::config::Config;
     use crate::context::AppContext;
     use crate::language::StubProvider;
+    use crate::protocol::RawRequest;
 
-    use super::restore_glob_checkpoint;
+    use super::{handle_edit_match, restore_glob_checkpoint};
+
+    #[test]
+    fn glob_edit_reads_each_pre_edit_file_once_and_preserves_backup_bytes() {
+        let cache = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        fs::write(&first, "first TARGET\n").unwrap();
+        fs::write(&second, "second TARGET\n").unwrap();
+        crate::backup::reset_capture_read_count(&first);
+        crate::backup::reset_capture_read_count(&second);
+
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "single-capture-glob",
+            "command": "edit_match",
+            "file": temp.path().join("*.txt").display().to_string(),
+            "match": "TARGET",
+            "replacement": "DONE",
+            "replace_all": true
+        }))
+        .unwrap();
+
+        let response = handle_edit_match(&request, &ctx);
+        assert!(response.success, "glob edit failed: {:?}", response.data);
+        assert_eq!(crate::backup::capture_read_count(&first), 1);
+        assert_eq!(crate::backup::capture_read_count(&second), 1);
+
+        let backup = ctx.backup().lock();
+        assert_eq!(
+            backup.history(request.session(), &first)[0]
+                .content_bytes
+                .as_ref(),
+            b"first TARGET\n"
+        );
+        assert_eq!(
+            backup.history(request.session(), &second)[0]
+                .content_bytes
+                .as_ref(),
+            b"second TARGET\n"
+        );
+    }
 
     #[test]
     fn restore_glob_checkpoint_reports_failures() {

@@ -309,6 +309,23 @@ pub fn auto_backup(
     Ok(backup_id)
 }
 
+/// Persist a regular-file capture that was already freshness-checked while
+/// creating the operation's rollback checkpoint.
+pub(crate) fn auto_backup_from_capture(
+    ctx: &AppContext,
+    session: &str,
+    path: &Path,
+    description: &str,
+    op_id: Option<&str>,
+    capture: &crate::backup::CapturedRegularFile,
+) -> Result<Option<String>, AftError> {
+    let backup_id = {
+        let mut store = ctx.backup().lock();
+        store.snapshot_with_op_from_capture(session, path, description, op_id, capture)?
+    };
+    Ok(backup_id)
+}
+
 /// Post-format excerpt of the region(s) the formatter reflowed, so the agent
 /// can re-anchor its next edit on the real on-disk text instead of the text it
 /// submitted. `None` on WriteResult when the formatter did not change the

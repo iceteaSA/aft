@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -69,7 +70,7 @@ pub struct BackupEntry {
     /// UTF-8 view of the captured regular-file bytes, kept for API/tests that
     /// inspect text backups. Restore uses `content_bytes` so binary files round-trip.
     pub content: String,
-    pub content_bytes: Vec<u8>,
+    pub content_bytes: Arc<[u8]>,
     pub timestamp: u64,
     pub order: u128,
     pub description: String,
@@ -85,6 +86,112 @@ pub enum BackupEntryKind {
     Content,
     Symlink,
     Tombstone,
+}
+
+/// One regular file captured for both rollback and durable undo.
+///
+/// Seeded consumers must call [`Self::refresh_if_stale`] immediately before
+/// storing the snapshot. A size or modification-time change means the buffer
+/// may no longer describe the pre-mutation file on disk, so the capture is
+/// replaced with a fresh read. Symlinks deliberately use the existing path-based
+/// snapshot code so their link metadata and target semantics remain unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedRegularFile {
+    metadata: std::fs::Metadata,
+    bytes: Arc<[u8]>,
+}
+
+impl CapturedRegularFile {
+    pub(crate) fn read(path: &Path) -> std::io::Result<Option<Self>> {
+        let before = std::fs::symlink_metadata(path)?;
+        if !before.is_file() {
+            return Ok(None);
+        }
+
+        let mut bytes: Arc<[u8]> = read_captured_content(path)?.into();
+        let mut metadata = std::fs::symlink_metadata(path)?;
+        if !same_capture_stat(&before, &metadata) {
+            if !metadata.is_file() {
+                return Ok(None);
+            }
+            bytes = read_captured_content(path)?.into();
+            metadata = std::fs::symlink_metadata(path)?;
+        }
+
+        Ok(Some(Self { metadata, bytes }))
+    }
+
+    pub(crate) fn read_text(path: &Path) -> std::io::Result<Option<(Self, String)>> {
+        let Some(capture) = Self::read(path)? else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(capture.bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+            .to_owned();
+        Ok(Some((capture, text)))
+    }
+
+    pub(crate) fn refresh_if_stale(&mut self, path: &Path) -> std::io::Result<bool> {
+        let current = std::fs::symlink_metadata(path)?;
+        if current.is_file() && same_capture_stat(&self.metadata, &current) {
+            return Ok(false);
+        }
+
+        let Some(fresh) = Self::read(path)? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "captured regular file is no longer a regular file",
+            ));
+        };
+        *self = fresh;
+        Ok(true)
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn shared_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
+
+    pub(crate) fn metadata(&self) -> &std::fs::Metadata {
+        &self.metadata
+    }
+}
+
+fn same_capture_stat(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+fn read_captured_content(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        *CAPTURE_READ_COUNTS.lock().unwrap().entry(key).or_default() += 1;
+    }
+    std::fs::read(path)
+}
+
+#[cfg(test)]
+static CAPTURE_READ_COUNTS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn reset_capture_read_count(path: &Path) {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    CAPTURE_READ_COUNTS.lock().unwrap().remove(&key);
+}
+
+#[cfg(test)]
+pub(crate) fn capture_read_count(path: &Path) -> usize {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    CAPTURE_READ_COUNTS
+        .lock()
+        .unwrap()
+        .get(&key)
+        .copied()
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +299,7 @@ impl TryFrom<BackupRow> for BackupEntry {
         Ok(BackupEntry {
             backup_id: row.backup_id,
             content,
-            content_bytes,
+            content_bytes: content_bytes.into(),
             timestamp: u64::try_from(row.created_at).unwrap_or_default(),
             order: row.order,
             description: row.description,
@@ -497,6 +604,32 @@ impl BackupStore {
         Ok(Some(id))
     }
 
+    /// Store an already captured regular file without reading its contents again.
+    /// The caller must refresh the capture immediately before invoking this method.
+    pub(crate) fn snapshot_with_op_from_capture(
+        &mut self,
+        session: &str,
+        path: &Path,
+        description: &str,
+        op_id: Option<&str>,
+        capture: &CapturedRegularFile,
+    ) -> Result<Option<String>, AftError> {
+        if !self.should_snapshot_path(path)? {
+            return Ok(None);
+        }
+        self.run_process_maintenance_once();
+        let key = canonicalize_key(path);
+        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
+        self.ensure_stack_hydrated_locked(session, &key)?;
+        let (id, order) = self.next_id_and_order();
+        let entry = backup_entry_from_capture(capture, id.clone(), order, description, op_id);
+
+        self.persist_new_entry_locked(session, &key, entry)?;
+        self.touch_session(session);
+
+        Ok(Some(id))
+    }
+
     /// Record that `path` was created by the operation and should be removed
     /// if that operation is undone. No file content is captured.
     pub fn snapshot_op_tombstone(
@@ -518,7 +651,7 @@ impl BackupStore {
         let entry = BackupEntry {
             backup_id: id.clone(),
             content: String::new(),
-            content_bytes: Vec::new(),
+            content_bytes: Arc::from([]),
             timestamp: current_timestamp(),
             order,
             description: description.to_string(),
@@ -1693,7 +1826,7 @@ impl BackupStore {
         let latest = stack.last()?;
         let modified = match latest.kind {
             BackupEntryKind::Content => std::fs::read(path)
-                .map(|current| current != latest.content_bytes)
+                .map(|current| current.as_slice() != latest.content_bytes.as_ref())
                 .unwrap_or(true),
             BackupEntryKind::Symlink => std::fs::read_link(path)
                 .map(|target| latest.link_target.as_ref() != Some(&target))
@@ -2883,14 +3016,16 @@ fn backup_entry_from_path(
         (
             BackupEntryKind::Symlink,
             target.display().to_string(),
-            Vec::new(),
+            Arc::from([]),
             Some(target),
         )
     } else if metadata.is_file() {
-        let bytes = std::fs::read(path).map_err(|error| AftError::IoError {
-            path: path.display().to_string(),
-            message: error.to_string(),
-        })?;
+        let bytes: Arc<[u8]> = read_captured_content(path)
+            .map_err(|error| AftError::IoError {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            })?
+            .into();
         (
             BackupEntryKind::Content,
             String::from_utf8_lossy(&bytes).into_owned(),
@@ -2919,6 +3054,28 @@ fn backup_entry_from_path(
         link_target,
         created_dirs: Vec::new(),
     })
+}
+
+fn backup_entry_from_capture(
+    capture: &CapturedRegularFile,
+    backup_id: String,
+    order: u128,
+    description: &str,
+    op_id: Option<&str>,
+) -> BackupEntry {
+    BackupEntry {
+        backup_id,
+        content: String::from_utf8_lossy(capture.bytes()).into_owned(),
+        content_bytes: capture.shared_bytes(),
+        timestamp: current_timestamp(),
+        order,
+        description: description.to_string(),
+        op_id: op_id.map(str::to_string),
+        kind: BackupEntryKind::Content,
+        mode: file_mode(capture.metadata()),
+        link_target: None,
+        created_dirs: Vec::new(),
+    }
 }
 
 fn canonicalize_key(path: &Path) -> PathBuf {
@@ -3398,7 +3555,7 @@ fn entry_from_meta(
     BackupEntry {
         backup_id,
         content,
-        content_bytes,
+        content_bytes: content_bytes.into(),
         timestamp,
         order,
         description: entry_meta
@@ -3481,15 +3638,17 @@ fn content_filename_for_entry(entry: &BackupEntry) -> Option<String> {
     }
 }
 
-fn content_bytes_for_disk(entry: &BackupEntry) -> Vec<u8> {
+fn content_bytes_for_disk(entry: &BackupEntry) -> Cow<'_, [u8]> {
     match entry.kind {
-        BackupEntryKind::Content => entry.content_bytes.clone(),
-        BackupEntryKind::Symlink => entry
-            .link_target
-            .as_ref()
-            .map(|target| target.as_os_str().to_string_lossy().as_bytes().to_vec())
-            .unwrap_or_default(),
-        BackupEntryKind::Tombstone => Vec::new(),
+        BackupEntryKind::Content => Cow::Borrowed(&entry.content_bytes),
+        BackupEntryKind::Symlink => Cow::Owned(
+            entry
+                .link_target
+                .as_ref()
+                .map(|target| target.as_os_str().to_string_lossy().as_bytes().to_vec())
+                .unwrap_or_default(),
+        ),
+        BackupEntryKind::Tombstone => Cow::Borrowed(&[]),
     }
 }
 
@@ -3671,7 +3830,7 @@ mod tests {
         BackupEntry {
             backup_id: format!("backup-{index}"),
             content: format!("content-{index}"),
-            content_bytes: format!("content-{index}").into_bytes(),
+            content_bytes: format!("content-{index}").into_bytes().into(),
             timestamp: u64::try_from(index + 1).unwrap(),
             order: index + 1,
             description: format!("generated-{index}"),
@@ -5286,8 +5445,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![second_id.as_str(), third_id.as_str()]
         );
-        assert_eq!(history[0].content_bytes, b"v1");
-        assert_eq!(history[1].content_bytes, b"v2");
+        assert_eq!(history[0].content_bytes.as_ref(), b"v1");
+        assert_eq!(history[1].content_bytes.as_ref(), b"v2");
     }
 
     #[test]

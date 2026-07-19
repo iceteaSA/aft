@@ -5,8 +5,10 @@
 //! → extract symbol text → remove from source → add to destination → rewrite
 //! imports in every consumer → format/validate all files → return results.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::backup::CapturedRegularFile;
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit;
 use crate::imports;
@@ -236,10 +238,20 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Read source file ---
-    let source_content = match std::fs::read_to_string(source_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
+    let mut captures = HashMap::new();
+    let source_content = match CapturedRegularFile::read_text(source_path) {
+        Ok(Some((capture, source))) => {
+            captures.insert(source_path.to_path_buf(), capture);
+            source
+        }
+        Ok(None) => match std::fs::read_to_string(source_path) {
+            Ok(source) => source,
+            Err(error) => {
+                return Response::error(&req.id, "file_not_found", format!("{}: {}", file, error));
+            }
+        },
+        Err(error) => {
+            return Response::error(&req.id, "file_not_found", format!("{}: {}", file, error));
         }
     };
 
@@ -306,7 +318,14 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Read destination file (may not exist yet) ---
     let dest_content = if dest_path.exists() {
-        std::fs::read_to_string(dest_path).unwrap_or_default()
+        match CapturedRegularFile::read_text(dest_path) {
+            Ok(Some((capture, content))) => {
+                captures.insert(dest_path.to_path_buf(), capture);
+                content
+            }
+            Ok(None) => std::fs::read_to_string(dest_path).unwrap_or_default(),
+            Err(_) => String::new(),
+        }
     } else {
         String::new()
     };
@@ -403,10 +422,15 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         if !consumer_file.exists() {
             continue;
         }
-        let consumer_content = match std::fs::read_to_string(consumer_file) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let (consumer_content, consumer_capture) =
+            match CapturedRegularFile::read_text(consumer_file) {
+                Ok(Some((capture, content))) => (content, Some(capture)),
+                Ok(None) => match std::fs::read_to_string(consumer_file) {
+                    Ok(content) => (content, None),
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
 
         match rewrite_consumer_imports(
             &consumer_content,
@@ -418,6 +442,9 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             moved_symbol_is_default,
         ) {
             Ok(Some(rewritten)) => {
+                if let Some(capture) = consumer_capture {
+                    captures.insert(consumer_file.clone(), capture);
+                }
                 consumer_rewrites.push((consumer_file.clone(), consumer_content, rewritten));
             }
             Ok(None) => {}
@@ -466,7 +493,13 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let backup_store = ctx.backup().lock();
         let mut cp_store = ctx.checkpoint().lock();
-        if let Err(e) = cp_store.create(req.session(), &checkpoint_name, all_files, &backup_store) {
+        if let Err(e) = cp_store.create_from_captures(
+            req.session(),
+            &checkpoint_name,
+            all_files,
+            &backup_store,
+            &mut captures,
+        ) {
             return Response::error(&req.id, e.code(), e.to_string());
         }
     }
@@ -486,12 +519,23 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let mut backup_store = ctx.backup().lock();
         for path in files_to_backup {
-            match backup_store.snapshot_with_op(
-                req.session(),
-                &path,
-                "move_symbol: pre-move backup",
-                Some(&op_id),
-            ) {
+            let backup_result = if let Some(capture) = captures.get(&path) {
+                backup_store.snapshot_with_op_from_capture(
+                    req.session(),
+                    &path,
+                    "move_symbol: pre-move backup",
+                    Some(&op_id),
+                    capture,
+                )
+            } else {
+                backup_store.snapshot_with_op(
+                    req.session(),
+                    &path,
+                    "move_symbol: pre-move backup",
+                    Some(&op_id),
+                )
+            };
+            match backup_result {
                 Ok(Some(id)) => backup_ids.push(id),
                 Ok(None) => {}
                 Err(e) => return Response::error(&req.id, e.code(), e.to_string()),

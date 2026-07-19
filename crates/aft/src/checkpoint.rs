@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::backup::BackupStore;
+use crate::backup::{BackupStore, CapturedRegularFile};
 use crate::error::AftError;
 use crate::fs_lock;
 
@@ -40,7 +41,7 @@ struct CheckpointFile {
 #[derive(Debug, Clone)]
 enum CheckpointFileKind {
     Regular {
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
     },
     Symlink {
         target: PathBuf,
@@ -67,17 +68,44 @@ impl CheckpointFile {
         }
 
         if metadata.is_file() {
-            let bytes = fs::read(path)?;
-            return Ok(Self {
-                metadata,
-                kind: CheckpointFileKind::Regular { bytes },
-            });
+            let capture = CapturedRegularFile::read(path)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file changed while being captured",
+                )
+            })?;
+            return Ok(Self::from_fresh_capture(capture));
         }
 
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file or symlink",
         ))
+    }
+
+    /// Build a checkpoint from bytes captured earlier in the command.
+    ///
+    /// Size and modification time are checked immediately before the bytes enter
+    /// the checkpoint. If either changed, the capture is refreshed from disk so
+    /// rollback and undo never preserve stale pre-edit content. This constructor
+    /// is only for regular files; symlinks continue through [`Self::read`].
+    fn from_captured(path: &Path, capture: &mut CapturedRegularFile) -> io::Result<Self> {
+        capture.refresh_if_stale(path)?;
+        Ok(Self {
+            metadata: capture.metadata().clone(),
+            kind: CheckpointFileKind::Regular {
+                bytes: capture.shared_bytes(),
+            },
+        })
+    }
+
+    fn from_fresh_capture(capture: CapturedRegularFile) -> Self {
+        Self {
+            metadata: capture.metadata().clone(),
+            kind: CheckpointFileKind::Regular {
+                bytes: capture.shared_bytes(),
+            },
+        }
     }
 
     fn read_optional(path: &Path) -> io::Result<Option<Self>> {
@@ -172,6 +200,28 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: &BackupStore,
     ) -> Result<CheckpointInfo, AftError> {
+        self.create_impl(session, name, files, backup_store, None)
+    }
+
+    pub(crate) fn create_from_captures(
+        &mut self,
+        session: &str,
+        name: &str,
+        files: Vec<PathBuf>,
+        backup_store: &BackupStore,
+        captures: &mut HashMap<PathBuf, CapturedRegularFile>,
+    ) -> Result<CheckpointInfo, AftError> {
+        self.create_impl(session, name, files, backup_store, Some(captures))
+    }
+
+    fn create_impl(
+        &mut self,
+        session: &str,
+        name: &str,
+        files: Vec<PathBuf>,
+        backup_store: &BackupStore,
+        mut captures: Option<&mut HashMap<PathBuf, CapturedRegularFile>>,
+    ) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
         let explicit_request = !files.is_empty();
         let file_list = if files.is_empty() {
@@ -183,7 +233,21 @@ impl CheckpointStore {
         let mut file_contents = HashMap::new();
         let mut skipped: Vec<(PathBuf, String)> = Vec::new();
         for path in &file_list {
-            match CheckpointFile::read(path) {
+            let seeded = captures
+                .as_deref_mut()
+                .and_then(|captures| captures.get_mut(path))
+                .map(|capture| CheckpointFile::from_captured(path, capture));
+            let snapshot = match seeded {
+                Some(Err(error)) if error.kind() == io::ErrorKind::InvalidInput => {
+                    if let Some(captures) = captures.as_deref_mut() {
+                        captures.remove(path);
+                    }
+                    CheckpointFile::read(path)
+                }
+                Some(result) => result,
+                None => CheckpointFile::read(path),
+            };
+            match snapshot {
                 Ok(snapshot) => {
                     file_contents.insert(path.clone(), snapshot);
                 }
@@ -1068,6 +1132,64 @@ mod tests {
             .is_symlink());
         assert_eq!(fs::read_link(&link).unwrap(), target);
         assert_eq!(fs::read_to_string(&link).unwrap(), "target content");
+    }
+
+    #[test]
+    fn captured_regular_file_is_shared_by_checkpoint_and_backup() {
+        let (path, _dir) = temp_file("shared-capture.txt", "original bytes");
+        crate::backup::reset_capture_read_count(&path);
+        let mut capture = CapturedRegularFile::read(&path).unwrap().unwrap();
+        assert_eq!(crate::backup::capture_read_count(&path), 1);
+
+        let checkpoint = CheckpointFile::from_captured(&path, &mut capture).unwrap();
+        let mut backup = BackupStore::new();
+        backup
+            .snapshot_with_op_from_capture(
+                DEFAULT_SESSION_ID,
+                &path,
+                "shared capture",
+                Some("shared-op"),
+                &capture,
+            )
+            .unwrap();
+
+        let history = backup.history(DEFAULT_SESSION_ID, &path);
+        let CheckpointFileKind::Regular { bytes } = checkpoint.kind else {
+            panic!("regular capture must create a regular checkpoint");
+        };
+        assert_eq!(bytes.as_ref(), b"original bytes");
+        assert_eq!(history[0].content_bytes.as_ref(), b"original bytes");
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(crate::backup::capture_read_count(&path), 1);
+    }
+
+    #[test]
+    fn stale_capture_refreshes_before_checkpoint_and_backup() {
+        let (path, _dir) = temp_file("stale-capture.txt", "old");
+        crate::backup::reset_capture_read_count(&path);
+        let mut capture = CapturedRegularFile::read(&path).unwrap().unwrap();
+        fs::write(&path, "fresh disk truth").unwrap();
+
+        let checkpoint = CheckpointFile::from_captured(&path, &mut capture).unwrap();
+        let mut backup = BackupStore::new();
+        backup
+            .snapshot_with_op_from_capture(
+                DEFAULT_SESSION_ID,
+                &path,
+                "freshened capture",
+                Some("fresh-op"),
+                &capture,
+            )
+            .unwrap();
+
+        let history = backup.history(DEFAULT_SESSION_ID, &path);
+        let CheckpointFileKind::Regular { bytes } = checkpoint.kind else {
+            panic!("regular capture must create a regular checkpoint");
+        };
+        assert_eq!(bytes.as_ref(), b"fresh disk truth");
+        assert_eq!(history[0].content_bytes.as_ref(), b"fresh disk truth");
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(crate::backup::capture_read_count(&path), 2);
     }
 
     #[test]

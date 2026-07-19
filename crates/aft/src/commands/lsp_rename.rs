@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use lsp_types::request::Rename;
@@ -7,6 +7,7 @@ use lsp_types::{
 };
 use serde::Deserialize;
 
+use crate::backup::CapturedRegularFile;
 use crate::context::AppContext;
 use crate::lsp::position::{build_text_document_position, uri_to_path};
 use crate::lsp::LspError;
@@ -36,6 +37,7 @@ struct RenameRollback {
     checkpoint_name: String,
     op_id: String,
     files: Vec<PathBuf>,
+    captures: HashMap<PathBuf, CapturedRegularFile>,
 }
 
 /// Handle the `lsp_rename` command.
@@ -213,7 +215,7 @@ fn apply_workspace_edit(
 
     let rollback = snapshot_affected_files(&file_changes, session, ctx, &op_id)
         .map_err(|err| Response::error(req_id, "lsp_error", format!("rename failed: {err}")))?;
-    let result = apply_collected_changes(&file_changes, ctx);
+    let result = apply_collected_changes(&file_changes, &rollback.captures, ctx);
 
     match result {
         Ok(changes) => {
@@ -317,12 +319,24 @@ fn snapshot_affected_files(
     op_id: &str,
 ) -> Result<RenameRollback, LspError> {
     let files = file_changes.keys().cloned().collect::<Vec<_>>();
+    let mut captures = HashMap::new();
+    for path in &files {
+        if let Some(capture) = CapturedRegularFile::read(path).map_err(LspError::Io)? {
+            captures.insert(path.clone(), capture);
+        }
+    }
     let checkpoint_name = format!("lsp_rename:{op_id}");
     {
         let backup = ctx.backup().lock();
         let mut checkpoint = ctx.checkpoint().lock();
         checkpoint
-            .create(session, &checkpoint_name, files.clone(), &backup)
+            .create_from_captures(
+                session,
+                &checkpoint_name,
+                files.clone(),
+                &backup,
+                &mut captures,
+            )
             .map_err(|err| {
                 LspError::NotFound(format!(
                     "failed to create rollback checkpoint '{}': {err}",
@@ -334,11 +348,20 @@ fn snapshot_affected_files(
     let snapshot_result = (|| -> Result<(), LspError> {
         let mut backup = ctx.backup().lock();
         for path in &files {
-            backup
-                .snapshot_with_op(session, path, "lsp_rename", Some(op_id))
-                .map_err(|err| {
-                    LspError::NotFound(format!("failed to snapshot '{}': {err}", path.display()))
-                })?;
+            let result = if let Some(capture) = captures.get(path) {
+                backup.snapshot_with_op_from_capture(
+                    session,
+                    path,
+                    "lsp_rename",
+                    Some(op_id),
+                    capture,
+                )
+            } else {
+                backup.snapshot_with_op(session, path, "lsp_rename", Some(op_id))
+            };
+            result.map_err(|err| {
+                LspError::NotFound(format!("failed to snapshot '{}': {err}", path.display()))
+            })?;
         }
         Ok(())
     })();
@@ -352,6 +375,7 @@ fn snapshot_affected_files(
         checkpoint_name,
         op_id: op_id.to_string(),
         files,
+        captures,
     })
 }
 
@@ -380,12 +404,21 @@ fn delete_rename_checkpoint(ctx: &AppContext, session: &str, checkpoint_name: &s
 
 fn apply_collected_changes(
     file_changes: &BTreeMap<PathBuf, Vec<PendingTextEdit>>,
+    captures: &HashMap<PathBuf, CapturedRegularFile>,
     ctx: &AppContext,
 ) -> Result<Vec<FileChange>, LspError> {
     let mut results = Vec::with_capacity(file_changes.len());
 
     for (path, edits) in file_changes {
-        let original_content = std::fs::read_to_string(&path).map_err(LspError::Io)?;
+        let original_content = if let Some(capture) = captures.get(path) {
+            std::str::from_utf8(capture.bytes())
+                .map_err(|error| {
+                    LspError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+                })?
+                .to_owned()
+        } else {
+            std::fs::read_to_string(path).map_err(LspError::Io)?
+        };
         let updated_content = apply_text_edits(&original_content, edits)?;
 
         std::fs::write(path, &updated_content).map_err(LspError::Io)?;
