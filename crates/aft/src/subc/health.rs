@@ -5,7 +5,7 @@ use super::{
     HealthStatus, Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
     DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
-use crate::context::RootHealthState;
+use crate::context::{AppContext, RootHealthState};
 use crate::executor::BindBlockerSnapshot;
 
 pub(super) struct DispatchPathMetrics {
@@ -179,6 +179,50 @@ fn pending_bind_breadcrumb(
     )
 }
 
+/// Per-root attributed-bytes rollup for health metrics: top roots by size
+/// (same cap as the status payload's memory section) plus process RSS and
+/// attributed totals. `None` scheduler entries (contended) yield a busy
+/// marker instead of waiting.
+fn memory_rollup_metrics(
+    actor_entries: Option<Vec<(cortexkit_paths::ProjectRootId, Arc<AppContext>)>>,
+) -> Value {
+    let Some(entries) = actor_entries else {
+        return json!({ "status": "busy" });
+    };
+    let mut roots = std::collections::BTreeMap::new();
+    for (root_id, ctx) in entries {
+        roots.insert(
+            root_id.as_path().display().to_string(),
+            ctx.memory_root_snapshot(),
+        );
+    }
+    let snapshot = crate::memory::MemorySnapshot::new("ready", roots);
+    let per_root: Value = snapshot
+        .roots
+        .iter()
+        .map(|(root, detail)| {
+            (
+                root.clone(),
+                json!({
+                    "attributed_bytes": detail.attributed_bytes,
+                    "status": detail.status,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>()
+        .into();
+    json!({
+        "status": "ready",
+        "roots": per_root,
+        "roots_total": snapshot.roots_total,
+        "roots_omitted": snapshot.roots_omitted,
+        "roots_omitted_bytes": snapshot.roots_omitted_bytes,
+        "rss_bytes": snapshot.process.rss_bytes,
+        "total_attributed_bytes": snapshot.process.total_attributed_bytes,
+        "sqlite_bytes": snapshot.process.sqlite.memory_used_bytes,
+    })
+}
+
 fn mutating_lanes_metrics(executor: &Executor) -> Value {
     match executor.try_mutating_lane_snapshots() {
         Some(snapshots) => Value::Array(
@@ -232,12 +276,20 @@ pub(super) fn build_health_report(
     // of waiting.
     let actor_entries = executor.try_actor_entries();
     let scheduler_busy = actor_entries.is_none();
+    let actor_entries_for_memory = actor_entries.clone();
     let mut roots: Vec<RootHealthSnapshot> = actor_entries
         .unwrap_or_default()
         .into_iter()
         .map(|(root_id, ctx)| ctx.try_health_snapshot(root_id.as_path()))
         .collect();
     roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
+
+    // Compact memory rollup for operator drill-down (`ck health aft`): per-root
+    // attributed bytes with the same top-N cap as the status payload, plus
+    // process totals. Memory estimates are themselves try-lock-only (busy
+    // subsystems report as such), so this stays within the health-path lock
+    // doctrine.
+    let memory = memory_rollup_metrics(actor_entries_for_memory);
 
     // Health-verdict rule: DEGRADED means dispatch is impaired (an actor we
     // could not even snapshot without contention), never "a background index
@@ -279,6 +331,7 @@ pub(super) fn build_health_report(
         metrics: Some(json!({
             "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
             "root_count": roots.len(),
+            "memory": memory,
             "roots": roots,
             "dispatch_liveness": dispatch_liveness_metrics(executor),
             "dispatch_path": dispatch_path_metrics.snapshot(pending_binds, executor),
@@ -401,6 +454,26 @@ mod tests {
         queued
             .recv_timeout(Duration::from_secs(1))
             .expect("queued completion response");
+    }
+
+    #[test]
+    fn health_metrics_memory_rollup_reports_per_root_and_process_totals() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+        let report = build_health_report(&executor, &HashMap::new(), &dispatch_path_metrics);
+        let metrics = report.metrics.expect("health metrics present");
+        let memory = metrics.get("memory").expect("memory rollup present");
+        // No actors registered: ready rollup with zero roots and process totals.
+        assert_eq!(memory.get("status").and_then(Value::as_str), Some("ready"));
+        assert_eq!(memory.get("roots_total").and_then(Value::as_u64), Some(0));
+        assert!(memory.get("total_attributed_bytes").is_some());
+        assert!(memory.get("rss_bytes").is_some());
     }
 
     #[test]
