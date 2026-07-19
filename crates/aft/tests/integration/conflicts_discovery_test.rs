@@ -213,6 +213,10 @@ fn conflicts_in_non_ascii_filename_are_reported() {
     assert!(aft.shutdown().success());
 }
 
+// Newlines are legal in POSIX filenames but reserved on Windows (the file
+// cannot even be created there), so this exotic-name case is unix-only. The
+// café.txt test above covers the realistic non-ASCII class on all platforms.
+#[cfg(unix)]
 #[test]
 fn conflicts_in_newline_filename_are_reported() {
     let dir = tempfile::tempdir().unwrap();
