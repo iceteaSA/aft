@@ -1487,7 +1487,7 @@ impl BasePostings {
             .and_then(|index| self.lookup.get(index).copied())
     }
 
-    fn read_postings(&self, entry: LookupEntry) -> std::io::Result<Vec<Posting>> {
+    fn read_posting_bytes(&self, entry: LookupEntry) -> std::io::Result<Vec<u8>> {
         let bytes_len = (entry.count as usize)
             .checked_mul(POSTING_BYTES)
             .ok_or_else(|| std::io::Error::other("posting list too large"))?;
@@ -1504,6 +1504,27 @@ impl BasePostings {
         }
         let mut bytes = vec![0u8; bytes_len];
         pread_exact(&self.file, offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn for_each_posting(
+        &self,
+        entry: LookupEntry,
+        mut visit: impl FnMut(u32, u8, u8),
+    ) -> std::io::Result<()> {
+        let bytes = self.read_posting_bytes(entry)?;
+        for chunk in bytes.chunks_exact(POSTING_BYTES) {
+            visit(
+                u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                chunk[4],
+                chunk[5],
+            );
+        }
+        Ok(())
+    }
+
+    fn read_postings(&self, entry: LookupEntry) -> std::io::Result<Vec<Posting>> {
+        let bytes = self.read_posting_bytes(entry)?;
         let mut postings = Vec::with_capacity(entry.count as usize);
         for chunk in bytes.chunks_exact(POSTING_BYTES) {
             postings.push(Posting {
@@ -1940,20 +1961,23 @@ impl SearchIndexSnapshot {
             .and_then(|base| base.lookup_entry(trigram))
         {
             if let Some(base) = &self.base {
-                if let Ok(postings) = base.read_postings(base_entry) {
-                    matches.reserve(postings.len());
-                    for posting in postings {
-                        if self.superseded.contains(&posting.file_id) {
-                            continue;
-                        }
-                        if !posting_matches_filter(&posting, filter) {
-                            continue;
-                        }
-                        if self.is_active_file(posting.file_id) {
-                            matches.push(posting.file_id);
-                        }
+                matches.reserve(base_entry.count as usize);
+                let _ = base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
+                    if self.superseded.contains(&file_id) {
+                        return;
                     }
-                }
+                    let posting = Posting {
+                        file_id,
+                        next_mask,
+                        loc_mask,
+                    };
+                    if !posting_matches_filter(&posting, filter) {
+                        return;
+                    }
+                    if self.is_active_file(file_id) {
+                        matches.push(file_id);
+                    }
+                });
             }
         }
 
@@ -4908,6 +4932,52 @@ mod tests {
         (dir, index)
     }
 
+    fn postings_for_trigram_materialized_reference(
+        index: &SearchIndexSnapshot,
+        trigram: u32,
+        filter: Option<PostingFilter>,
+    ) -> Vec<u32> {
+        let mut matches = Vec::new();
+        if let Some(base_entry) = index
+            .base
+            .as_ref()
+            .and_then(|base| base.lookup_entry(trigram))
+        {
+            if let Some(base) = &index.base {
+                if let Ok(postings) = base.read_postings(base_entry) {
+                    matches.reserve(postings.len());
+                    for posting in postings {
+                        if index.superseded.contains(&posting.file_id) {
+                            continue;
+                        }
+                        if !posting_matches_filter(&posting, filter) {
+                            continue;
+                        }
+                        if index.is_active_file(posting.file_id) {
+                            matches.push(posting.file_id);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(postings) = index.delta_postings.get(&trigram) {
+            matches.reserve(postings.len());
+            for posting in postings {
+                if !posting_matches_filter(posting, filter) {
+                    continue;
+                }
+                if index.is_active_file(posting.file_id) {
+                    matches.push(posting.file_id);
+                }
+            }
+        }
+        if matches.len() > 1 {
+            matches.sort_unstable();
+            matches.dedup();
+        }
+        matches
+    }
+
     fn assert_rank_matches_reference(
         index: &SearchIndex,
         query_trigrams: &[u32],
@@ -5076,6 +5146,68 @@ mod tests {
         assert!(index
             .postings_for_trigram(trigram, Some(non_matching_filter))
             .is_empty());
+    }
+
+    #[test]
+    fn direct_base_decode_matches_materialized_reference_for_all_storage_and_filters() {
+        let (_dir, index) = lexical_rank_mixed_storage_fixture();
+        let snapshot = index.snapshot();
+        let base_only = pack_trigram(b'm', b'a', b'r');
+        let base_and_delta = pack_trigram(b'a', b'b', b'c');
+
+        assert!(snapshot.delta_postings.get(&base_only).is_none());
+        assert!(snapshot.delta_postings.contains_key(&base_and_delta));
+        assert!(!snapshot.superseded.is_empty());
+
+        let filters = [
+            None,
+            Some(PostingFilter::default()),
+            Some(PostingFilter {
+                next_mask: mask_for_next_char(b'd'),
+                loc_mask: 0,
+            }),
+            Some(PostingFilter {
+                next_mask: mask_for_next_char(b'z'),
+                loc_mask: 0,
+            }),
+            Some(PostingFilter {
+                next_mask: 0,
+                loc_mask: mask_for_position(0),
+            }),
+            Some(PostingFilter {
+                next_mask: mask_for_next_char(b'd'),
+                loc_mask: mask_for_position(17),
+            }),
+            Some(PostingFilter {
+                next_mask: mask_for_next_char(b'z'),
+                loc_mask: mask_for_position(17),
+            }),
+        ];
+
+        for trigram in [base_only, base_and_delta] {
+            for filter in filters {
+                let expected =
+                    postings_for_trigram_materialized_reference(&snapshot, trigram, filter);
+                let actual = snapshot.postings_for_trigram(trigram, filter);
+                assert_eq!(
+                    actual, expected,
+                    "trigram={trigram:#08x}, filter={filter:?}"
+                );
+                assert!(actual
+                    .iter()
+                    .all(|file_id| !snapshot.superseded.contains(file_id)));
+            }
+        }
+
+        let unfiltered = snapshot.postings_for_trigram(base_and_delta, None);
+        let loc_only = snapshot.postings_for_trigram(
+            base_and_delta,
+            Some(PostingFilter {
+                next_mask: 0,
+                loc_mask: mask_for_position(31),
+            }),
+        );
+        assert_eq!(loc_only, unfiltered);
     }
 
     #[test]
