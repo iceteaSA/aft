@@ -11,6 +11,7 @@ pub mod rules;
 
 use crate::context::AppContext;
 use crate::protocol::Response;
+use crate::sandbox_spawn::{native_sandbox_enforced, AuthenticatedPrincipal};
 
 /// A `RewriteRule` matches a specific bash invocation pattern and dispatches
 /// internally to an AFT tool.
@@ -26,7 +27,16 @@ pub trait RewriteRule: Send + Sync {
 }
 
 /// Try to rewrite a bash command into an internal AFT tool call.
-/// Returns Some(response) if rewritten, None if no rule matched.
-pub fn try_rewrite(command: &str, session_id: Option<&str>, ctx: &AppContext) -> Option<Response> {
+/// Returns `Some(response)` if rewritten and `None` when no rule matched or the
+/// command must execute inside the native sandbox.
+pub fn try_rewrite(
+    command: &str,
+    session_id: Option<&str>,
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+) -> Option<Response> {
+    if native_sandbox_enforced(ctx, principal) {
+        return None;
+    }
     dispatch::dispatch(command, session_id, ctx)
 }

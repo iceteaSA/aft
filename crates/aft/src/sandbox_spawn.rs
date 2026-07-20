@@ -497,7 +497,11 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Whether permission-scanner findings should be recorded instead of prompting.
+/// Returns true on Unix when native sandboxing is enabled for a first-party caller.
+///
+/// Process spawning and in-process bash rewriting both use this check so the
+/// command executes through the configured sandbox instead of being rewritten
+/// to run inside the unsandboxed AFT process.
 pub(crate) fn native_sandbox_enforced(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
@@ -570,13 +574,16 @@ pub fn resolve_sandbox_spawn(
         }
     }
 
-    if !principal_is_first_party(principal) {
+    if !native_sandbox_enforced(ctx, principal) {
+        #[cfg(windows)]
+        if principal_is_first_party(principal) {
+            warn_windows_unsupported_once();
+        }
         return SpawnPlan::Unsandboxed;
     }
 
     #[cfg(windows)]
     {
-        warn_windows_unsupported_once();
         let _ = (ctx, task_kind, task_bundle_dir);
         SpawnPlan::Unsandboxed
     }
@@ -608,6 +615,20 @@ pub fn resolve_sandbox_spawn(
                 };
             }
         };
+        crate::slog_info!(
+            "sandbox profile apply: tier=native task_kind={task_kind:?} writable_roots={} read_deny={}",
+            profile.writable_roots.len(),
+            profile.read_deny.len()
+        );
+        crate::slog_debug!(
+            "sandbox profile paths: tier=native writable_roots={:?} write_deny_nested={:?} read_deny={:?} socket_deny={:?} cache_roots={:?} temp_dir={:?}",
+            profile.writable_roots,
+            profile.write_deny_nested,
+            profile.read_deny,
+            profile.socket_deny,
+            profile.cache_roots,
+            profile.temp_dir
+        );
         SpawnPlan::Launcher {
             profile,
             launcher_path,
@@ -1162,6 +1183,46 @@ mod policy_tests {
                 ..crate::config::Config::default()
             },
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_sandbox_predicate_controls_spawn_and_rewrite() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("rewrite-probe.txt");
+        std::fs::write(&file, "sandboxed\n").unwrap();
+        let ctx = context(project.path().to_path_buf());
+        ctx.update_config(|config| config.experimental_bash_rewrite = true);
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let command = format!("cat {}", file.display());
+
+        assert!(native_sandbox_enforced(&ctx, &principal));
+        assert!(crate::bash_rewrite::try_rewrite(&command, None, &ctx, &principal).is_none());
+        let sandboxed = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Native,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            None,
+        );
+        assert!(matches!(&sandboxed, SpawnPlan::Launcher { .. }));
+        sandboxed.cleanup_unspawned();
+
+        ctx.update_config(|config| config.sandbox.enabled = false);
+        assert!(!native_sandbox_enforced(&ctx, &principal));
+        assert!(crate::bash_rewrite::try_rewrite(&command, None, &ctx, &principal).is_some());
+        assert_eq!(
+            resolve_sandbox_spawn(
+                &ctx,
+                &principal,
+                RequestedSandboxTier::Native,
+                SandboxTaskKind::BashForeground,
+                project.path(),
+                None,
+            ),
+            SpawnPlan::Unsandboxed
+        );
     }
 
     #[test]

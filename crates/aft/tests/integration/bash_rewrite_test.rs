@@ -18,6 +18,7 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
+use aft::sandbox_spawn::AuthenticatedPrincipal;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -61,11 +62,18 @@ fn request(command: &str, params: Value) -> RawRequest {
 }
 
 fn rewrite(command: &str, ctx: &AppContext) -> Option<Value> {
-    try_rewrite(command, None, ctx).map(|response| response.data)
+    try_rewrite(command, None, ctx, &AuthenticatedPrincipal::FirstParty)
+        .map(|response| response.data)
 }
 
 fn rewrite_with_session(command: &str, session_id: &str, ctx: &AppContext) -> Option<Value> {
-    try_rewrite(command, Some(session_id), ctx).map(|response| response.data)
+    try_rewrite(
+        command,
+        Some(session_id),
+        ctx,
+        &AuthenticatedPrincipal::FirstParty,
+    )
+    .map(|response| response.data)
 }
 
 fn stable_hash_16(bytes: &[u8]) -> String {

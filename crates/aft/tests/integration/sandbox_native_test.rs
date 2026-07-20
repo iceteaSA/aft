@@ -29,7 +29,7 @@ fn configure_native_policy(
             "storage_dir": storage,
             "bash_permissions": true,
             "config": user_config(json!({
-                "bash": { "background": true },
+                "bash": { "background": true, "rewrite": true },
                 "sandbox": {
                     "enabled": enabled,
                     "write_allow": write_allow,
@@ -279,7 +279,7 @@ fn native_sandbox_denies_credentials_and_nested_git_writes_on_macos() {
     let read = foreground(
         &mut aft,
         "native-secret-read",
-        &format!("/bin/sh -c 'cat \"$1\"' native-read {}", quote(&secret)),
+        &format!("cat {}", quote(&secret)),
     );
     assert_eq!(
         read["status"], "failed",

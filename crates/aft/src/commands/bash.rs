@@ -259,9 +259,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
     if host_escalation.is_none() && workdir_matches_project_root(&workdir, ctx) {
-        if let Some(mut response) =
-            crate::bash_rewrite::try_rewrite(&params.command, req.session_id.as_deref(), ctx)
-        {
+        if let Some(mut response) = crate::bash_rewrite::try_rewrite(
+            &params.command,
+            req.session_id.as_deref(),
+            ctx,
+            &principal,
+        ) {
             // Rewriter rules build their own internal request with a placeholder
             // id (e.g. "bash_rewrite") to call into read/grep/glob handlers.
             // Stamp the original bash request id back onto the response so the
