@@ -502,6 +502,15 @@ pub(crate) fn native_sandbox_enforced(
     cfg!(unix) && ctx.config().sandbox.enabled && principal_is_first_party(principal)
 }
 
+pub(crate) fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<SpawnPlan> {
+    (ctx.config().sandbox.enabled && !cfg!(unix)).then(|| SpawnPlan::Refused {
+        code: "sandbox_unavailable",
+        message: "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
+            .to_string(),
+        mismatch_class: None,
+    })
+}
+
 /// Resolve policy for an agent-command process.
 ///
 /// `task_bundle_dir` must be the already-created directory that owns the task's
@@ -525,6 +534,12 @@ pub fn resolve_sandbox_spawn(
         return plan;
     }
 
+    // An enabled policy must never degrade into an ordinary child merely
+    // because this build has no kernel sandbox backend.
+    if let Some(refusal) = unsupported_platform_sandbox_refusal(ctx) {
+        return refusal;
+    }
+
     if requested_tier == RequestedSandboxTier::Disabled || !ctx.config().sandbox.enabled {
         return SpawnPlan::Unsandboxed;
     }
@@ -541,9 +556,8 @@ pub fn resolve_sandbox_spawn(
 
         #[cfg(windows)]
         {
-            warn_windows_unsupported_once();
             let _ = (ctx, task_kind, task_bundle_dir, host_escalation);
-            return SpawnPlan::Unsandboxed;
+            unreachable!("unsupported platforms return before host-tier resolution");
         }
 
         #[cfg(unix)]
@@ -563,22 +577,18 @@ pub fn resolve_sandbox_spawn(
         #[cfg(all(not(unix), not(windows)))]
         {
             let _ = (ctx, task_kind, task_bundle_dir, host_escalation);
-            return SpawnPlan::Unsandboxed;
+            unreachable!("unsupported platforms return before host-tier resolution");
         }
     }
 
     if !native_sandbox_enforced(ctx, principal) {
-        #[cfg(windows)]
-        if principal_is_first_party(principal) {
-            warn_windows_unsupported_once();
-        }
         return SpawnPlan::Unsandboxed;
     }
 
     #[cfg(windows)]
     {
         let _ = (ctx, task_kind, task_bundle_dir);
-        SpawnPlan::Unsandboxed
+        unreachable!("unsupported platforms return before native-tier resolution")
     }
 
     #[cfg(unix)]
@@ -631,7 +641,7 @@ pub fn resolve_sandbox_spawn(
     #[cfg(all(not(unix), not(windows)))]
     {
         let _ = (ctx, principal, task_kind, task_bundle_dir);
-        SpawnPlan::Unsandboxed
+        unreachable!("unsupported platforms return before native-tier resolution")
     }
 }
 
@@ -643,25 +653,6 @@ fn escalation_refused(refusal: EscalationRefusal) -> SpawnPlan {
         message: format!("sandbox host escalation grant refused: {class}"),
         mismatch_class: Some(class),
     }
-}
-
-#[cfg(windows)]
-fn warn_windows_unsupported_once() {
-    let session = crate::log_ctx::current_session().unwrap_or_else(|| "<unknown-session>".into());
-    if should_warn_windows_unsupported(&session) {
-        crate::slog_warn!("sandbox.enabled is not supported on Windows");
-    }
-}
-
-#[cfg(any(windows, test))]
-fn should_warn_windows_unsupported(session: &str) -> bool {
-    use std::collections::HashSet;
-
-    static WARNED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    WARNED_SESSIONS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .is_ok_and(|mut warned| warned.insert(session.to_string()))
 }
 
 #[cfg(unix)]
@@ -1627,19 +1618,9 @@ mod policy_tests {
         assert!(ctx.escalation_grants().lock().grants.is_empty());
     }
 
-    #[test]
-    fn windows_unsupported_warning_is_once_per_session() {
-        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
-        let first = format!("windows-warning-first-{suffix}");
-        let second = format!("windows-warning-second-{suffix}");
-        assert!(should_warn_windows_unsupported(&first));
-        assert!(!should_warn_windows_unsupported(&first));
-        assert!(should_warn_windows_unsupported(&second));
-    }
-
     #[cfg(windows)]
     #[test]
-    fn enabled_host_request_is_unsandboxed_on_windows_without_a_grant() {
+    fn enabled_host_request_is_refused_on_windows_without_a_grant() {
         let project = tempfile::tempdir().unwrap();
         let ctx = context(project.path().to_path_buf());
         let plan = resolve_sandbox_spawn(
@@ -1650,12 +1631,18 @@ mod policy_tests {
             project.path(),
             None,
         );
-        assert_eq!(plan, SpawnPlan::Unsandboxed);
+        assert_eq!(plan.refusal_code(), Some("sandbox_unavailable"));
+        assert_eq!(
+            plan.refusal_message(),
+            Some(
+                "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
+            )
+        );
     }
 
     #[cfg(windows)]
     #[test]
-    fn enabled_native_tier_is_unsandboxed_on_windows() {
+    fn enabled_native_tier_is_refused_on_windows() {
         let project = tempfile::tempdir().unwrap();
         let ctx = context(project.path().to_path_buf());
         let plan = resolve_sandbox_spawn(
@@ -1666,6 +1653,12 @@ mod policy_tests {
             project.path(),
             None,
         );
-        assert_eq!(plan, SpawnPlan::Unsandboxed);
+        assert_eq!(plan.refusal_code(), Some("sandbox_unavailable"));
+        assert_eq!(
+            plan.refusal_message(),
+            Some(
+                "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
+            )
+        );
     }
 }

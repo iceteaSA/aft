@@ -129,6 +129,18 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    if let Some(refusal) = crate::sandbox_spawn::unsupported_platform_sandbox_refusal(ctx) {
+        return Response::error(
+            &req.id,
+            refusal
+                .refusal_code()
+                .expect("unsupported platform refusal has a code"),
+            refusal
+                .refusal_message()
+                .expect("unsupported platform refusal has a message"),
+        );
+    }
+
     let workdir = params
         .workdir
         .clone()
@@ -908,6 +920,43 @@ mod tests {
             Some("sandbox_principal_unknown")
         );
         assert!(!sentinel.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsupported_platform_refuses_before_rewrite_or_spawn() {
+        use crate::sandbox_spawn::{
+            clear_sandbox_spawn_test_seam, install_sandbox_spawn_test_seam,
+            sandbox_spawn_test_observations,
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("rewrite-probe.txt");
+        std::fs::write(&file, "must-not-be-read").unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        ctx.update_config(|config| {
+            config.sandbox.enabled = true;
+            config.experimental_bash_rewrite = true;
+        });
+        install_sandbox_spawn_test_seam(project.path().to_path_buf());
+        let request = spawn_test_request(
+            "unsupported-sandbox-platform",
+            &format!("cat {}", file.display()),
+            false,
+        );
+
+        let response = handle(&request, &ctx);
+        let observations = sandbox_spawn_test_observations(project.path());
+        clear_sandbox_spawn_test_seam(project.path());
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "sandbox_unavailable");
+        assert_eq!(
+            response.data["message"],
+            "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
+        );
+        assert!(observations.is_empty(), "no child spawn may be resolved");
     }
 
     #[cfg(unix)]
