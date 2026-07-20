@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
 use std::sync::Mutex;
@@ -6,10 +7,12 @@ use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::cache::Tier1FileMemo;
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
+use crate::parser::{detect_language, grammar_for, LangId};
 
 const MAX_LINES_PER_FILE: usize = 100_000;
 const MAX_ITEMS: usize = 100;
@@ -17,6 +20,10 @@ const MAX_TEXT_CHARS: usize = 200;
 const MARKERS: [&str; 5] = ["TODO", "FIXME", "HACK", "XXX", "BUG"];
 
 static TODOS_MEMO: OnceLock<Tier1FileMemo<FileScan>> = OnceLock::new();
+
+thread_local! {
+    static TODOS_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
+}
 
 #[cfg(debug_assertions)]
 static FILE_READS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
@@ -112,13 +119,10 @@ fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileSc
     };
 
     let file = display_file_path(project_root, path);
-    let mut items = Vec::new();
-    let mut in_block_comment = false;
-    for (line_index, line) in source.lines().take(MAX_LINES_PER_FILE).enumerate() {
-        if let Some(item) = scan_line(line, line_index + 1, &file, &mut in_block_comment) {
-            items.push(item);
-        }
-    }
+    let items = match detect_language(path) {
+        Some(language) => scan_parser_comments(path, language, &source, &file),
+        None => scan_lexical_comments(&source, &file),
+    };
 
     (
         freshness,
@@ -127,6 +131,284 @@ fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileSc
             items,
         },
     )
+}
+
+fn scan_parser_comments(path: &Path, language: LangId, source: &str, file: &str) -> Vec<TodoItem> {
+    let Some(tree) = parse_source(path, language, source) else {
+        return Vec::new();
+    };
+
+    let mut comment_nodes = Vec::new();
+    collect_comment_nodes(tree.root_node(), language, source, &mut comment_nodes);
+    comment_nodes.sort_by_key(|node| node.start_byte());
+
+    let mut items = Vec::new();
+    for node in comment_nodes {
+        scan_comment_node(node, source, file, &mut items);
+    }
+    items.sort_by_key(|item| item.line);
+    items.dedup_by_key(|item| item.line);
+    items
+}
+
+fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
+    TODOS_PARSERS.with(|parsers| {
+        let mut parsers = parsers.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(language) {
+            let mut parser = Parser::new();
+            if parser.set_language(&grammar_for(language)).is_err() {
+                return None;
+            }
+            entry.insert(parser);
+        }
+
+        parsers
+            .get_mut(&language)
+            .expect("parser inserted for language")
+            .parse(source, None)
+            .or_else(|| {
+                log::debug!(
+                    "tree-sitter returned no TODO scan tree for {}",
+                    path.display()
+                );
+                None
+            })
+    })
+}
+
+fn collect_comment_nodes<'tree>(
+    root: Node<'tree>,
+    language: LangId,
+    source: &str,
+    comments: &mut Vec<Node<'tree>>,
+) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if is_comment_node(node, language, source) {
+            comments.push(node);
+            continue;
+        }
+
+        let mut children = Vec::new();
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                children.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        pending.extend(children.into_iter().rev());
+    }
+}
+
+fn is_comment_node(node: Node<'_>, language: LangId, source: &str) -> bool {
+    let kind = node.kind();
+    if kind == "comment" || kind.ends_with("_comment") {
+        return true;
+    }
+
+    language == LangId::Markdown
+        && matches!(kind, "html_block" | "html_inline")
+        && node
+            .utf8_text(source.as_bytes())
+            .is_ok_and(|text| text.trim_start().starts_with("<!--"))
+}
+
+fn scan_comment_node(node: Node<'_>, source: &str, file: &str, items: &mut Vec<TodoItem>) {
+    let Ok(comment) = node.utf8_text(source.as_bytes()) else {
+        return;
+    };
+    let first_line = node.start_position().row + 1;
+    let mut in_block_comment = false;
+    for (offset, line) in comment.lines().enumerate() {
+        let line_number = first_line + offset;
+        if line_number > MAX_LINES_PER_FILE {
+            break;
+        }
+        if let Some(item) = scan_line(line, line_number, file, &mut in_block_comment) {
+            items.push(item);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuoteState {
+    delimiter: u8,
+    raw_hashes: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct LexicalState {
+    quote: Option<QuoteState>,
+    block_closer: Option<&'static str>,
+}
+
+fn scan_lexical_comments(source: &str, file: &str) -> Vec<TodoItem> {
+    let mut state = LexicalState::default();
+    source
+        .lines()
+        .take(MAX_LINES_PER_FILE)
+        .enumerate()
+        .filter_map(|(line_index, line)| scan_lexical_line(line, line_index + 1, file, &mut state))
+        .collect()
+}
+
+fn scan_lexical_line(
+    line: &str,
+    line_number: usize,
+    file: &str,
+    state: &mut LexicalState,
+) -> Option<TodoItem> {
+    let mut cursor = 0usize;
+    while cursor < line.len() {
+        if let Some(closer) = state.block_closer {
+            let closer_offset = line[cursor..].find(closer);
+            let body_end = closer_offset
+                .map(|offset| cursor + offset)
+                .unwrap_or(line.len());
+            let body = strip_block_comment_prefix(&line[cursor..body_end]);
+            let item = parse_todo_body(body, line_number, file);
+            let Some(closer_offset) = closer_offset else {
+                return item;
+            };
+            state.block_closer = None;
+            cursor += closer_offset + closer.len();
+            if item.is_some() {
+                return item;
+            }
+            continue;
+        }
+
+        if let Some(quote) = state.quote {
+            cursor = advance_quoted_cursor(line, cursor, quote, state);
+            continue;
+        }
+
+        if let Some((quote, after_opener)) = raw_quote_start(line, cursor) {
+            state.quote = Some(quote);
+            cursor = after_opener;
+            continue;
+        }
+
+        let byte = line.as_bytes()[cursor];
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            state.quote = Some(QuoteState {
+                delimiter: byte,
+                raw_hashes: None,
+            });
+            cursor += 1;
+            continue;
+        }
+
+        let Some((prefix, closer)) = comment_prefix_at(line, cursor) else {
+            cursor += next_char_len(line, cursor);
+            continue;
+        };
+        if !is_comment_prefix_boundary(line, cursor, prefix) {
+            cursor += prefix.len();
+            continue;
+        }
+
+        let body_start = cursor + prefix.len();
+        if let Some(closer) = closer {
+            let closer_offset = line[body_start..].find(closer);
+            let body_end = closer_offset
+                .map(|offset| body_start + offset)
+                .unwrap_or(line.len());
+            let body = strip_block_comment_prefix(&line[body_start..body_end]);
+            let item = parse_todo_body(body, line_number, file);
+            if let Some(offset) = closer_offset {
+                cursor = body_start + offset + closer.len();
+            } else {
+                state.block_closer = Some(closer);
+                return item;
+            }
+            if item.is_some() {
+                return item;
+            }
+            continue;
+        }
+
+        return parse_todo_body(line[body_start..].trim_start(), line_number, file);
+    }
+
+    None
+}
+
+fn advance_quoted_cursor(
+    line: &str,
+    cursor: usize,
+    quote: QuoteState,
+    state: &mut LexicalState,
+) -> usize {
+    let byte = line.as_bytes()[cursor];
+    if quote.raw_hashes.is_none() && byte == b'\\' {
+        let escaped = cursor + 1;
+        return escaped + next_char_len(line, escaped);
+    }
+    if byte != quote.delimiter {
+        return cursor + next_char_len(line, cursor);
+    }
+
+    let hashes = quote.raw_hashes.unwrap_or_default();
+    let after_quote = cursor + 1;
+    let hashes_match = line.as_bytes().get(after_quote..).is_some_and(|rest| {
+        rest.len() >= hashes && rest[..hashes].iter().all(|byte| *byte == b'#')
+    });
+    if hashes_match {
+        state.quote = None;
+        after_quote + hashes
+    } else {
+        cursor + 1
+    }
+}
+
+fn raw_quote_start(line: &str, cursor: usize) -> Option<(QuoteState, usize)> {
+    if line.as_bytes().get(cursor) != Some(&b'r') {
+        return None;
+    }
+
+    let mut opener_end = cursor + 1;
+    while line.as_bytes().get(opener_end) == Some(&b'#') {
+        opener_end += 1;
+    }
+    if line.as_bytes().get(opener_end) != Some(&b'"') {
+        return None;
+    }
+
+    Some((
+        QuoteState {
+            delimiter: b'"',
+            raw_hashes: Some(opener_end - cursor - 1),
+        },
+        opener_end + 1,
+    ))
+}
+
+fn comment_prefix_at(line: &str, cursor: usize) -> Option<(&'static str, Option<&'static str>)> {
+    let rest = &line[cursor..];
+    if rest.starts_with("<!--") {
+        Some(("<!--", Some("-->")))
+    } else if rest.starts_with("//") {
+        Some(("//", None))
+    } else if rest.starts_with("/*") {
+        Some(("/*", Some("*/")))
+    } else if rest.starts_with('#') {
+        Some(("#", None))
+    } else if rest.starts_with("--") {
+        Some(("--", None))
+    } else {
+        None
+    }
+}
+
+fn next_char_len(line: &str, cursor: usize) -> usize {
+    line.get(cursor..)
+        .and_then(|rest| rest.chars().next())
+        .map(char::len_utf8)
+        .unwrap_or_default()
 }
 
 fn read_text_file(path: &Path) -> (Option<FileFreshness>, Option<String>) {

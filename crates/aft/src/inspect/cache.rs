@@ -146,7 +146,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// different surfaced group set.
 /// v30: cycles verdicts retain singleton strongly connected components when a
 /// resolved non-type import explicitly points back to the same file.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 30;
+/// v31: TODO extraction now reads parser comment nodes and ignores marker-like
+/// text in strings, changing aggregate verdicts for unchanged source files.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 31;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -2349,7 +2351,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 30);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 31);
     }
 
     #[test]

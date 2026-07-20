@@ -6,6 +6,9 @@ use aft::config::Config;
 use aft::inspect::scanners::todos::run_todos_scan;
 use aft::inspect::{InspectCategory, InspectJob, InspectScanSuccess, JobKey, JobScope};
 use aft::parser::SymbolCache;
+use serde_json::json;
+
+use crate::test_helpers::AftProcess;
 
 fn inspect_todos_job(project_root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
     let config = Config {
@@ -49,9 +52,9 @@ fn inspect_todos_counts_mixed_markers_and_items() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let src = temp_dir.path().join("src");
     fs::create_dir_all(&src).expect("create src");
-    let file = src.join("app.rs");
+    let rust_file = src.join("app.rs");
     fs::write(
-        &file,
+        &rust_file,
         "// TODO(alice): implement retry\n\
          fn main() {\n\
          /* FIXME handle errors */\n\
@@ -59,11 +62,12 @@ fn inspect_todos_counts_mixed_markers_and_items() {
           * HACK: temporary shim\n\
           * XXX: doc block item\n\
           */\n\
-         # BUG: hash-style bug\n\
          }\n",
     )
-    .expect("write fixture");
-    let job = inspect_todos_job(temp_dir.path(), vec![file]);
+    .expect("write Rust fixture");
+    let python_file = src.join("worker.py");
+    fs::write(&python_file, "# BUG: hash-style bug\n").expect("write Python fixture");
+    let job = inspect_todos_job(temp_dir.path(), vec![rust_file, python_file]);
 
     let success = run_job(&job);
 
@@ -100,8 +104,8 @@ fn inspect_todos_requires_comment_syntax_before_marker() {
 
     let success = run_job(&job);
 
-    // v0.33 intentionally uses lexical scanning, but markers must still follow
-    // a recognized comment prefix on the same line.
+    // Parser-supported files accept markers only from syntax-tree comment nodes;
+    // marker text in code or string literals must not contribute findings.
     assert_eq!(success.aggregate["count"], 1);
     let items = success.aggregate["items"].as_array().unwrap();
     assert_eq!(items[0]["marker"], "BUG");
@@ -139,4 +143,98 @@ fn inspect_todos_skips_binary_files_without_panic() {
     assert!(success.scanned_files.is_empty());
     assert_eq!(success.aggregate["count"], 0);
     assert_eq!(success.aggregate["items"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn inspect_todos_unsupported_text_fallback_ignores_quoted_comment_tokens() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let file = temp_dir.path().join("notes.txt");
+    fs::write(
+        &file,
+        "plain = \" // TODO: not a comment\"\n\
+         escaped = \"\\\" // FIXME: not a comment\"\n\
+         raw = r#\"// HACK: not a comment\"#\n\
+         template = `-- XXX: not a comment`\n\
+         # BUG: real fallback comment\n",
+    )
+    .expect("write fallback fixture");
+    let job = inspect_todos_job(temp_dir.path(), vec![file]);
+
+    let success = run_job(&job);
+
+    assert_eq!(success.aggregate["count"], 1);
+    assert_eq!(success.aggregate["by_kind"]["BUG"], 1);
+    assert_eq!(
+        success.aggregate["items"][0]["text"],
+        "real fallback comment"
+    );
+}
+
+#[test]
+fn inspect_todos_binary_uses_comment_nodes_without_regressing_real_comments() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let src = temp_dir.path().join("src");
+    fs::create_dir_all(&src).expect("create src");
+    fs::write(
+        src.join("strings.rs"),
+        "fn main() {\n\
+             let plain = \" // TODO: not a comment\";\n\
+             let escaped = \"\\\" // FIXME: not a comment\";\n\
+             let raw = r#\"// TODO: not a comment\"#;\n\
+         }\n\
+         // TODO: real Rust line comment\n\
+         /* FIXME: real Rust block comment */\n",
+    )
+    .expect("write Rust fixture");
+    fs::write(
+        src.join("template.ts"),
+        "const fake = `// HACK: not a comment`;\n",
+    )
+    .expect("write TypeScript fixture");
+    fs::write(src.join("worker.py"), "# HACK: real hash comment\n").expect("write Python fixture");
+    fs::write(
+        src.join("page.html"),
+        "<script>const fake = \"<!-- TODO: not a comment -->\";</script>\n\
+         <!-- XXX: real HTML comment -->\n",
+    )
+    .expect("write HTML fixture");
+    fs::write(
+        temp_dir.path().join("README.md"),
+        "<!-- BUG: real Markdown comment -->\n",
+    )
+    .expect("write Markdown fixture");
+    fs::write(src.join("script.lua"), "-- BUG: real Lua comment\n").expect("write Lua fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configured = aft.configure(temp_dir.path());
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+    let response = aft.send(
+        &json!({
+            "id": "inspect-todos-comments",
+            "command": "tool_call",
+            "name": "inspect",
+            "arguments": { "sections": ["todos"] }
+        })
+        .to_string(),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:?}");
+    assert_eq!(response["summary"]["todos"]["count"], 6, "{response:?}");
+    assert_eq!(response["summary"]["todos"]["by_kind"]["TODO"], 1);
+    assert_eq!(response["summary"]["todos"]["by_kind"]["FIXME"], 1);
+    assert_eq!(response["summary"]["todos"]["by_kind"]["HACK"], 1);
+    assert_eq!(response["summary"]["todos"]["by_kind"]["XXX"], 1);
+    assert_eq!(response["summary"]["todos"]["by_kind"]["BUG"], 2);
+
+    let items = response["details"]["todos"]
+        .as_array()
+        .expect("TODO details array");
+    assert!(items.iter().all(|item| {
+        !item["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("not a comment"))
+    }));
 }
