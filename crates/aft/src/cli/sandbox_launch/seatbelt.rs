@@ -53,29 +53,19 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         ));
     }
     for path in &profile.write_deny_nested {
-        if !path.exists() {
-            continue;
-        }
         source.push_str(&format!(
-            "(deny file-write* ({} \"{}\"))\n",
-            path_filter(path),
+            "(deny file-write* (subpath \"{}\"))\n",
             escape_path(path)?
         ));
     }
     for path in &profile.read_deny {
-        if !path.exists() {
-            continue;
-        }
         source.push_str(&format!(
             "(deny file-read* ({} \"{}\"))\n",
-            path_filter(path),
+            read_path_filter(path),
             escape_path(path)?
         ));
     }
     for path in &profile.socket_deny {
-        if !path.exists() {
-            continue;
-        }
         source.push_str(&format!(
             "(deny network-outbound (path \"{}\"))\n",
             escape_path(path)?
@@ -85,11 +75,13 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
     Ok(source)
 }
 
-fn path_filter(path: &Path) -> &'static str {
-    if path.is_dir() {
-        "subpath"
-    } else {
+fn read_path_filter(path: &Path) -> &'static str {
+    if path.is_file() {
         "literal"
+    } else {
+        // A missing deny target may become a directory after the profile is
+        // installed, so treating it as a subpath keeps future children denied.
+        "subpath"
     }
 }
 
@@ -140,5 +132,44 @@ mod tests {
             .rfind("(deny file-write*")
             .expect("nested write deny");
         assert!(deny > allow, "nested deny must be the last matching rule");
+    }
+
+    #[test]
+    fn missing_mandatory_denies_are_rendered_with_path_intent() {
+        let root = tempfile::tempdir().expect("temp root");
+        let project = root.path().join("project");
+        let task_temp = root.path().join("task");
+        std::fs::create_dir_all(&project).expect("project directory");
+        std::fs::create_dir_all(&task_temp).expect("task temp directory");
+        let missing_git = project.join(".git");
+        let missing_secret = root.path().join("missing-secret");
+        let missing_socket = root.path().join("missing.sock");
+        let profile = SandboxProfile::build(
+            vec![project],
+            vec![missing_git.clone()],
+            vec![missing_secret.clone()],
+            vec![missing_socket.clone()],
+            Vec::new(),
+            task_temp,
+        )
+        .expect("build profile");
+
+        let source = render_profile(&profile).expect("render profile");
+        for rule in [
+            format!(
+                "(deny file-write* (subpath \"{}\"))",
+                profile.write_deny_nested[0].display()
+            ),
+            format!(
+                "(deny file-read* (subpath \"{}\"))",
+                profile.read_deny[0].display()
+            ),
+            format!(
+                "(deny network-outbound (path \"{}\"))",
+                profile.socket_deny[0].display()
+            ),
+        ] {
+            assert!(source.contains(&rule), "missing mandatory rule: {rule}");
+        }
     }
 }

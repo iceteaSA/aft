@@ -3,6 +3,8 @@
 use aft::sandbox_profile::SandboxProfile;
 use portable_pty::{CommandBuilder, PtySize};
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::io::{BufRead, BufReader};
 use std::io::{Read, Seek, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
@@ -311,6 +313,98 @@ fn p4_nested_project_write_denies_are_enforced() {
         b"original\n"
     );
     assert!(!cortex_file.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn missing_project_metadata_remains_write_denied() {
+    let root = tempfile::tempdir().expect("create probe root");
+    let root = root.path().canonicalize().expect("canonical probe root");
+    let project = root.join("project");
+    let task_temp = root.join("task-temp");
+    fs::create_dir_all(&project).expect("create project");
+    fs::create_dir_all(&task_temp).expect("create task temp");
+    let git_dir = project.join(".git");
+    let hook = git_dir.join("hooks/pre-commit");
+    let profile = SandboxProfile::build(
+        vec![project],
+        vec![git_dir],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        task_temp,
+    )
+    .expect("build profile with absent metadata deny");
+    let mut inherited = InheritedProfile::new(&profile);
+    inherited.rewind();
+
+    let script = format!(
+        "mkdir -p {} && printf x > {}",
+        shell_path(hook.parent().expect("hook parent")),
+        shell_path(&hook)
+    );
+    let output = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .output()
+        .expect("launch absent metadata probe");
+
+    assert_denied(&output, "absent project metadata write");
+    assert!(!hook.exists(), "sandbox created a denied hook");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn read_deny_created_after_sandbox_start_remains_denied() {
+    let root = tempfile::tempdir().expect("create probe root");
+    let root = root.path().canonicalize().expect("canonical probe root");
+    let project = root.join("project");
+    let task_temp = root.join("task-temp");
+    fs::create_dir_all(&project).expect("create project");
+    fs::create_dir_all(&task_temp).expect("create task temp");
+    let secret_dir = root.join("late-secret");
+    let secret_file = secret_dir.join("token");
+    let release = root.join("release");
+    let profile = SandboxProfile::build(
+        vec![project],
+        Vec::new(),
+        vec![secret_dir.clone()],
+        Vec::new(),
+        Vec::new(),
+        task_temp,
+    )
+    .expect("build profile with absent read deny");
+    let mut inherited = InheritedProfile::new(&profile);
+    inherited.rewind();
+    let script = format!(
+        "printf 'ready\\n'; while [ ! -e {} ]; do sleep 0.01; done; cat {}",
+        shell_path(&release),
+        shell_path(&secret_file)
+    );
+    let mut child = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("launch late read-deny probe");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).expect("read readiness line");
+    assert_eq!(ready, "ready\n", "sandboxed shell did not become ready");
+
+    fs::create_dir(&secret_dir).expect("create late secret directory");
+    fs::write(&secret_file, b"late-secret\n").expect("write late secret");
+    fs::write(&release, b"go").expect("release sandboxed shell");
+    let status = child.wait().expect("wait for late read-deny probe");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+
+    assert!(
+        !status.success(),
+        "late-created secret read unexpectedly succeeded; stderr={stderr}"
+    );
 }
 
 #[cfg(target_os = "linux")]

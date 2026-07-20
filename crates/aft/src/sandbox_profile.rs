@@ -44,8 +44,8 @@ impl SandboxProfile {
 
     /// Revalidate an inherited profile and canonicalize it in the launcher.
     ///
-    /// Missing deny targets remain normalized in the profile and platform
-    /// appliers skip them. Every path that grants write access must exist.
+    /// Missing deny targets remain enforceable by resolving their nearest
+    /// existing ancestor. Every path that grants write access must exist.
     pub fn canonicalize_for_launch(self) -> Result<Self, SandboxProfileError> {
         if self.v != SANDBOX_PROFILE_VERSION {
             return Err(SandboxProfileError::new(format!(
@@ -141,19 +141,57 @@ fn canonicalize_optional_paths(
             Ok(path) => canonical.push(path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 validate_normalized(&path, field)?;
-                canonical.push(path);
+                canonical.push(canonicalize_missing_path(path, field)?);
             }
             Err(error) => {
-                return Err(SandboxProfileError::new(format!(
-                    "failed to canonicalize {field} path {}: {error}",
-                    path.display()
-                )));
+                return Err(canonicalization_error(&path, field, &error));
             }
         }
     }
     canonical.sort_unstable();
     canonical.dedup();
     Ok(canonical)
+}
+
+fn canonicalize_missing_path(path: PathBuf, field: &str) -> Result<PathBuf, SandboxProfileError> {
+    let original = path.clone();
+    let mut ancestor = path;
+    let mut missing_tail = Vec::new();
+
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in missing_tail.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&ancestor) {
+                    Ok(_) => return Err(canonicalization_error(&original, field, &error)),
+                    Err(probe_error) if probe_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(probe_error) => {
+                        return Err(canonicalization_error(&original, field, &probe_error));
+                    }
+                }
+                let Some(component) = ancestor.file_name().map(ToOwned::to_owned) else {
+                    return Err(canonicalization_error(&original, field, &error));
+                };
+                missing_tail.push(component);
+                if !ancestor.pop() {
+                    return Err(canonicalization_error(&original, field, &error));
+                }
+            }
+            Err(error) => return Err(canonicalization_error(&original, field, &error)),
+        }
+    }
+}
+
+fn canonicalization_error(path: &Path, field: &str, error: &std::io::Error) -> SandboxProfileError {
+    SandboxProfileError::new(format!(
+        "failed to canonicalize {field} path {}: {error}",
+        path.display()
+    ))
 }
 
 fn validate_absolute(path: &Path, field: &str) -> Result<(), SandboxProfileError> {
@@ -194,6 +232,11 @@ mod tests {
         std::fs::create_dir_all(&cache).expect("cache");
         std::fs::create_dir_all(&temp).expect("temp");
         let missing = root.path().join("missing-secret");
+        let canonical_missing = root
+            .path()
+            .canonicalize()
+            .expect("canonical root")
+            .join("missing-secret");
 
         let profile = SandboxProfile::build(
             vec![project.clone()],
@@ -211,7 +254,7 @@ mod tests {
         );
         assert_eq!(profile.cache_roots, vec![cache.canonicalize().unwrap()]);
         assert_eq!(profile.temp_dir, temp.canonicalize().unwrap());
-        assert_eq!(profile.read_deny, vec![missing]);
+        assert_eq!(profile.read_deny, vec![canonical_missing]);
     }
 
     #[test]
