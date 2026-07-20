@@ -182,6 +182,7 @@ pub struct StoreTraceToSymbolResult {
     pub reason: Option<String>,
 }
 
+#[derive(Clone)]
 enum ForwardCall {
     Resolved(StoreCallSite),
     Unresolved(StoreUnresolvedCall),
@@ -531,7 +532,16 @@ pub fn call_tree_result(
 ) -> StoreAdapterResult<StoreCallTreeNode> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let mut visited = HashSet::new();
-    let mut tree = call_tree_inner(store, &target, depth, 0, &mut visited)?;
+    let mut adjacency_cache = HashMap::new();
+    let mut tree = call_tree_inner(
+        store,
+        &target,
+        depth,
+        0,
+        &mut visited,
+        &mut adjacency_cache,
+        true,
+    )?;
     if !include_tests {
         filter_call_tree_tests(&mut tree);
     }
@@ -1872,12 +1882,15 @@ fn collect_callers_recursive(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_tree_inner(
     store: &impl CallGraphRead,
     current: &ResolvedStoreSymbol,
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<(String, String)>,
+    adjacency_cache: &mut HashMap<(String, String), Vec<ForwardCall>>,
+    memoize_adjacency: bool,
 ) -> StoreAdapterResult<StoreCallTreeNode> {
     let node = &current.representative;
     let visit_key = (node.file.clone(), node.symbol.clone());
@@ -1897,7 +1910,19 @@ fn call_tree_inner(
     }
     visited.insert(visit_key.clone());
 
-    let calls = forward_calls_for_nodes(store, &current.nodes)?;
+    // Only adjacency rows are shared across converging paths. The visited set remains
+    // path-local so repeated nodes still render independently with correct cycle guards.
+    let calls = if memoize_adjacency {
+        if let Some(calls) = adjacency_cache.get(&visit_key) {
+            calls.clone()
+        } else {
+            let calls = forward_calls_for_nodes(store, &current.nodes)?;
+            adjacency_cache.insert(visit_key.clone(), calls.clone());
+            calls
+        }
+    } else {
+        forward_calls_for_nodes(store, &current.nodes)?
+    };
     let mut children = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
@@ -1919,6 +1944,8 @@ fn call_tree_inner(
                             max_depth,
                             current_depth + 1,
                             visited,
+                            adjacency_cache,
+                            memoize_adjacency,
                         )?;
                         child.approximate = edge_approximate(&site);
                         child.resolved_by = edge_resolved_by(&site);
@@ -2143,7 +2170,9 @@ mod trace_to_tests {
         sqlite_path: PathBuf,
         nodes: HashMap<(String, String), StoreNode>,
         callers: HashMap<(String, String), Vec<StoreCallSite>>,
+        outgoing: HashMap<(String, String), Vec<StoreCallSite>>,
         caller_queries: RefCell<HashMap<(String, String), usize>>,
+        forward_query_count: RefCell<usize>,
         caller_count_queries: RefCell<usize>,
         caller_count_targets: RefCell<usize>,
     }
@@ -2155,7 +2184,9 @@ mod trace_to_tests {
                 sqlite_path: PathBuf::from("/repo/callgraph.sqlite"),
                 nodes: HashMap::new(),
                 callers: HashMap::new(),
+                outgoing: HashMap::new(),
                 caller_queries: RefCell::new(HashMap::new()),
+                forward_query_count: RefCell::new(0),
                 caller_count_queries: RefCell::new(0),
                 caller_count_targets: RefCell::new(0),
             }
@@ -2185,6 +2216,31 @@ mod trace_to_tests {
                     resolved: true,
                     provenance: TRACE_DATA_RESOLVER_PROVENANCE.to_string(),
                 });
+        }
+
+        fn add_outgoing(&mut self, caller: &StoreNode, target: &StoreNode) {
+            self.outgoing
+                .entry((caller.file.clone(), caller.symbol.clone()))
+                .or_default()
+                .push(StoreCallSite {
+                    caller: caller.clone(),
+                    target_file: target.file.clone(),
+                    target_symbol: target.symbol.clone(),
+                    target: Some(target.clone()),
+                    line: target.line,
+                    byte_start: 0,
+                    byte_end: 1,
+                    resolved: true,
+                    provenance: TRACE_DATA_RESOLVER_PROVENANCE.to_string(),
+                });
+        }
+
+        fn total_forward_queries(&self) -> usize {
+            *self.forward_query_count.borrow()
+        }
+
+        fn reset_forward_queries(&self) {
+            *self.forward_query_count.borrow_mut() = 0;
         }
 
         fn total_caller_queries(&self) -> usize {
@@ -2312,19 +2368,25 @@ mod trace_to_tests {
             unreachable!("not used by trace_to_result")
         }
 
-        fn outgoing_calls_of(&self, _node: &StoreNode) -> CallGraphResult<Vec<StoreCallSite>> {
-            unreachable!("not used by trace_to_result")
+        fn outgoing_calls_of(&self, node: &StoreNode) -> CallGraphResult<Vec<StoreCallSite>> {
+            *self.forward_query_count.borrow_mut() += 1;
+            Ok(self
+                .outgoing
+                .get(&(node.file.clone(), node.symbol.clone()))
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn resolved_self_calls_of(&self, _node: &StoreNode) -> CallGraphResult<Vec<StoreCallSite>> {
-            unreachable!("not used by trace_to_result")
+            unreachable!("not used by these adapter tests")
         }
 
         fn unresolved_calls_of(
             &self,
             _node: &StoreNode,
         ) -> CallGraphResult<Vec<StoreUnresolvedCall>> {
-            unreachable!("not used by trace_to_result")
+            *self.forward_query_count.borrow_mut() += 1;
+            Ok(Vec::new())
         }
 
         fn call_tree(
@@ -2388,6 +2450,70 @@ mod trace_to_tests {
             previous = current;
         }
         (store, target)
+    }
+
+    fn converging_call_tree_store(width: usize) -> (CountingStore, StoreNode) {
+        let mut store = CountingStore::new();
+        let root = node("root", false);
+        let helper = node("helper", false);
+        let leaf = node("leaf", false);
+        for fixture_node in [&root, &helper, &leaf] {
+            store.add_node(fixture_node.clone());
+        }
+        store.add_outgoing(&helper, &leaf);
+
+        for index in 0..width {
+            let handler = node(&format!("handler_{index}"), false);
+            store.add_node(handler.clone());
+            store.add_outgoing(&root, &handler);
+            store.add_outgoing(&handler, &helper);
+        }
+        (store, root)
+    }
+
+    fn call_tree_node_count(tree: &StoreCallTreeNode) -> usize {
+        1 + tree
+            .children
+            .iter()
+            .map(call_tree_node_count)
+            .sum::<usize>()
+    }
+
+    #[test]
+    fn call_tree_memoizes_only_adjacency_and_preserves_rendered_tree() {
+        let (store, root) = converging_call_tree_store(200);
+
+        let memoized = call_tree_result(&store, Path::new(&root.file), &root.symbol, 3, true)
+            .expect("memoized call tree");
+        let memoized_queries = store.total_forward_queries();
+
+        store.reset_forward_queries();
+        let resolved_root = ResolvedStoreSymbol {
+            representative: root.clone(),
+            nodes: vec![root],
+        };
+        let mut visited = HashSet::new();
+        let mut unused_cache = HashMap::new();
+        let uncached = call_tree_inner(
+            &store,
+            &resolved_root,
+            3,
+            0,
+            &mut visited,
+            &mut unused_cache,
+            false,
+        )
+        .expect("uncached call tree");
+        let uncached_queries = store.total_forward_queries();
+
+        assert_eq!(call_tree_node_count(&memoized), 601);
+        assert_eq!(
+            serde_json::to_vec(&memoized).expect("serialize memoized tree"),
+            serde_json::to_vec(&uncached).expect("serialize uncached tree"),
+            "adjacency memoization must not change rendered call-tree bytes"
+        );
+        assert_eq!(uncached_queries, 1_202);
+        assert_eq!(memoized_queries, 406);
     }
 
     #[test]
