@@ -3776,7 +3776,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
         }
 
         if job.format_tool_cache_clear_needed {
-            crate::format::clear_tool_cache();
+            crate::format::clear_tool_cache_for_root(Some(&job.root_path));
         }
 
         ctx.backup()

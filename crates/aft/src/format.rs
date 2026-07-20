@@ -313,6 +313,32 @@ pub fn clear_tool_cache() {
     }
 }
 
+/// Invalidate only the tool-cache entries scoped to `project_root`.
+///
+/// The resolution and availability caches are both keyed by project root, and a
+/// tool's resolved location depends only on the root in its key (node_modules/.bin
+/// is relative to that root; PATH and well-known lookups are root-independent), so
+/// reconfiguring one root can never stale another root's entry. A global clear on
+/// every root change was therefore both unnecessary and harmful: under the daemon
+/// it dumped every other root's cache, and because it ran on a configure background
+/// thread it raced test-local cache assertions elsewhere in the process. Scoping the
+/// clear to the reconfigured root removes both problems.
+pub fn clear_tool_cache_for_root(project_root: Option<&Path>) {
+    let scoped_root = project_root.map(Path::to_path_buf).unwrap_or_default();
+    if let Ok(mut cache) = TOOL_RESOLUTION_CACHE.lock() {
+        cache.retain(|key, _| key.project_root != scoped_root);
+    }
+    let root_suffix = format!(
+        "\0{}",
+        project_root
+            .map(|path| path.to_string_lossy())
+            .unwrap_or_default()
+    );
+    if let Ok(mut cache) = TOOL_AVAILABILITY_CACHE.lock() {
+        cache.retain(|key, _| !key.ends_with(&root_suffix));
+    }
+}
+
 /// Resolve a tool by checking node_modules/.bin relative to project_root, then PATH.
 /// Returns the full path to the tool if found, otherwise None.
 fn resolve_tool(command: &str, project_root: Option<&Path>) -> Option<String> {
