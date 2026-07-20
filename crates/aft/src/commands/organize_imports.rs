@@ -798,7 +798,7 @@ fn raw_preserving_dedup_key(imp: &ImportStatement) -> String {
         | ImportForm::Es { named, .. }
         | ImportForm::Python { named, .. }
         | ImportForm::RustUse { named, .. } => sort_named_specifiers(named),
-        ImportForm::Go { .. } => {}
+        ImportForm::Go { .. } | ImportForm::Php { .. } => {}
     }
 
     format!("{}|{:?}|{:?}", imp.module_path, imp.kind, form)

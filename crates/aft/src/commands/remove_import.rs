@@ -152,6 +152,8 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .filter(|(_, imp)| {
             let module_matches = if lang == LangId::Python {
                 python_import_matches_module(imp, module)
+            } else if lang == LangId::Php {
+                imports::php_import_matches_module(imp, module)
             } else {
                 imp.module_path == module
             };
@@ -535,6 +537,14 @@ fn remove_entire_imports(
     let mut edits: Vec<(std::ops::Range<usize>, String)> = matching
         .iter()
         .map(|(_, imp)| {
+            if lang == LangId::Php {
+                if let Some(replacement) = imports::rewrite_php_import_without_module(imp, module) {
+                    return match replacement {
+                        Some(new_line) => (imp.byte_range.clone(), new_line),
+                        None => (line_range(source, &imp.byte_range), String::new()),
+                    };
+                }
+            }
             if lang == LangId::Python {
                 if let Some(specifiers) = python_plain_import_specifiers(imp) {
                     let remaining: Vec<&str> = specifiers

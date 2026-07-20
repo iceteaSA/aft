@@ -1,6 +1,6 @@
 use super::{
     import_byte_range, ImportBlock, ImportForm, ImportGroup, ImportKind, ImportRequest,
-    ImportStatement, ImportSyntax,
+    ImportStatement, ImportSyntax, PhpImportClause,
 };
 use tree_sitter::{Node, Tree};
 
@@ -19,28 +19,66 @@ pub(crate) fn parse_php_imports(source: &str, tree: &Tree) -> ImportBlock {
     }
 }
 
-fn collect_php_imports(source: &str, node: Node, imports: &mut Vec<ImportStatement>) {
-    if node.kind() == "namespace_use_declaration" {
-        if let Some(imp) = parse_php_namespace_use_declaration(source, &node) {
-            imports.push(imp);
-        }
-        return;
-    }
+fn collect_php_imports(source: &str, root: Node, imports: &mut Vec<ImportStatement>) {
+    collect_php_imports_in_scope(source, root, imports);
+}
 
-    let mut cursor = node.walk();
+fn collect_php_imports_in_scope(
+    source: &str,
+    scope: Node,
+    imports: &mut Vec<ImportStatement>,
+) -> usize {
+    let mut visited = 0;
+    let mut cursor = scope.walk();
     if cursor.goto_first_child() {
         loop {
-            collect_php_imports(source, cursor.node(), imports);
+            let child = cursor.node();
+            visited += 1;
+            match child.kind() {
+                "namespace_use_declaration" => {
+                    if let Some(imp) = parse_php_namespace_use_declaration(source, &child) {
+                        imports.push(imp);
+                    }
+                }
+                "namespace_definition" => {
+                    visited += collect_php_imports_in_namespace(source, child, imports);
+                }
+                _ => {}
+            }
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
     }
+    visited
+}
+
+fn collect_php_imports_in_namespace(
+    source: &str,
+    namespace: Node,
+    imports: &mut Vec<ImportStatement>,
+) -> usize {
+    let mut visited = 0;
+    let mut cursor = namespace.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            visited += 1;
+            if child.kind() == "compound_statement" {
+                visited += collect_php_imports_in_scope(source, child, imports);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    visited
 }
 
 fn parse_php_namespace_use_declaration(source: &str, node: &Node) -> Option<ImportStatement> {
-    if let Some(clause) = find_direct_child(node, "namespace_use_clause") {
-        return parse_php_single_namespace_use_declaration(source, node, &clause);
+    let clauses = direct_children(node, "namespace_use_clause");
+    if !clauses.is_empty() {
+        return parse_php_clause_declaration(source, node, &clauses);
     }
 
     if find_direct_child(node, "namespace_use_group").is_some() {
@@ -50,34 +88,51 @@ fn parse_php_namespace_use_declaration(source: &str, node: &Node) -> Option<Impo
     parse_php_payload_namespace_use_declaration(source, node)
 }
 
-fn parse_php_single_namespace_use_declaration(
+fn parse_php_clause_declaration(
     source: &str,
     node: &Node,
-    clause: &Node,
+    clause_nodes: &[Node<'_>],
 ) -> Option<ImportStatement> {
-    let raw_text = source[node.byte_range()].to_string();
-    let byte_range = node.byte_range();
+    let mut clauses: Vec<PhpImportClause> = clause_nodes
+        .iter()
+        .filter_map(|clause| {
+            let (module_path, alias, import_kind) = parse_php_namespace_use_clause(source, clause)?;
+            Some(PhpImportClause {
+                module_path,
+                alias,
+                import_kind,
+            })
+        })
+        .collect();
+    if clauses.is_empty() {
+        return None;
+    }
 
-    let (module_path, alias, import_kind) = parse_php_namespace_use_clause(source, clause)?;
-    let names = Vec::new();
+    // In `use function A, B;` and `use const A, B;`, PHP writes the kind once
+    // for the whole declaration. The grammar attaches it to one clause, so copy
+    // it to siblings to keep every clause semantically complete.
+    let declaration_kind = clauses
+        .first()
+        .and_then(|clause| clause.import_kind.clone());
+    if let Some(kind) = declaration_kind {
+        for clause in &mut clauses {
+            clause.import_kind.get_or_insert_with(|| kind.clone());
+        }
+    }
+
+    let module_path = clauses.first()?.module_path.clone();
     let group = classify_group_php(&module_path);
 
     Some(ImportStatement {
         module_path,
-        names: names.clone(),
+        names: Vec::new(),
         default_import: None,
         namespace_import: None,
         kind: ImportKind::Value,
         group,
-        byte_range,
-        raw_text,
-        form: ImportForm::Structured {
-            named: names,
-            namespace: None,
-            alias,
-            modifiers: vec![],
-            import_kind,
-        },
+        byte_range: node.byte_range(),
+        raw_text: source[node.byte_range()].to_string(),
+        form: ImportForm::Php { clauses },
     })
 }
 
@@ -283,6 +338,74 @@ fn parse_php_namespace_use_clause(
     Some((module_path, alias, import_kind))
 }
 
+pub(crate) fn php_import_satisfies_request(imp: &ImportStatement, req: &ImportRequest<'_>) -> bool {
+    let ImportForm::Php { clauses } = &imp.form else {
+        return false;
+    };
+
+    clauses.iter().any(|clause| {
+        clause.module_path == req.module_path
+            && clause.alias.as_deref() == req.alias
+            && clause.import_kind.as_deref() == req.import_kind
+    })
+}
+
+pub(crate) fn php_import_matches_module(imp: &ImportStatement, module: &str) -> bool {
+    match &imp.form {
+        ImportForm::Php { clauses } => clauses.iter().any(|clause| clause.module_path == module),
+        _ => imp.module_path == module,
+    }
+}
+
+pub(crate) fn rewrite_php_import_without_module(
+    imp: &ImportStatement,
+    module: &str,
+) -> Option<Option<String>> {
+    let ImportForm::Php { clauses } = &imp.form else {
+        return None;
+    };
+    let remaining: Vec<&PhpImportClause> = clauses
+        .iter()
+        .filter(|clause| clause.module_path != module)
+        .collect();
+    if remaining.len() == clauses.len() {
+        return None;
+    }
+    if remaining.is_empty() {
+        return Some(None);
+    }
+
+    let shared_kind = remaining.first().and_then(|first| {
+        first.import_kind.as_deref().filter(|kind| {
+            remaining
+                .iter()
+                .all(|clause| clause.import_kind.as_deref() == Some(*kind))
+        })
+    });
+    let body = remaining
+        .iter()
+        .map(|clause| {
+            let kind = clause
+                .import_kind
+                .as_deref()
+                .filter(|kind| Some(*kind) != shared_kind)
+                .map(|kind| format!("{kind} "))
+                .unwrap_or_default();
+            let alias = clause
+                .alias
+                .as_deref()
+                .map(|alias| format!(" as {alias}"))
+                .unwrap_or_default();
+            format!("{kind}{}{alias}", clause.module_path)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let kind_prefix = shared_kind
+        .map(|kind| format!("{kind} "))
+        .unwrap_or_default();
+    Some(Some(format!("use {kind_prefix}{body};")))
+}
+
 pub(crate) fn php_grouped_use_shares_prefix(imp: &ImportStatement, module: &str) -> bool {
     if !php_import_is_grouped(imp) {
         return false;
@@ -323,20 +446,25 @@ fn php_import_is_grouped(imp: &ImportStatement) -> bool {
     )
 }
 
-fn find_direct_child<'tree>(node: &Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+fn direct_children<'tree>(node: &Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+    let mut children = Vec::new();
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
             if child.kind() == kind {
-                return Some(child);
+                children.push(child);
             }
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
     }
-    None
+    children
+}
+
+fn find_direct_child<'tree>(node: &Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    direct_children(node, kind).into_iter().next()
 }
 
 pub(crate) fn generate_php_import_line(req: &ImportRequest) -> String {
@@ -393,7 +521,7 @@ mod tests {
 
     #[test]
     fn php_grammar_node_kinds_are_stable() {
-        let src = "<?php\nuse App\\Foo;\nuse App\\Foo as Bar;\nuse function App\\helper;\nuse const App\\VERSION;\nuse App\\{Foo, Bar as Baz};\n";
+        let src = "<?php\nuse App\\Foo;\nuse App\\Foo as Bar, App\\Other;\nuse function App\\helper, App\\other_helper;\nuse const App\\VERSION;\nuse App\\{Foo, Bar as Baz};\n";
         let (tree, _) = parse_php(src);
         let mut kinds: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
@@ -448,6 +576,88 @@ use const App\VERSION;
         assert_php_import(&block.imports[3], r"App\VERSION", None, Some("const"));
     }
 
+    fn collect_php_imports_full_walk(source: &str, node: Node, imports: &mut Vec<ImportStatement>) {
+        if node.kind() == "namespace_use_declaration" {
+            if let Some(imp) = parse_php_namespace_use_declaration(source, &node) {
+                imports.push(imp);
+            }
+            return;
+        }
+
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                collect_php_imports_full_walk(source, cursor.node(), imports);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn count_tree_nodes(node: Node) -> usize {
+        let mut count = 1;
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                count += count_tree_nodes(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn pruned_php_collector_matches_full_walk_across_namespace_shapes() {
+        let sources = [
+            "<?php\nuse GlobalApp\\Thing;\nclass C { function method() {} }\n",
+            "<?php\nnamespace First;\nuse App\\One, App\\Two;\nclass C {}\n",
+            "<?php\nnamespace Braced { use App\\One; class C {} use App\\Two; }\n",
+            "<?php\nnamespace First { use App\\One; class A {} }\nnamespace Second { class B {} use App\\Two, App\\Three; }\n",
+            "<?php\nuse App\\Before;\nclass A { function method() { return 1; } }\nuse App\\After;\nclass B {}\n",
+        ];
+
+        for source in sources {
+            let (tree, pruned) = parse_php(source);
+            let mut full_walk_imports = Vec::new();
+            collect_php_imports_full_walk(source, tree.root_node(), &mut full_walk_imports);
+            let full_walk = ImportBlock {
+                byte_range: import_byte_range(&full_walk_imports),
+                imports: full_walk_imports,
+            };
+            assert_eq!(pruned, full_walk, "collector mismatch for {source:?}");
+        }
+    }
+
+    #[test]
+    fn pruned_php_collector_does_not_visit_method_bodies() {
+        let mut source = String::from("<?php\nuse App\\Keep;\nclass Huge {\n");
+        for index in 0..2_000 {
+            source.push_str(&format!(
+                "function method{index}() {{ $value = {index}; return $value; }}\n"
+            ));
+        }
+        source.push_str("}\n");
+
+        let (tree, expected) = parse_php(&source);
+        let mut imports = Vec::new();
+        let pruned_visits = collect_php_imports_in_scope(&source, tree.root_node(), &mut imports);
+        let full_walk_visits = count_tree_nodes(tree.root_node());
+
+        assert_eq!(imports, expected.imports);
+        assert!(
+            pruned_visits <= 4,
+            "collector visited {pruned_visits} nodes for three top-level declarations"
+        );
+        assert!(
+            full_walk_visits > pruned_visits * 1_000,
+            "tripwire fixture is not deep enough: full={full_walk_visits}, pruned={pruned_visits}"
+        );
+        eprintln!("PHP collector node visits: full={full_walk_visits}, pruned={pruned_visits}");
+    }
+
     fn assert_php_import(
         imp: &ImportStatement,
         module_path: &str,
@@ -463,12 +673,59 @@ use const App\VERSION;
 
         assert_eq!(
             imp.form,
-            ImportForm::Structured {
-                named: vec![],
-                namespace: None,
-                alias: expected_alias.map(str::to_string),
-                modifiers: vec![],
-                import_kind: expected_import_kind.map(str::to_string),
+            ImportForm::Php {
+                clauses: vec![PhpImportClause {
+                    module_path: module_path.to_string(),
+                    alias: expected_alias.map(str::to_string),
+                    import_kind: expected_import_kind.map(str::to_string),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_php_comma_separated_clauses_keeps_each_clause() {
+        let (_, block) = parse_php(
+            "<?php\nuse App\\First as One, App\\Second, App\\Third as Three;\nuse function App\\first, App\\second;\n",
+        );
+        assert_eq!(block.imports.len(), 2);
+        assert_eq!(
+            block.imports[0].form,
+            ImportForm::Php {
+                clauses: vec![
+                    PhpImportClause {
+                        module_path: "App\\First".to_string(),
+                        alias: Some("One".to_string()),
+                        import_kind: None,
+                    },
+                    PhpImportClause {
+                        module_path: "App\\Second".to_string(),
+                        alias: None,
+                        import_kind: None,
+                    },
+                    PhpImportClause {
+                        module_path: "App\\Third".to_string(),
+                        alias: Some("Three".to_string()),
+                        import_kind: None,
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            block.imports[1].form,
+            ImportForm::Php {
+                clauses: vec![
+                    PhpImportClause {
+                        module_path: "App\\first".to_string(),
+                        alias: None,
+                        import_kind: Some("function".to_string()),
+                    },
+                    PhpImportClause {
+                        module_path: "App\\second".to_string(),
+                        alias: None,
+                        import_kind: Some("function".to_string()),
+                    },
+                ],
             }
         );
     }
@@ -573,10 +830,11 @@ use const App\VERSION;
             assert_eq!(block.imports.len(), 1, "parse {src:?}");
             let imp = &block.imports[0];
             let (alias, import_kind) = match &imp.form {
-                ImportForm::Structured {
-                    alias, import_kind, ..
-                } => (alias.as_deref(), import_kind.as_deref()),
-                other => panic!("expected PHP structured form, got {other:?}"),
+                ImportForm::Php { clauses } => {
+                    let clause = clauses.first().expect("single PHP import clause");
+                    (clause.alias.as_deref(), clause.import_kind.as_deref())
+                }
+                other => panic!("expected PHP clause form, got {other:?}"),
             };
             let regenerated = generate_import(
                 LangId::Php,

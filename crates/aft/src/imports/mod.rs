@@ -21,7 +21,10 @@ mod kotlin;
 mod lua;
 mod perl;
 mod php;
-pub(crate) use php::{php_grouped_use_matches_module, php_grouped_use_shares_prefix};
+pub(crate) use php::{
+    php_grouped_use_matches_module, php_grouped_use_shares_prefix, php_import_matches_module,
+    rewrite_php_import_without_module,
+};
 mod ruby;
 mod scala;
 pub(crate) use scala::scala_block_uses_scala2_dialect;
@@ -72,6 +75,17 @@ impl ImportGroup {
             ImportGroup::Internal => "internal",
         }
     }
+}
+
+/// One clause in a PHP `use` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpImportClause {
+    /// Fully qualified imported symbol for this clause.
+    pub module_path: String,
+    /// Local alias introduced by `as`, when present.
+    pub alias: Option<String>,
+    /// PHP import namespace (`function` or `const`), when present.
+    pub import_kind: Option<String>,
 }
 
 /// Structured, language-honest representation of a single import's shape.
@@ -129,11 +143,14 @@ pub enum ImportForm {
         namespace: Option<String>,
         alias: Option<String>,
     },
-    /// Generic structured form shared by the Phase-1 engines (Java, C#, PHP,
-    /// Kotlin, Scala, Swift, …). Carries the full schema field set so a new
-    /// engine does not need its own enum variant; `module_path` (on the parent
-    /// `ImportStatement`) holds the path/FQN. `named` uses the verbatim
-    /// specifier convention.
+    /// One physical PHP `use` declaration. A declaration may contain multiple
+    /// comma-separated clauses, each with its own path, alias, and import kind.
+    Php { clauses: Vec<PhpImportClause> },
+    /// Generic structured form shared by Java, C#, grouped PHP uses, Kotlin,
+    /// Scala, Swift, and other engines that use this common schema. Includes all
+    /// schema fields so a new engine does not need its own enum variant;
+    /// `module_path` on the parent `ImportStatement` stores the full path or
+    /// fully qualified name, while `named` stores each specifier exactly as parsed.
     Structured {
         named: Vec<String>,
         namespace: Option<String>,
@@ -193,7 +210,7 @@ impl<'a> ImportRequest<'a> {
 }
 
 /// A single parsed import statement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportStatement {
     /// The module path (e.g., `react`, `./utils`, `../config`).
     pub module_path: String,
@@ -218,7 +235,7 @@ pub struct ImportStatement {
 }
 
 /// A block of parsed imports from a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportBlock {
     /// All parsed import statements, in source order.
     pub imports: Vec<ImportStatement>,
@@ -718,6 +735,15 @@ pub(crate) fn is_duplicate_import_request(
     block: &ImportBlock,
     req: &ImportRequest<'_>,
 ) -> bool {
+    if lang == LangId::Php
+        && block
+            .imports
+            .iter()
+            .any(|imp| php::php_import_satisfies_request(imp, req))
+    {
+        return true;
+    }
+
     if lang == LangId::Python && req.names.is_empty() && req.default_import.is_none() {
         return block.imports.iter().any(|imp| {
             matches!(
@@ -1059,7 +1085,7 @@ fn canonical_dedup_key(lang: LangId, mut key: ImportDedupKey) -> ImportDedupKey 
         ImportForm::RustUse { named, .. } => {
             sort_named_specifiers(named);
         }
-        ImportForm::Go { .. } => {}
+        ImportForm::Go { .. } | ImportForm::Php { .. } => {}
     }
 
     if matches!(lang, LangId::Java | LangId::Kotlin) {

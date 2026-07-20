@@ -1,0 +1,7 @@
+<?php
+
+namespace Demo;
+
+use App\First, App\Keep;
+
+class C { public Keep $keep; }

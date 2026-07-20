@@ -1498,6 +1498,98 @@ fn php_grouped_use_refuses_memberwise_add_and_remove() {
 }
 
 #[test]
+fn php_remove_comma_separated_use_rewrites_physical_declaration() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            "first",
+            "<?php\nuse App\\Unused, App\\Keep;\n\nclass C { public Keep $keep; }\n",
+            "App\\Unused",
+            "<?php\nuse App\\Keep;\n\nclass C { public Keep $keep; }\n",
+        ),
+        (
+            "middle",
+            "<?php\nuse A, B, C;\n\nclass Example {}\n",
+            "B",
+            "<?php\nuse A, C;\n\nclass Example {}\n",
+        ),
+        (
+            "only",
+            "<?php\nuse A;\n\nclass Example {}\n",
+            "A",
+            "<?php\n\nclass Example {}\n",
+        ),
+        (
+            "aliased-sibling",
+            "<?php\nuse A as X, B;\n\nclass Example { public X $value; }\n",
+            "B",
+            "<?php\nuse A as X;\n\nclass Example { public X $value; }\n",
+        ),
+        (
+            "function-kind",
+            "<?php\nuse function App\\unused, App\\keep;\n\nkeep();\n",
+            "App\\unused",
+            "<?php\nuse function App\\keep;\n\nkeep();\n",
+        ),
+    ];
+
+    for (case, input, module, expected) in cases {
+        let file = dir.path().join(format!("php_multi_{case}.php"));
+        fs::write(&file, input).unwrap();
+        let file_str = file.display().to_string();
+        let response = send_remove_import(
+            &mut aft,
+            &format!("php-multi-remove-{case}"),
+            &file_str,
+            module,
+            None,
+        );
+        assert_eq!(response["success"], true, "remove failed: {response:?}");
+        assert_eq!(
+            response["removed"], true,
+            "remove was a no-op: {response:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected, "case {case}");
+    }
+
+    aft.shutdown();
+}
+
+#[test]
+fn php_add_deduplicates_comma_separated_sibling_and_organize_preserves_it() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("php_multi_dedup.php");
+    let original = "<?php\nuse App\\First, App\\Keep;\n\nclass C { public Keep $keep; }\n";
+    fs::write(&file, original).unwrap();
+    let file_str = file.display().to_string();
+
+    let add = send_add_import(
+        &mut aft,
+        "php-multi-dedup-add",
+        &file_str,
+        "App\\Keep",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(add["success"], true, "add failed: {add:?}");
+    assert_eq!(add["added"], false, "duplicate sibling was added: {add:?}");
+    assert_eq!(
+        add["already_present"], true,
+        "sibling was not visible: {add:?}"
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    let organize = send_organize_imports(&mut aft, "php-multi-dedup-organize", &file_str);
+    assert_eq!(organize["success"], true, "organize failed: {organize:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    aft.shutdown();
+}
+
+#[test]
 fn organize_imports_go_grouped_block_refuses_internal_comments() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

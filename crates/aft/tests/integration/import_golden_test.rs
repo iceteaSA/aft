@@ -1052,6 +1052,15 @@ class C {}
             }],
         },
         Scenario {
+            name: "php_remove_comma_separated_middle",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\First, App\\Unused as Old, App\\Keep;\n\nclass C { public Keep $keep; }\n",
+            ops: &[Op::Remove {
+                module: "App\\Unused",
+                name: None,
+            }],
+        },
+        Scenario {
             name: "php_organize_preserves_grouped_and_kind_uses",
             ext: "php",
             input: r#"<?php
