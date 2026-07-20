@@ -946,6 +946,49 @@ pub fn trace_to_symbol_result(
     }
 }
 
+#[derive(Debug, Default)]
+struct TrackedBindings {
+    approximate_by_name: HashMap<String, bool>,
+}
+
+struct AssignmentInfo {
+    binding: String,
+    hop_variable: String,
+    line: u32,
+    approximate: bool,
+    stop_after_hop: bool,
+}
+
+impl TrackedBindings {
+    fn with_origin(name: &str, approximate: bool) -> Self {
+        let mut bindings = Self::default();
+        bindings.track(name.to_string(), approximate);
+        bindings
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.approximate_by_name.contains_key(name)
+    }
+
+    fn approximation(&self, name: &str) -> Option<bool> {
+        self.approximate_by_name.get(name).copied()
+    }
+
+    fn track(&mut self, name: String, approximate: bool) {
+        self.approximate_by_name.insert(name, approximate);
+    }
+
+    fn kill(&mut self, name: &str) {
+        self.approximate_by_name.remove(name);
+    }
+
+    fn mark_approximate(&mut self, name: &str) {
+        if let Some(approximate) = self.approximate_by_name.get_mut(name) {
+            *approximate = true;
+        }
+    }
+}
+
 pub fn trace_data_result(
     store: &impl CallGraphRead,
     file: &Path,
@@ -967,6 +1010,7 @@ pub fn trace_data_result(
         &origin_path,
         &origin_symbol,
         expression,
+        false,
         max_depth,
         0,
         &mut hops,
@@ -990,17 +1034,19 @@ fn trace_data_inner(
     file: &Path,
     symbol: &str,
     tracking_name: &str,
+    tracking_approximate: bool,
     max_depth: usize,
     current_depth: usize,
     hops: &mut Vec<callgraph::DataFlowHop>,
     depth_limited: &mut bool,
-    visited: &mut HashSet<(String, String, String)>,
+    visited: &mut HashSet<(String, String, String, bool)>,
 ) -> StoreAdapterResult<()> {
     let rel_file = relative_file(store, file);
     let visit_key = (
         rel_file.clone(),
         symbol.to_string(),
         tracking_name.to_string(),
+        tracking_approximate,
     );
     if visited.contains(&visit_key) {
         return Ok(());
@@ -1043,18 +1089,20 @@ fn trace_data_inner(
         return Ok(());
     };
 
-    let mut tracked_names = vec![tracking_name.to_string()];
+    let mut tracked = TrackedBindings::with_origin(tracking_name, tracking_approximate);
     walk_for_data_flow(
         store,
         symbol_cache,
         body_node,
         &source,
         &current_calls,
-        &mut tracked_names,
+        &mut tracked,
         symbol,
         &rel_file,
         max_depth,
         current_depth,
+        false,
+        false,
         hops,
         depth_limited,
         visited,
@@ -1068,14 +1116,16 @@ fn walk_for_data_flow(
     node: Node<'_>,
     source: &str,
     current_calls: &[TraceForwardCall],
-    tracked_names: &mut Vec<String>,
+    tracked: &mut TrackedBindings,
     symbol: &str,
     rel_file: &str,
     max_depth: usize,
     current_depth: usize,
+    control_flow_uncertain: bool,
+    origin_function_seen: bool,
     hops: &mut Vec<callgraph::DataFlowHop>,
     depth_limited: &mut bool,
-    visited: &mut HashSet<(String, String, String)>,
+    visited: &mut HashSet<(String, String, String, bool)>,
 ) -> StoreAdapterResult<()> {
     let kind = node.kind();
     let is_var_decl = matches!(
@@ -1089,29 +1139,29 @@ fn walk_for_data_flow(
     );
 
     if is_var_decl {
-        if let Some((new_name, init_text, line, is_approx)) =
-            extract_assignment_info(node, source, tracked_names)
-        {
-            if !is_approx {
-                hops.push(callgraph::DataFlowHop {
-                    file: rel_file.to_string(),
-                    symbol: symbol.to_string(),
-                    variable: new_name.clone(),
-                    line,
-                    flow_type: "assignment".to_string(),
-                    approximate: false,
-                });
-                tracked_names.push(new_name);
-            } else {
-                hops.push(callgraph::DataFlowHop {
-                    file: rel_file.to_string(),
-                    symbol: symbol.to_string(),
-                    variable: init_text,
-                    line,
-                    flow_type: "assignment".to_string(),
-                    approximate: true,
-                });
+        if let Some(assignment) = extract_assignment_info(node, source, tracked) {
+            let approximate = assignment.approximate || control_flow_uncertain;
+            hops.push(callgraph::DataFlowHop {
+                file: rel_file.to_string(),
+                symbol: symbol.to_string(),
+                variable: assignment.hop_variable,
+                line: assignment.line,
+                flow_type: "assignment".to_string(),
+                approximate,
+            });
+            tracked.track(assignment.binding, approximate);
+            if assignment.stop_after_hop {
                 return Ok(());
+            }
+        } else if let Some(overwritten_name) = plain_assignment_target(node, source) {
+            if tracked.contains(&overwritten_name) {
+                if control_flow_uncertain {
+                    // Because an assignment inside a conditional or loop may be skipped,
+                    // retain the previously tracked path and mark subsequent uses as approximate.
+                    tracked.mark_approximate(&overwritten_name);
+                } else {
+                    tracked.kill(&overwritten_name);
+                }
             }
         }
     }
@@ -1123,7 +1173,7 @@ fn walk_for_data_flow(
             node,
             source,
             current_calls,
-            tracked_names,
+            tracked,
             symbol,
             rel_file,
             max_depth,
@@ -1134,6 +1184,11 @@ fn walk_for_data_flow(
         )?;
     }
 
+    let is_function = function_container(kind);
+    let descendants_uncertain = control_flow_uncertain
+        || conditional_flow_container(kind)
+        || (is_function && origin_function_seen);
+    let descendants_origin_function_seen = origin_function_seen || is_function;
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
@@ -1143,11 +1198,13 @@ fn walk_for_data_flow(
                 cursor.node(),
                 source,
                 current_calls,
-                tracked_names,
+                tracked,
                 symbol,
                 rel_file,
                 max_depth,
                 current_depth,
+                descendants_uncertain,
+                descendants_origin_function_seen,
                 hops,
                 depth_limited,
                 visited,
@@ -1163,76 +1220,155 @@ fn walk_for_data_flow(
 fn extract_assignment_info(
     node: Node<'_>,
     source: &str,
-    tracked_names: &[String],
-) -> Option<(String, String, u32, bool)> {
+    tracked: &TrackedBindings,
+) -> Option<AssignmentInfo> {
     let kind = node.kind();
     let line = node.start_position().row as u32 + 1;
 
-    match kind {
-        "variable_declarator" => {
-            let name_node = node.child_by_field_name("name")?;
-            let value_node = node.child_by_field_name("value")?;
-            let name_text = trace_node_text(name_node, source);
-            let value_text = trace_node_text(value_node, source);
+    let (name_node, value_node) = match kind {
+        "variable_declarator" => (
+            node.child_by_field_name("name")?,
+            node.child_by_field_name("value")?,
+        ),
+        "assignment_expression" | "augmented_assignment_expression" | "assignment" => (
+            node.child_by_field_name("left")?,
+            node.child_by_field_name("right")?,
+        ),
+        "let_declaration" | "short_var_declaration" => (
+            node.child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("left"))?,
+            node.child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("right"))?,
+        ),
+        _ => return None,
+    };
 
-            if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
-                if tracked_names
-                    .iter()
-                    .any(|tracked| value_text.contains(tracked))
-                {
-                    return Some((name_text.clone(), name_text, line, true));
-                }
-                return None;
-            }
-
-            if tracked_names.iter().any(|tracked| {
-                value_text == *tracked
-                    || value_text.starts_with(&format!("{}.", tracked))
-                    || value_text.starts_with(&format!("{}[", tracked))
-            }) {
-                return Some((name_text, value_text, line, false));
-            }
-            None
-        }
-        "assignment_expression" | "augmented_assignment_expression" => {
-            let left = node.child_by_field_name("left")?;
-            let right = node.child_by_field_name("right")?;
-            let left_text = trace_node_text(left, source);
-            let right_text = trace_node_text(right, source);
-
-            if tracked_names.iter().any(|tracked| right_text == *tracked) {
-                return Some((left_text, right_text, line, false));
-            }
-            None
-        }
-        "assignment" => {
-            let left = node.child_by_field_name("left")?;
-            let right = node.child_by_field_name("right")?;
-            let left_text = trace_node_text(left, source);
-            let right_text = trace_node_text(right, source);
-
-            if tracked_names.iter().any(|tracked| right_text == *tracked) {
-                return Some((left_text, right_text, line, false));
-            }
-            None
-        }
-        "let_declaration" | "short_var_declaration" => {
-            let left = node
-                .child_by_field_name("pattern")
-                .or_else(|| node.child_by_field_name("left"))?;
-            let right = node
-                .child_by_field_name("value")
-                .or_else(|| node.child_by_field_name("right"))?;
-            let left_text = trace_node_text(left, source);
-            let right_text = trace_node_text(right, source);
-
-            if tracked_names.iter().any(|tracked| right_text == *tracked) {
-                return Some((left_text, right_text, line, false));
-            }
-            None
-        }
-        _ => None,
+    let binding = trace_node_text(name_node, source);
+    if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+        tracked_reference_approximation(value_node, source, tracked)?;
+        return Some(AssignmentInfo {
+            binding: binding.clone(),
+            hop_variable: binding,
+            line,
+            approximate: true,
+            stop_after_hop: true,
+        });
     }
+
+    let source_approximate = if kind == "augmented_assignment_expression" {
+        merge_reference_approximation(
+            tracked_reference_approximation(name_node, source, tracked),
+            tracked_reference_approximation(value_node, source, tracked),
+        )?
+    } else {
+        tracked_reference_approximation(value_node, source, tracked)?
+    };
+
+    Some(AssignmentInfo {
+        binding: binding.clone(),
+        hop_variable: binding,
+        line,
+        approximate: source_approximate,
+        stop_after_hop: false,
+    })
+}
+
+fn merge_reference_approximation(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left && right),
+        (Some(approximate), None) | (None, Some(approximate)) => Some(approximate),
+        (None, None) => None,
+    }
+}
+
+fn tracked_reference_approximation(
+    node: Node<'_>,
+    source: &str,
+    tracked: &TrackedBindings,
+) -> Option<bool> {
+    let mut approximation = if is_identifier_reference(node) {
+        tracked.approximation(&trace_node_text(node, source))
+    } else {
+        None
+    };
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            approximation = merge_reference_approximation(
+                approximation,
+                tracked_reference_approximation(cursor.node(), source, tracked),
+            );
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    approximation
+}
+
+fn is_identifier_reference(node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "identifier" | "simple_identifier" | "variable_name" | "shorthand_property_identifier"
+    ) {
+        return false;
+    }
+
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+    !["property", "attribute", "field"].iter().any(|field| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == node.id())
+    })
+}
+
+fn plain_assignment_target(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "augmented_assignment_expression" {
+        return None;
+    }
+    let target = match node.kind() {
+        "assignment_expression" | "assignment" => node.child_by_field_name("left")?,
+        _ => return None,
+    };
+    is_identifier_reference(target).then(|| trace_node_text(target, source))
+}
+
+fn conditional_flow_container(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_statement"
+            | "else_clause"
+            | "conditional_expression"
+            | "ternary_expression"
+            | "switch_statement"
+            | "switch_expression"
+            | "match_expression"
+            | "when_expression"
+            | "for_statement"
+            | "for_in_statement"
+            | "for_each_statement"
+            | "while_statement"
+            | "do_statement"
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+    )
+}
+
+fn function_container(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "method_definition"
+            | "lambda"
+            | "lambda_expression"
+            | "closure_expression"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1242,14 +1378,14 @@ fn check_call_for_data_flow(
     node: Node<'_>,
     source: &str,
     current_calls: &[TraceForwardCall],
-    tracked_names: &[String],
+    tracked: &TrackedBindings,
     symbol: &str,
     rel_file: &str,
     max_depth: usize,
     current_depth: usize,
     hops: &mut Vec<callgraph::DataFlowHop>,
     depth_limited: &mut bool,
-    visited: &mut HashSet<(String, String, String)>,
+    visited: &mut HashSet<(String, String, String, bool)>,
 ) -> StoreAdapterResult<()> {
     let args_node =
         find_child_by_kind(node, "arguments").or_else(|| find_child_by_kind(node, "argument_list"));
@@ -1273,10 +1409,7 @@ fn check_call_for_data_flow(
 
             let arg_text = trace_node_text(child, source);
             if child_kind == "spread_element" || child_kind == "dictionary_splat" {
-                if tracked_names
-                    .iter()
-                    .any(|tracked| arg_text.contains(tracked))
-                {
+                if tracked_reference_approximation(child, source, tracked).is_some() {
                     hops.push(callgraph::DataFlowHop {
                         file: rel_file.to_string(),
                         symbol: symbol.to_string(),
@@ -1293,8 +1426,8 @@ fn check_call_for_data_flow(
                 continue;
             }
 
-            if tracked_names.iter().any(|tracked| arg_text == *tracked) {
-                arg_positions.push((arg_idx, arg_text));
+            if let Some(approximate) = tracked.approximation(&arg_text) {
+                arg_positions.push((arg_idx, arg_text, approximate));
             }
 
             arg_idx += 1;
@@ -1327,7 +1460,7 @@ fn check_call_for_data_flow(
                 .map(|signature| callgraph::extract_parameters(signature, target.lang))
                 .unwrap_or_default();
             let target_file = store.project_root().join(&target.file);
-            for (pos, _tracked) in &arg_positions {
+            for (pos, _tracked, approximate) in &arg_positions {
                 if let Some(param_name) = params.get(*pos) {
                     hops.push(callgraph::DataFlowHop {
                         file: target.file.clone(),
@@ -1335,7 +1468,7 @@ fn check_call_for_data_flow(
                         variable: param_name.clone(),
                         line: target.line,
                         flow_type: "parameter".to_string(),
-                        approximate: false,
+                        approximate: *approximate,
                     });
                     trace_data_inner(
                         store,
@@ -1343,6 +1476,7 @@ fn check_call_for_data_flow(
                         &target_file,
                         &target.symbol,
                         param_name,
+                        *approximate,
                         max_depth,
                         current_depth + 1,
                         hops,
@@ -1370,10 +1504,10 @@ fn push_unresolved_parameter_hops(
     hops: &mut Vec<callgraph::DataFlowHop>,
     rel_file: &str,
     callee_name: &str,
-    arg_positions: &[(usize, String)],
+    arg_positions: &[(usize, String, bool)],
     call_node: Node<'_>,
 ) {
-    for (_pos, tracked) in arg_positions {
+    for (_pos, tracked, _approximate) in arg_positions {
         hops.push(callgraph::DataFlowHop {
             file: rel_file.to_string(),
             symbol: callee_name.to_string(),

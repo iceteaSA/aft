@@ -2384,6 +2384,71 @@ fn callgraph_trace_data_assignment_tracking() {
     aft.shutdown();
 }
 
+fn trace_data_hops(aft: &mut AftProcess, root: &str, request_id: &str, symbol: &str) -> Vec<Value> {
+    let resp = aft.send(&format!(
+        r#"{{"id":{},"command":"trace_data","file":{},"symbol":{},"expression":"raw","depth":5}}"#,
+        crate::helpers::json_string(&request_id),
+        crate::helpers::json_string(&format!("{root}/data_flow_kills.ts")),
+        crate::helpers::json_string(&symbol),
+    ));
+    assert_eq!(resp["success"], true, "trace_data should succeed: {resp:?}");
+    resp["hops"].as_array().expect("hops array").clone()
+}
+
+fn sink_parameter_hop(hops: &[Value]) -> Option<&Value> {
+    hops.iter().find(|hop| {
+        hop["symbol"] == "sink" && hop["variable"] == "input" && hop["flow_type"] == "parameter"
+    })
+}
+
+#[test]
+fn callgraph_trace_data_kills_only_dominating_straight_line_overwrites() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    aft.send(&format!(
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
+    ));
+
+    let overwritten = trace_data_hops(&mut aft, &root, "2", "overwritten");
+    assert!(
+        sink_parameter_hop(&overwritten).is_none(),
+        "a straight-line overwrite must kill the stale flow: {overwritten:?}"
+    );
+
+    let derived = trace_data_hops(&mut aft, &root, "3", "derived");
+    assert_eq!(
+        sink_parameter_hop(&derived).map(|hop| &hop["approximate"]),
+        Some(&Value::Bool(false)),
+        "an assignment derived from raw must remain tracked: {derived:?}"
+    );
+
+    let before_overwrite = trace_data_hops(&mut aft, &root, "4", "usedBeforeOverwrite");
+    assert_eq!(
+        sink_parameter_hop(&before_overwrite).map(|hop| &hop["approximate"]),
+        Some(&Value::Bool(false)),
+        "a use before the overwrite must remain an exact flow: {before_overwrite:?}"
+    );
+
+    let conditional = trace_data_hops(&mut aft, &root, "5", "conditionallyOverwritten");
+    assert_eq!(
+        sink_parameter_hop(&conditional).map(|hop| &hop["approximate"]),
+        Some(&Value::Bool(true)),
+        "a possible branch overwrite must retain but qualify the flow: {conditional:?}"
+    );
+
+    let augmented = trace_data_hops(&mut aft, &root, "6", "augmented");
+    assert_eq!(
+        sink_parameter_hop(&augmented).map(|hop| &hop["approximate"]),
+        Some(&Value::Bool(false)),
+        "an augmented assignment derives from its tracked left side: {augmented:?}"
+    );
+
+    aft.shutdown();
+}
+
 /// `trace_data` tracks across file boundaries via argument-to-parameter matching.
 ///
 /// In data_flow.ts, `transformData` calls `processInput(cleaned)`.
