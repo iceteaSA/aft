@@ -92,6 +92,7 @@ struct DuplicateGroup {
     generated: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize)]
 struct DuplicateContribution {
     file: String,
@@ -102,6 +103,23 @@ struct DuplicateContribution {
     #[serde(default)]
     generated: bool,
     fragments: Vec<DuplicateFragment>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DuplicateContributionRef<'a> {
+    file: &'a str,
+    line_count: u32,
+    expected_duplicate: bool,
+    generated: bool,
+    fragments: &'a [Value],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DuplicateFragmentRef<'a> {
+    hash: &'a str,
+    start_line: u32,
+    end_line: u32,
+    cost: u32,
 }
 
 #[derive(Debug)]
@@ -458,6 +476,113 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
     drill_down_limit: Option<usize>,
     expected_mirrors: &[[String; 2]],
 ) -> serde_json::Value {
+    let parsed = contributions
+        .iter()
+        .filter_map(|contribution| duplicate_contribution_ref(&contribution.contribution))
+        .collect::<Vec<_>>();
+    let mut fragment_counts = HashMap::<&str, usize>::new();
+    for scan in &parsed {
+        for fragment in scan.fragments {
+            let fragment = duplicate_fragment_ref(fragment)
+                .expect("duplicate contribution fragments were validated while parsing");
+            *fragment_counts.entry(fragment.hash).or_default() += 1;
+        }
+    }
+
+    let mut by_hash = BTreeMap::<String, Vec<FragmentOccurrence>>::new();
+    let mut line_counts = BTreeMap::<String, u32>::new();
+    let mut marker_files = BTreeSet::<String>::new();
+    for scan in &parsed {
+        line_counts.insert(scan.file.to_string(), scan.line_count);
+        if scan.expected_duplicate {
+            marker_files.insert(scan.file.to_string());
+        }
+        let file = Rc::<str>::from(scan.file);
+        let generated = scan.generated
+            || crate::inspect::generated::path_has_generated_shape(Path::new(scan.file));
+        for fragment in scan.fragments {
+            let fragment = duplicate_fragment_ref(fragment)
+                .expect("duplicate contribution fragments were validated while parsing");
+            if fragment_counts
+                .get(fragment.hash)
+                .copied()
+                .unwrap_or_default()
+                < 2
+            {
+                continue;
+            }
+            push_occurrence(
+                &mut by_hash,
+                fragment.hash,
+                FragmentOccurrence {
+                    file: Rc::clone(&file),
+                    start_line: fragment.start_line,
+                    end_line: fragment.end_line,
+                    cost: fragment.cost,
+                    generated,
+                },
+            );
+        }
+    }
+
+    aggregate_duplicate_occurrences(
+        by_hash,
+        parsed.len(),
+        line_counts.values().copied().map(u64::from).sum(),
+        marker_files,
+        languages_skipped,
+        drill_down_limit,
+        expected_mirrors,
+    )
+}
+
+fn duplicate_contribution_ref(value: &Value) -> Option<DuplicateContributionRef<'_>> {
+    let object = value.as_object()?;
+    let fragments = object.get("fragments")?.as_array()?;
+    if !fragments
+        .iter()
+        .all(|fragment| duplicate_fragment_ref(fragment).is_some())
+    {
+        return None;
+    }
+    Some(DuplicateContributionRef {
+        file: object.get("file")?.as_str()?,
+        line_count: optional_u32(object.get("line_count"))?,
+        expected_duplicate: optional_bool(object.get("expected_duplicate"))?,
+        generated: optional_bool(object.get("generated"))?,
+        fragments,
+    })
+}
+
+fn duplicate_fragment_ref(value: &Value) -> Option<DuplicateFragmentRef<'_>> {
+    let object = value.as_object()?;
+    Some(DuplicateFragmentRef {
+        hash: object.get("hash")?.as_str()?,
+        start_line: required_u32(object.get("start_line")?)?,
+        end_line: required_u32(object.get("end_line")?)?,
+        cost: required_u32(object.get("cost")?)?,
+    })
+}
+
+fn optional_u32(value: Option<&Value>) -> Option<u32> {
+    value.map_or(Some(0), required_u32)
+}
+
+fn required_u32(value: &Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok()
+}
+
+fn optional_bool(value: Option<&Value>) -> Option<bool> {
+    value.map_or(Some(false), Value::as_bool)
+}
+
+#[cfg(test)]
+fn aggregate_duplicate_contributions_with_clone_for_test(
+    contributions: &[FileContribution],
+    languages_skipped: Vec<String>,
+    drill_down_limit: Option<usize>,
+    expected_mirrors: &[[String; 2]],
+) -> Value {
     let parsed = contributions
         .iter()
         .filter_map(|contribution| {
@@ -1087,6 +1212,101 @@ mod tests {
 
     fn group_count(aggregate: &serde_json::Value) -> u64 {
         aggregate["count"].as_u64().unwrap()
+    }
+
+    fn unique_fragment_contributions(fragment_count: usize) -> Vec<FileContribution> {
+        let fragments = (0..fragment_count)
+            .map(|index| {
+                json!({
+                    "hash": format!("unique-{index}"),
+                    "start_line": index as u32 + 1,
+                    "end_line": index as u32 + 10,
+                    "cost": 100,
+                })
+            })
+            .collect::<Vec<_>>();
+        vec![FileContribution::new(
+            InspectCategory::Duplicates,
+            "src/unique.ts",
+            freshness(),
+            json!({
+                "file": "src/unique.ts",
+                "line_count": 2_000,
+                "expected_duplicate": false,
+                "fragments": fragments,
+            }),
+        )]
+    }
+
+    #[test]
+    fn borrowed_rollup_is_byte_identical_to_clone_rollup() {
+        let contributions = vec![
+            contribution(
+                "src/a.ts",
+                &[
+                    (1, 20, 900, "shared"),
+                    (30, 39, 200, "kept"),
+                    (50, 60, 100, "single"),
+                ],
+            ),
+            contribution("src/b.ts", &[(2, 21, 900, "shared"), (40, 49, 200, "kept")]),
+            contribution_with_generated("gen/a.ts", 80, false, true, &[(1, 12, 700, "gen")]),
+            contribution_with_generated("gen/b.ts", 80, false, true, &[(3, 14, 700, "gen")]),
+            contribution("plugin/mirror.ts", &[(5, 16, 500, "mirror")]),
+            contribution("pi-plugin/mirror.ts", &[(5, 16, 500, "mirror")]),
+            contribution_with_options("src/marked.ts", 60, true, &[(10, 22, 300, "marked")]),
+            contribution("src/plain.ts", &[(10, 22, 300, "marked")]),
+        ];
+        let expected_mirrors = vec![["plugin/**".to_string(), "pi-plugin/**".to_string()]];
+
+        let before = aggregate_duplicate_contributions_with_clone_for_test(
+            &contributions,
+            vec!["markdown".to_string()],
+            Some(3),
+            &expected_mirrors,
+        );
+        let after = aggregate_duplicate_contributions_with_limit(
+            &contributions,
+            vec!["markdown".to_string()],
+            Some(3),
+            &expected_mirrors,
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&after).expect("serialize borrowed rollup"),
+            serde_json::to_vec(&before).expect("serialize clone rollup")
+        );
+    }
+
+    #[test]
+    fn borrowed_rollup_allocations_do_not_scale_with_discarded_fragments() {
+        let small = unique_fragment_contributions(8);
+        let large = unique_fragment_contributions(1_024);
+        let (_, small_allocations) = crate::test_allocations::count(|| {
+            aggregate_duplicate_contributions_with_limit(&small, Vec::new(), Some(20), &[])
+        });
+        let (after, large_allocations) = crate::test_allocations::count(|| {
+            aggregate_duplicate_contributions_with_limit(&large, Vec::new(), Some(20), &[])
+        });
+        let (before, clone_allocations) = crate::test_allocations::count(|| {
+            aggregate_duplicate_contributions_with_clone_for_test(&large, Vec::new(), Some(20), &[])
+        });
+
+        assert_eq!(
+            serde_json::to_vec(&after).expect("serialize borrowed rollup"),
+            serde_json::to_vec(&before).expect("serialize clone rollup")
+        );
+        assert!(
+            large_allocations <= small_allocations + 24,
+            "discarded fragments added too many allocations: small={small_allocations}, large={large_allocations}"
+        );
+        assert!(
+            clone_allocations > large_allocations + 2 * 1_024,
+            "allocation seam is vacuous: clone={clone_allocations}, borrowed={large_allocations}"
+        );
+        eprintln!(
+            "duplicates rollup allocations for 1,024 discarded fragments: clone={clone_allocations}, borrowed={large_allocations}"
+        );
     }
 
     #[test]

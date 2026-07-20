@@ -330,52 +330,10 @@ mod tests {
     }
 
     mod raw_request_construction {
-        use std::alloc::{GlobalAlloc, Layout, System};
-        use std::cell::Cell;
         use std::hint::black_box;
 
         use super::*;
-
-        struct CountingAllocator;
-
-        thread_local! {
-            static COUNTING: Cell<bool> = const { Cell::new(false) };
-            static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
-        }
-
-        unsafe impl GlobalAlloc for CountingAllocator {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                record_allocation();
-                unsafe { System.alloc(layout) }
-            }
-
-            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                unsafe { System.dealloc(ptr, layout) }
-            }
-
-            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                record_allocation();
-                unsafe { System.realloc(ptr, layout, new_size) }
-            }
-        }
-
-        #[global_allocator]
-        static GLOBAL: CountingAllocator = CountingAllocator;
-
-        fn record_allocation() {
-            if COUNTING.try_with(Cell::get).unwrap_or(false) {
-                let _ = ALLOCATION_COUNT.try_with(|count| count.set(count.get() + 1));
-            }
-        }
-
-        fn count_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
-            ALLOCATION_COUNT.with(|count| count.set(0));
-            COUNTING.with(|counting| counting.set(true));
-            let result = operation();
-            COUNTING.with(|counting| counting.set(false));
-            let count = ALLOCATION_COUNT.with(Cell::get);
-            (result, count)
-        }
+        use crate::test_allocations::count as count_allocations;
 
         fn context(preview: bool) -> ToolCallContext {
             ToolCallContext {

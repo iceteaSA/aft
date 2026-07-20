@@ -121,6 +121,8 @@ pub mod watcher_filter;
 pub mod windows_shell;
 
 #[cfg(test)]
+pub(crate) mod test_allocations;
+#[cfg(test)]
 pub(crate) mod test_env;
 
 #[cfg(test)]
