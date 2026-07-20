@@ -4112,6 +4112,26 @@ fn git_root_commit_once(project_root: &Path) -> RootCommitProbe {
     git_root_commit_once_real(project_root)
 }
 
+/// Canonicalize the root set before it becomes an artifact-cache identity.
+/// Grafted-history repositories can have multiple roots, and Git traversal
+/// order may change after repacks or commit-graph regeneration.
+fn canonicalize_root_commit_output(stdout: &[u8]) -> RootCommitProbe {
+    let decoded = String::from_utf8_lossy(stdout);
+    let mut roots: Vec<&str> = decoded
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    roots.sort_unstable();
+    roots.dedup();
+
+    if roots.is_empty() {
+        RootCommitProbe::NoCommit
+    } else {
+        RootCommitProbe::Commit(roots.join("\n"))
+    }
+}
+
 fn git_root_commit_once_real(project_root: &Path) -> RootCommitProbe {
     let output = match crate::effective_path::new_command("git")
         .arg("-C")
@@ -4124,11 +4144,7 @@ fn git_root_commit_once_real(project_root: &Path) -> RootCommitProbe {
     };
 
     if output.status.success() {
-        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if value.is_empty() {
-            return RootCommitProbe::NoCommit;
-        }
-        return RootCommitProbe::Commit(value);
+        return canonicalize_root_commit_output(&output.stdout);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5645,6 +5661,206 @@ mod tests {
         fs::write(cache_dir.join("cache.bin.tmp.1.1"), b"partial").expect("write partial tmp");
 
         assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
+    }
+
+    fn grafted_history_test_roots() -> [&'static str; 3] {
+        [
+            "7e96b9e0000000000000000000000000000000",
+            "1e394c20000000000000000000000000000000",
+            "40587520000000000000000000000000000000",
+        ]
+    }
+
+    fn artifact_key_from_root_commit_output(stdout: &[u8]) -> String {
+        match canonicalize_root_commit_output(stdout) {
+            RootCommitProbe::Commit(root_commit) => artifact_key_from_git_identity(&root_commit),
+            RootCommitProbe::NoCommit => panic!("root commit output unexpectedly empty"),
+            RootCommitProbe::NotARepo => panic!("root commit output was not a repository"),
+            RootCommitProbe::Transient(detail) => panic!("root commit output failed: {detail}"),
+        }
+    }
+
+    fn force_git_root_commit_probe_outputs_for_test(
+        outputs_by_root: BTreeMap<PathBuf, Vec<u8>>,
+    ) -> GitRootCommitProbeOverrideGuard {
+        install_git_root_commit_probe_override_for_test(move |project_root| {
+            outputs_by_root
+                .get(project_root)
+                .map(|stdout| canonicalize_root_commit_output(stdout))
+        })
+    }
+
+    #[test]
+    fn artifact_cache_key_canonicalizes_all_root_permutations() {
+        let roots = grafted_history_test_roots();
+        let mut sorted_roots = roots;
+        sorted_roots.sort_unstable();
+        let expected_commit = sorted_roots.join("\n");
+        let expected_key = artifact_key_from_git_identity(&expected_commit);
+
+        let permutations = [
+            [roots[0], roots[1], roots[2]],
+            [roots[0], roots[2], roots[1]],
+            [roots[1], roots[0], roots[2]],
+            [roots[1], roots[2], roots[0]],
+            [roots[2], roots[0], roots[1]],
+            [roots[2], roots[1], roots[0]],
+        ];
+        for permutation in permutations {
+            let output = format!("{}\n", permutation.join("\n"));
+            let RootCommitProbe::Commit(canonical) =
+                canonicalize_root_commit_output(output.as_bytes())
+            else {
+                panic!("root permutation did not produce a commit");
+            };
+            assert_eq!(canonical, expected_commit);
+            assert_eq!(artifact_key_from_git_identity(&canonical), expected_key);
+        }
+    }
+
+    #[test]
+    fn artifact_cache_key_deduplicates_repeated_roots() {
+        let root = grafted_history_test_roots()[0];
+        let one_root = format!("{root}\n");
+        let duplicate_root = format!("{root}\n{root}\n");
+
+        assert_eq!(
+            artifact_key_from_root_commit_output(one_root.as_bytes()),
+            artifact_key_from_root_commit_output(duplicate_root.as_bytes())
+        );
+    }
+
+    #[test]
+    fn artifact_cache_key_ignores_blank_whitespace_and_crlf_lines() {
+        let roots = grafted_history_test_roots();
+        let clean = format!("{}\n{}\n", roots[0], roots[1]);
+        let decorated = format!(" \r\n\t{}  \r\n{}\t\r\n\r\n", roots[1], roots[0]);
+
+        assert_eq!(
+            artifact_key_from_root_commit_output(clean.as_bytes()),
+            artifact_key_from_root_commit_output(decorated.as_bytes())
+        );
+    }
+
+    #[test]
+    fn artifact_cache_key_single_root_matches_the_old_trimmed_derivation() {
+        let root = grafted_history_test_roots()[0];
+        let output = format!("{root}\n");
+        let old_trimmed = String::from_utf8_lossy(output.as_bytes())
+            .trim()
+            .to_string();
+        let old_key = artifact_hash16(old_trimmed.as_bytes());
+
+        let RootCommitProbe::Commit(canonical) = canonicalize_root_commit_output(output.as_bytes())
+        else {
+            panic!("single root output did not produce a commit");
+        };
+        assert_eq!(canonical, root);
+        assert_eq!(artifact_key_from_git_identity(&canonical), old_key);
+    }
+
+    #[test]
+    fn artifact_cache_key_empty_canonical_root_output_is_no_commit() {
+        assert!(matches!(
+            canonicalize_root_commit_output(b" \r\n\t\n\r\n"),
+            RootCommitProbe::NoCommit
+        ));
+    }
+
+    #[test]
+    fn artifact_cache_key_memo_round_trip_uses_canonical_root_set() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root = git_like_root(&dir, "repo");
+        let roots = grafted_history_test_roots();
+        let mut sorted_roots = roots;
+        sorted_roots.sort_unstable();
+        let canonical = sorted_roots.join("\n");
+        let expected_key = artifact_key_from_git_identity(&canonical);
+        let first_output = format!("{}\n{}\n{}\n", roots[2], roots[0], roots[1]);
+        let second_output = format!("{}\n{}\n{}\n", roots[1], roots[2], roots[0]);
+
+        {
+            let mut outputs = BTreeMap::new();
+            outputs.insert(root.clone(), first_output.into_bytes());
+            let _override = force_git_root_commit_probe_outputs_for_test(outputs);
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None)
+                    .expect("first canonical key"),
+                expected_key
+            );
+        }
+        let first_memo_bytes =
+            fs::read(artifact_cache_key_memo_path(&storage)).expect("read first memo bytes");
+
+        {
+            let mut outputs = BTreeMap::new();
+            outputs.insert(root.clone(), second_output.into_bytes());
+            let _override = force_git_root_commit_probe_outputs_for_test(outputs);
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None)
+                    .expect("second canonical key"),
+                expected_key
+            );
+        }
+        let second_memo_bytes =
+            fs::read(artifact_cache_key_memo_path(&storage)).expect("read second memo bytes");
+        assert_eq!(
+            first_memo_bytes, second_memo_bytes,
+            "an unchanged canonical memo entry should not be rewritten"
+        );
+        let memo = read_cache_key_memo(&storage);
+        assert_eq!(
+            memo.get(root.to_string_lossy().as_ref())
+                .expect("canonical memo entry")
+                .git_root_commit,
+            canonical
+        );
+    }
+
+    #[test]
+    fn artifact_cache_key_replaces_old_unsorted_memo_entry() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root = git_like_root(&dir, "repo");
+        let roots = grafted_history_test_roots();
+        let unsorted = format!("{}\n{}", roots[2], roots[0]);
+        let mut sorted_roots = [roots[2], roots[0]];
+        sorted_roots.sort_unstable();
+        let canonical = sorted_roots.join("\n");
+        let expected_key = artifact_key_from_git_identity(&canonical);
+
+        let mut seeded_memo = BTreeMap::new();
+        seeded_memo.insert(
+            root.to_string_lossy().into_owned(),
+            ArtifactCacheKeyMemoEntry {
+                key: artifact_key_from_git_identity(&unsorted),
+                git_root_commit: unsorted.clone(),
+                recorded_at_ms: 1,
+            },
+        );
+        fs::create_dir_all(&storage).expect("create memo storage");
+        fs::write(
+            artifact_cache_key_memo_path(&storage),
+            serde_json::to_vec_pretty(&seeded_memo).expect("serialize seeded memo"),
+        )
+        .expect("write seeded memo");
+
+        let mut outputs = BTreeMap::new();
+        outputs.insert(root.clone(), unsorted.into_bytes());
+        let _override = force_git_root_commit_probe_outputs_for_test(outputs);
+        let key = artifact_cache_key_with_memo(&root, &root, &storage, None)
+            .expect("canonical probe should replace old memo");
+
+        assert_eq!(key, expected_key);
+        let memo = read_cache_key_memo(&storage);
+        let entry = memo
+            .get(root.to_string_lossy().as_ref())
+            .expect("replaced memo entry");
+        assert_eq!(entry.key, expected_key);
+        assert_eq!(entry.git_root_commit, canonical);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -15,6 +16,7 @@ use aft::protocol::{RawRequest, Response};
 use aft::search_index::{artifact_cache_key, resolve_cache_dir, SearchIndex};
 use aft::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn request(query: &str) -> RawRequest {
     request_with(query, None)
@@ -144,6 +146,66 @@ fn git_project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static
     init_git(project.path());
     commit_all(project.path());
     (project, source_file, source)
+}
+
+#[test]
+fn artifact_cache_key_uses_sorted_roots_for_grafted_history() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let dir = tempfile::tempdir().expect("create grafted-history temp dir");
+    let repo = dir.path().join("grafted-repo");
+    fs::create_dir_all(&repo).expect("create grafted repo");
+    init_git(&repo);
+
+    fs::write(repo.join("first.txt"), "first root\n").expect("write first root file");
+    commit_all(&repo);
+    let first_root = git_head(&repo);
+
+    let orphan = git_command(&repo)
+        .args(["checkout", "--orphan", "second-root"])
+        .status()
+        .expect("create orphan branch");
+    assert!(orphan.success(), "orphan branch creation failed");
+    let remove_first = git_command(&repo)
+        .args(["rm", "-rf", "."])
+        .status()
+        .expect("remove first root files");
+    assert!(remove_first.success(), "removing first root files failed");
+    fs::write(repo.join("second.txt"), "second root\n").expect("write second root file");
+    commit_all(&repo);
+    let second_root = git_head(&repo);
+
+    let restore_first = git_command(&repo)
+        .args(["checkout", "-b", "grafted-base", &first_root])
+        .status()
+        .expect("restore first root branch");
+    assert!(
+        restore_first.success(),
+        "restoring first root branch failed"
+    );
+    let merge = git_command(&repo)
+        .args([
+            "merge",
+            "--allow-unrelated-histories",
+            "--no-edit",
+            "-m",
+            "graft roots",
+            "second-root",
+        ])
+        .status()
+        .expect("merge unrelated roots");
+    assert!(merge.success(), "grafted-history merge failed");
+
+    let mut roots = [first_root, second_root];
+    roots.sort_unstable();
+    let canonical_roots = roots.join("\n");
+    let digest = format!("{:x}", Sha256::digest(canonical_roots.as_bytes()));
+    let expected_key = digest[..16].to_string();
+
+    assert_eq!(
+        artifact_cache_key(&repo),
+        expected_key,
+        "grafted-history cache identity must hash the sorted root set"
+    );
 }
 
 fn git_head(root: &Path) -> String {
