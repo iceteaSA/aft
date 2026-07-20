@@ -194,14 +194,14 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.47.2";
+const ANNOUNCEMENT_VERSION = "0.47.3";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Fixed: apply_patch wrote mixed line endings when editing CRLF (Windows) files; the file's dominant line ending is now preserved.",
-  "Fixed: inlining a function argument like twice(1 + 2) could change operator precedence; non-atomic arguments are now parenthesized.",
-  "Fixed: removing one name from a Python import with an aliased sibling (from m import a, b as c) could delete the whole line.",
-  "Fixed: bash_watch could report a match that spanned the stdout/stderr seam; streams are now scanned independently.",
-  "GitHub and GitLab file links (…/blob/…) now read raw file content in aft_outline/aft_zoom, and documentation heading lookups tolerate numeric prefixes, link labels, emoji, and anchor slugs.",
-  "bash now finds tools on a PATH exported from your shell rc (e.g. zsh .zshrc), and several warm hot paths got faster.",
+  "Fixed: aft_search could return zero results when a match existed — hidden test files consumed the result cap before source files were reached.",
+  "Fixed: aft_import removing one name from a comma-separated PHP use (use A, B) deleted the sibling; Java static-member removal is fixed the same way.",
+  "Fixed: aft_safety restore now preserves Unix permission bits (including the executable bit); aft_conflicts keeps conflicts with non-ASCII filenames.",
+  "Fixed: aft_inspect no longer counts TODO markers inside strings and now reports self-import cycles; trace_data no longer reports a flow after the variable is overwritten.",
+  "Long-running daemon sessions fully reclaim idle projects (lower memory), and daemon restarts no longer trigger a re-embedding storm.",
+  "Faster indexed search, tool dispatch, call trees, and duplicate scans across the board.",
 ];
 
 /**
