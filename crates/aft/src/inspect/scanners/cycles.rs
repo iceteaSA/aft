@@ -523,7 +523,14 @@ impl CycleGraph {
     fn cycles(&self) -> Vec<CycleReport> {
         self.strongly_connected_components()
             .into_iter()
-            .filter(|component| component.len() >= 2)
+            .filter(|component| {
+                component.len() >= 2
+                    || component.first().is_some_and(|node| {
+                        self.adjacency
+                            .get(node)
+                            .is_some_and(|neighbors| neighbors.contains(node))
+                    })
+            })
             .filter_map(|component| self.report_for_component(component))
             .collect()
     }
@@ -582,6 +589,18 @@ impl CycleGraph {
     }
 
     fn report_for_component(&self, files: Vec<String>) -> Option<CycleReport> {
+        if files.len() == 1 {
+            let file = files.first()?.clone();
+            let edge = self.edge_report(&file, &file);
+            let edge_kind = edge.edge_kind.clone();
+            return Some(CycleReport {
+                files,
+                chain: vec![file.clone(), file],
+                edges: vec![edge],
+                edge_kind,
+            });
+        }
+
         let component_set = files.iter().cloned().collect::<BTreeSet<_>>();
         let mut chain = vec![files.first()?.clone()];
         let mut edges = Vec::new();

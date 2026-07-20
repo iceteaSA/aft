@@ -144,7 +144,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v29: duplicates verdicts require every reported occurrence to span at least
 /// 10 source lines, so unchanged per-file fragment facts can now aggregate to a
 /// different surfaced group set.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 29;
+/// v30: cycles verdicts retain singleton strongly connected components when a
+/// resolved non-type import explicitly points back to the same file.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 30;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -2347,7 +2349,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 29);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 30);
     }
 
     #[test]
