@@ -15,6 +15,7 @@ pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
 #[cfg(test)]
 const MAX_UNDO_DEPTH: usize = DEFAULT_MAX_UNDO_DEPTH;
 const V2_FORMAT_VERSION: &str = "v2";
+const DB_RESTORE_META_VERSION: u32 = 1;
 const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
 
 #[cfg(test)]
@@ -244,6 +245,7 @@ impl BackupEntry {
             description: self.description.clone(),
             created_at: i64::try_from(self.timestamp).unwrap_or(i64::MAX),
             is_tombstone: matches!(self.kind, BackupEntryKind::Tombstone),
+            restore_meta: Some(restore_metadata_json(self)),
         }
     }
 }
@@ -260,9 +262,15 @@ impl TryFrom<BackupRow> for BackupEntry {
             BackupEntryKind::Content
         };
         let backup_path = row.backup_path.clone();
-        let disk_metadata = backup_path
+        let persisted_metadata = row
+            .restore_meta
             .as_deref()
-            .and_then(|path| read_entry_disk_metadata(Path::new(path), &row.backup_id));
+            .and_then(restore_metadata_from_json);
+        let restore_metadata = persisted_metadata.or_else(|| {
+            backup_path
+                .as_deref()
+                .and_then(|path| read_entry_disk_metadata(Path::new(path), &row.backup_id))
+        });
         let content_bytes = match kind {
             BackupEntryKind::Content | BackupEntryKind::Symlink => {
                 let backup_path = backup_path.ok_or_else(|| {
@@ -276,7 +284,7 @@ impl TryFrom<BackupRow> for BackupEntry {
             BackupEntryKind::Tombstone => Vec::new(),
         };
         let link_target = if kind == BackupEntryKind::Symlink {
-            disk_metadata
+            restore_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.link_target.clone())
                 .or_else(|| {
@@ -305,9 +313,9 @@ impl TryFrom<BackupRow> for BackupEntry {
             description: row.description,
             op_id: row.op_id,
             kind,
-            mode: disk_metadata.as_ref().and_then(|metadata| metadata.mode),
+            mode: restore_metadata.as_ref().and_then(|metadata| metadata.mode),
             link_target,
-            created_dirs: disk_metadata
+            created_dirs: restore_metadata
                 .map(|metadata| metadata.created_dirs)
                 .unwrap_or_default(),
         })
@@ -2970,11 +2978,79 @@ pub fn new_op_id() -> String {
     format!("op-{}-{:08x}", current_timestamp() * 1000, rand)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BackupEntryDiskMetadata {
     mode: Option<u32>,
     link_target: Option<PathBuf>,
     created_dirs: Vec<PathBuf>,
+}
+
+fn restore_metadata_json(entry: &BackupEntry) -> String {
+    serde_json::json!({
+        "version": DB_RESTORE_META_VERSION,
+        "mode": entry.mode,
+        "link_target": entry.link_target.as_ref().map(|target| target.display().to_string()),
+        "created_dirs": entry
+            .created_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+fn restore_metadata_from_json(value: &str) -> Option<BackupEntryDiskMetadata> {
+    let value: serde_json::Value = serde_json::from_str(value).ok()?;
+    if value.get("version")?.as_u64()? != u64::from(DB_RESTORE_META_VERSION) {
+        return None;
+    }
+
+    let mode = value.get("mode")?;
+    if !mode.is_null()
+        && mode
+            .as_u64()
+            .and_then(|mode| u32::try_from(mode).ok())
+            .is_none()
+    {
+        return None;
+    }
+    let link_target = value.get("link_target")?;
+    if !link_target.is_null() && !link_target.is_string() {
+        return None;
+    }
+    if !value
+        .get("created_dirs")?
+        .as_array()?
+        .iter()
+        .all(serde_json::Value::is_string)
+    {
+        return None;
+    }
+
+    Some(restore_metadata_fields(&value))
+}
+
+fn restore_metadata_fields(value: &serde_json::Value) -> BackupEntryDiskMetadata {
+    BackupEntryDiskMetadata {
+        mode: value
+            .get("mode")
+            .and_then(|value| value.as_u64())
+            .and_then(|mode| u32::try_from(mode).ok()),
+        link_target: value
+            .get("link_target")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from),
+        created_dirs: value
+            .get("created_dirs")
+            .and_then(|value| value.as_array())
+            .map(|dirs| {
+                dirs.iter()
+                    .filter_map(|dir| dir.as_str())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3325,26 +3401,7 @@ fn read_entry_disk_metadata(
     let entry = entries
         .iter()
         .find(|entry| entry.get("backup_id").and_then(|value| value.as_str()) == Some(backup_id))?;
-    Some(BackupEntryDiskMetadata {
-        mode: entry
-            .get("mode")
-            .and_then(|value| value.as_u64())
-            .and_then(|mode| u32::try_from(mode).ok()),
-        link_target: entry
-            .get("link_target")
-            .and_then(|value| value.as_str())
-            .map(PathBuf::from),
-        created_dirs: entry
-            .get("created_dirs")
-            .and_then(|value| value.as_array())
-            .map(|dirs| {
-                dirs.iter()
-                    .filter_map(|dir| dir.as_str())
-                    .map(PathBuf::from)
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
+    Some(restore_metadata_fields(entry))
 }
 
 fn rollback_transactional_restore(
@@ -3850,6 +3907,34 @@ mod tests {
             DB_MIRROR_PATH_HASH,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn backup_db_restore_metadata_round_trips_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let context = db_mirror_context();
+        let mut entry = db_mirror_entry(0, BackupEntryKind::Symlink);
+        entry.mode = Some(0o100755);
+        entry.link_target = Some(PathBuf::from("../target"));
+        entry.created_dirs = vec![PathBuf::from("/project/new"), PathBuf::from("/project")];
+
+        crate::db::backups::insert_backup(&conn, &backup_row_for_db(&entry, &context)).unwrap();
+        let row = db_mirror_rows(&conn).pop().unwrap();
+        let metadata = row
+            .restore_meta
+            .as_deref()
+            .and_then(restore_metadata_from_json)
+            .unwrap();
+
+        assert_eq!(
+            metadata,
+            BackupEntryDiskMetadata {
+                mode: entry.mode,
+                link_target: entry.link_target,
+                created_dirs: entry.created_dirs,
+            }
+        );
     }
 
     #[test]
@@ -5274,6 +5359,7 @@ mod tests {
                 description: "db fallback".to_string(),
                 created_at: i64::try_from(current_timestamp()).unwrap(),
                 is_tombstone: false,
+                restore_meta: None,
             },
         )
         .unwrap();

@@ -8,7 +8,7 @@ pub mod bash_tasks;
 pub mod compression_events;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -122,6 +122,12 @@ ON compression_events (
 const MIGRATION_V3: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_bash_tasks_project_lookup
 ON bash_tasks (harness, project_key, task_id, started_at DESC);
+"#;
+
+// V4 adds the restore_meta column to backups (Unix mode / created_dirs /
+// link_target for DB-fallback restores when the meta.json sidecar is gone).
+const MIGRATION_V4: &str = r#"
+ALTER TABLE backups ADD COLUMN restore_meta TEXT;
 "#;
 
 #[derive(Debug)]
@@ -245,6 +251,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         1 => tx.execute_batch(MIGRATION_V1),
         2 => tx.execute_batch(MIGRATION_V2),
         3 => tx.execute_batch(MIGRATION_V3),
+        4 => apply_migration_v4(&tx),
         _ => Ok(()),
     }
     .and_then(|()| {
@@ -261,6 +268,19 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         to: version,
         error,
     })
+}
+
+fn apply_migration_v4(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(backups)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    if !columns.iter().any(|column| column == "restore_meta") {
+        conn.execute_batch(MIGRATION_V4)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -452,7 +472,9 @@ mod tests {
 
         let conn = open(&path).unwrap();
 
-        assert_eq!(schema_version(&conn), 3);
+        // A v2 database migrates all the way to the current version; V3 creates
+        // the bash-task lookup index on the way.
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         assert!(sqlite_names(&conn, "index").contains(&"idx_bash_tasks_project_lookup".to_string()));
     }
 
@@ -489,6 +511,63 @@ mod tests {
             plan.iter()
                 .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
             "lookup plan still sorts into a temporary B-tree: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn migration_v4_adds_restore_metadata_to_v2_and_v3_databases() {
+        for initial_version in [2, 3] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join(format!("aft-v{initial_version}.db"));
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute("DELETE FROM schema_version", []).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                [initial_version],
+            )
+            .unwrap();
+            insert_backup(&conn, "legacy", &order_blob(1)).unwrap();
+            drop(conn);
+
+            let conn = open(&path).unwrap();
+
+            assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+            assert!(table_columns(&conn, "backups").contains(&"restore_meta".to_string()));
+            let restore_meta: Option<String> = conn
+                .query_row(
+                    "SELECT restore_meta FROM backups WHERE backup_id = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(restore_meta, None, "legacy rows stay nullable");
+        }
+    }
+
+    #[test]
+    fn migration_v4_is_idempotent_when_column_already_exists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute_batch(MIGRATION_V4).unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (3)", [])
+            .unwrap();
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            table_columns(&conn, "backups")
+                .iter()
+                .filter(|column| column.as_str() == "restore_meta")
+                .count(),
+            1
         );
     }
 
@@ -583,6 +662,16 @@ mod tests {
         };
         let mut stmt = conn.prepare(sql).unwrap();
         stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()

@@ -15,6 +15,7 @@ pub struct BackupRow {
     pub description: String,
     pub created_at: i64,
     pub is_tombstone: bool,
+    pub restore_meta: Option<String>,
 }
 
 pub fn upsert_backup(conn: &Connection, row: &BackupRow) -> rusqlite::Result<()> {
@@ -33,10 +34,10 @@ pub fn insert_backup(conn: &Connection, row: &BackupRow) -> rusqlite::Result<()>
     conn.execute(
         "INSERT INTO backups (
             backup_id, harness, session_id, project_key, op_id, order_blob, file_path,
-            path_hash, backup_path, kind, description, created_at, is_tombstone
+            path_hash, backup_path, kind, description, created_at, is_tombstone, restore_meta
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-            ?8, ?9, ?10, ?11, ?12, ?13
+            ?8, ?9, ?10, ?11, ?12, ?13, ?14
          )",
         params![
             row.backup_id,
@@ -52,6 +53,7 @@ pub fn insert_backup(conn: &Connection, row: &BackupRow) -> rusqlite::Result<()>
             row.description,
             row.created_at,
             row.is_tombstone,
+            row.restore_meta,
         ],
     )?;
 
@@ -81,7 +83,7 @@ pub fn get_latest_backup(
 ) -> rusqlite::Result<Option<BackupRow>> {
     conn.query_row(
         "SELECT backup_id, harness, session_id, project_key, op_id, order_blob, file_path,
-                path_hash, backup_path, kind, description, created_at, is_tombstone
+                path_hash, backup_path, kind, description, created_at, is_tombstone, restore_meta
          FROM backups
          WHERE harness = ?1 AND session_id = ?2 AND path_hash = ?3
          ORDER BY order_blob DESC
@@ -100,7 +102,7 @@ pub fn list_backups(
 ) -> rusqlite::Result<Vec<BackupRow>> {
     let mut stmt = conn.prepare(
         "SELECT backup_id, harness, session_id, project_key, op_id, order_blob, file_path,
-                path_hash, backup_path, kind, description, created_at, is_tombstone
+                path_hash, backup_path, kind, description, created_at, is_tombstone, restore_meta
          FROM backups
          WHERE harness = ?1 AND session_id = ?2 AND path_hash = ?3
          ORDER BY order_blob ASC",
@@ -120,7 +122,7 @@ pub fn list_backups_by_op(
 ) -> rusqlite::Result<Vec<BackupRow>> {
     let mut stmt = conn.prepare(
         "SELECT backup_id, harness, session_id, project_key, op_id, order_blob, file_path,
-                path_hash, backup_path, kind, description, created_at, is_tombstone
+                path_hash, backup_path, kind, description, created_at, is_tombstone, restore_meta
          FROM backups
          WHERE harness = ?1 AND session_id = ?2 AND op_id = ?3
          ORDER BY file_path ASC, order_blob ASC",
@@ -139,7 +141,7 @@ pub fn get_latest_operation_backup(
 ) -> rusqlite::Result<Option<BackupRow>> {
     conn.query_row(
         "SELECT backup_id, harness, session_id, project_key, op_id, order_blob, file_path,
-                path_hash, backup_path, kind, description, created_at, is_tombstone
+                path_hash, backup_path, kind, description, created_at, is_tombstone, restore_meta
          FROM backups
          WHERE harness = ?1 AND session_id = ?2 AND op_id IS NOT NULL
          ORDER BY order_blob DESC
@@ -179,6 +181,7 @@ fn map_backup_row(row: &Row<'_>) -> rusqlite::Result<BackupRow> {
         description: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
         created_at: row.get(11)?,
         is_tombstone: row.get::<_, i64>(12)? != 0,
+        restore_meta: row.get(13)?,
     })
 }
 

@@ -9,6 +9,9 @@ use aft::db::backups::{upsert_backup, BackupRow};
 use aft::harness::Harness;
 use rusqlite::Connection;
 
+#[cfg(unix)]
+use super::helpers::AftProcess;
+
 const SESSION: &str = "backup-dual-write-session";
 const PROJECT_KEY: &str = "backup-project-key";
 
@@ -27,6 +30,7 @@ struct DbBackupRow {
     description: Option<String>,
     created_at: i64,
     is_tombstone: bool,
+    restore_meta: Option<String>,
 }
 
 fn store_with_db(storage: &Path, harness: Harness) -> (BackupStore, Arc<Mutex<Connection>>) {
@@ -50,7 +54,7 @@ fn fetch_rows(conn: &Arc<Mutex<Connection>>, order_by: &str) -> Vec<DbBackupRow>
     let conn = conn.lock().unwrap();
     let sql = format!(
         "SELECT backup_id, harness, session_id, project_key, op_id, order_blob, file_path,
-                path_hash, backup_path, kind, description, created_at, is_tombstone
+                path_hash, backup_path, kind, description, created_at, is_tombstone, restore_meta
          FROM backups {order_by}"
     );
     let mut stmt = conn.prepare(&sql).unwrap();
@@ -69,6 +73,7 @@ fn fetch_rows(conn: &Arc<Mutex<Connection>>, order_by: &str) -> Vec<DbBackupRow>
             description: row.get(10)?,
             created_at: row.get(11)?,
             is_tombstone: row.get::<_, i64>(12)? != 0,
+            restore_meta: row.get(13)?,
         })
     })
     .unwrap()
@@ -109,6 +114,7 @@ fn backups_dual_write_backup_save_writes_both_disk_and_db_row() {
     assert_eq!(row.description.as_deref(), Some("before edit"));
     assert!(!row.is_tombstone);
     assert!(row.created_at > 0);
+    assert!(row.restore_meta.is_some());
     let backup_path = row.backup_path.unwrap();
     assert!(!Path::new(&backup_path).is_absolute());
     let stack_dir = storage
@@ -292,6 +298,137 @@ fn backup_restore_preserves_unix_permissions() {
     assert_eq!(mode, 0o755);
 }
 
+#[cfg(unix)]
+#[test]
+fn legacy_db_row_without_restore_meta_reads_mode_from_sidecar() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let (mut store, conn) = store_with_db(storage.path(), Harness::Opencode);
+    let file = temp_file(
+        project.path(),
+        "legacy-executable.sh",
+        "#!/bin/sh\nexit 0\n",
+    );
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    store.snapshot(SESSION, &file, "legacy executable").unwrap();
+
+    let summary = fetch_rows(&conn, "").pop().unwrap();
+    conn.lock()
+        .unwrap()
+        .execute("UPDATE backups SET restore_meta = NULL", [])
+        .unwrap();
+    let mut row = aft::db::backups::list_backups(
+        &conn.lock().unwrap(),
+        "opencode",
+        SESSION,
+        &summary.path_hash,
+    )
+    .unwrap()
+    .pop()
+    .unwrap();
+    assert_eq!(row.restore_meta, None);
+    let relative_backup_path = row.backup_path.take().unwrap();
+    row.backup_path = Some(
+        storage
+            .path()
+            .join("backups")
+            .join(hash_session(SESSION))
+            .join(&summary.path_hash)
+            .join(relative_backup_path)
+            .display()
+            .to_string(),
+    );
+
+    let restored = aft::backup::BackupEntry::try_from(row).unwrap();
+
+    assert_eq!(restored.mode.map(|mode| mode & 0o777), Some(0o755));
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_db_fallback_restores_mode_without_sidecar() {
+    const BINARY_SESSION: &str = "binary-db-restore-metadata-session";
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let file = temp_file(project.path(), "tool.sh", "#!/bin/sh\necho ORIGINAL\n");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    let configure = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "session_id": BINARY_SESSION,
+            "config": { "format_on_edit": false },
+        })
+    };
+
+    let mut first = AftProcess::spawn();
+    let configured = first.send(&configure("configure-first").to_string());
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+    let edited = first.send(
+        &serde_json::json!({
+            "id": "edit",
+            "command": "edit_match",
+            "session_id": BINARY_SESSION,
+            "file": &file,
+            "match": "ORIGINAL",
+            "replacement": "EDITED",
+        })
+        .to_string(),
+    );
+    assert_eq!(edited["success"], true, "edit failed: {edited:?}");
+    assert!(first.shutdown().success());
+
+    let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
+    let path_hash: String = conn
+        .query_row(
+            "SELECT path_hash FROM backups WHERE session_id = ?1",
+            [BINARY_SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let meta_path = storage
+        .path()
+        .join("opencode")
+        .join("backups")
+        .join(hash_session(BINARY_SESSION))
+        .join(path_hash)
+        .join("meta.json");
+    fs::remove_file(&meta_path).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut second = AftProcess::spawn();
+    let configured = second.send(&configure("configure-second").to_string());
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+    let undone = second.send(
+        &serde_json::json!({
+            "id": "undo",
+            "command": "undo",
+            "session_id": BINARY_SESSION,
+            "file": &file,
+        })
+        .to_string(),
+    );
+    assert_eq!(undone["success"], true, "undo failed: {undone:?}");
+    assert!(second.shutdown().success());
+
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "#!/bin/sh\necho ORIGINAL\n"
+    );
+    let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
 #[test]
 fn backup_process_maintenance_repairs_legacy_root_backups() {
     let storage = tempfile::tempdir().unwrap();
@@ -413,6 +550,7 @@ fn direct_row_with_op(
         description: "direct row".to_string(),
         created_at: 1,
         is_tombstone: false,
+        restore_meta: None,
     }
 }
 
