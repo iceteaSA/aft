@@ -1382,7 +1382,19 @@ mod policy_tests {
             project.path(),
             None,
         );
+        // The invariant is that an untrusted principal never receives a native
+        // Launcher plan. On Unix that surfaces as a downgrade to Unsandboxed
+        // (the untrusted principal fails the first-party enforcement check); on
+        // platforms without a kernel backend the enabled policy fails closed
+        // with a platform refusal before the trust check is reached. Both honor
+        // the invariant, so assert the exact non-Launcher outcome per platform.
+        #[cfg(unix)]
         assert_eq!(plan, SpawnPlan::Unsandboxed);
+        #[cfg(not(unix))]
+        assert!(
+            matches!(&plan, SpawnPlan::Refused { code, .. } if *code == "sandbox_unavailable"),
+            "untrusted principal must never reach the native launcher; got {plan:?}"
+        );
     }
 
     #[cfg(unix)]
