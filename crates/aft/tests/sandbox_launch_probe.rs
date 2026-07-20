@@ -62,6 +62,7 @@ impl ProbeFixture {
 
         let profile = SandboxProfile::build(
             vec![project.clone(), artifacts],
+            Vec::new(),
             vec![project.join(".git"), project.join(".cortexkit")],
             vec![secret.clone()],
             vec![docker_socket.clone(), agent_socket.clone()],
@@ -328,6 +329,7 @@ fn missing_project_metadata_remains_write_denied() {
     let hook = git_dir.join("hooks/pre-commit");
     let profile = SandboxProfile::build(
         vec![project],
+        Vec::new(),
         vec![git_dir],
         Vec::new(),
         Vec::new(),
@@ -365,6 +367,7 @@ fn read_deny_created_after_sandbox_start_remains_denied() {
     let release = root.join("release");
     let profile = SandboxProfile::build(
         vec![project],
+        Vec::new(),
         Vec::new(),
         vec![secret_dir.clone()],
         Vec::new(),
@@ -456,6 +459,75 @@ fn p5_linux_records_read_deny_gap() {
     assert_eq!(output.stdout, b"probe-secret\n");
     assert_linux_unenforced_warning(&output);
     eprintln!("P5 Linux observed ALLOWED with read_deny warning");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_secret_floor_write_is_denied_under_enclosing_write_root() {
+    let root = tempfile::tempdir().expect("create probe root");
+    let root = root.path().canonicalize().expect("canonical probe root");
+    let home = root.join("fake-home");
+    let secret_floor = home.join(".ssh");
+    let authorized_keys = secret_floor.join("authorized_keys");
+    let work = home.join("work");
+    let allowed_file = work.join("allowed");
+    let task_temp = home.join("task-temp");
+    for directory in [&secret_floor, &work, &task_temp] {
+        fs::create_dir_all(directory).expect("create fake HOME fixture");
+    }
+    fs::write(&authorized_keys, b"original\n").expect("write fake authorized_keys");
+    let profile = SandboxProfile::build(
+        vec![home.clone(), work],
+        vec![secret_floor.clone()],
+        Vec::new(),
+        vec![secret_floor],
+        Vec::new(),
+        Vec::new(),
+        task_temp,
+    )
+    .expect("build profile with secret write floor");
+    let mut inherited = InheritedProfile::new(&profile);
+    inherited.rewind();
+    let script = format!(
+        "printf allowed > {}; printf changed >> {}",
+        shell_path(&allowed_file),
+        shell_path(&authorized_keys)
+    );
+    let output = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .env("HOME", &home)
+        .output()
+        .expect("launch secret-floor write probe");
+
+    assert_denied(&output, "secret-floor append");
+    assert_eq!(
+        fs::read(&authorized_keys).expect("read fake authorized_keys"),
+        b"original\n"
+    );
+    assert_eq!(
+        fs::read(&allowed_file).expect("read disjoint allowed file"),
+        b"allowed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("operation not permitted"),
+        "secret-floor write did not fail with EPERM: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    inherited.rewind();
+    let read_output = launcher_command(
+        inherited.fd(),
+        &[
+            "/bin/bash",
+            "-c",
+            &format!("cat {}", shell_path(&authorized_keys)),
+        ],
+    )
+    .env("HOME", &home)
+    .output()
+    .expect("launch secret-floor read probe");
+    assert_denied(&read_output, "secret-floor read");
 }
 
 #[test]

@@ -52,7 +52,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
             escape_path(root)?
         ));
     }
-    for path in &profile.write_deny_nested {
+    for path in profile.write_deny.iter().chain(&profile.write_deny_nested) {
         source.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
             escape_path(path)?
@@ -120,6 +120,7 @@ mod tests {
         let profile = SandboxProfile {
             v: 1,
             writable_roots: vec![project],
+            write_deny: Vec::new(),
             write_deny_nested: vec![nested_deny],
             read_deny: Vec::new(),
             socket_deny: Vec::new(),
@@ -135,6 +136,43 @@ mod tests {
     }
 
     #[test]
+    fn secret_floor_denies_follow_enclosing_write_allow() {
+        let root = tempfile::tempdir().expect("temp root");
+        let home = root.path().join("home");
+        let secret_floor = home.join(".ssh");
+        let task_temp = home.join("task");
+        std::fs::create_dir_all(&secret_floor).expect("secret floor directory");
+        std::fs::create_dir_all(&task_temp).expect("task temp directory");
+        let profile = SandboxProfile::build(
+            vec![home],
+            vec![secret_floor.clone()],
+            Vec::new(),
+            vec![secret_floor],
+            Vec::new(),
+            Vec::new(),
+            task_temp,
+        )
+        .expect("build profile");
+
+        let source = render_profile(&profile).expect("render profile");
+        let allow = source.find("(allow file-write*").expect("write allow");
+        let write_deny = source
+            .find("(deny file-write* (subpath")
+            .expect("secret-floor write deny");
+        let read_deny = source
+            .find("(deny file-read* (subpath")
+            .expect("secret-floor read deny");
+        assert!(
+            write_deny > allow,
+            "secret-floor write deny must follow enclosing write allow"
+        );
+        assert!(
+            read_deny > write_deny,
+            "read deny must remain in the profile"
+        );
+    }
+
+    #[test]
     fn missing_mandatory_denies_are_rendered_with_path_intent() {
         let root = tempfile::tempdir().expect("temp root");
         let project = root.path().join("project");
@@ -146,6 +184,7 @@ mod tests {
         let missing_socket = root.path().join("missing.sock");
         let profile = SandboxProfile::build(
             vec![project],
+            Vec::new(),
             vec![missing_git.clone()],
             vec![missing_secret.clone()],
             vec![missing_socket.clone()],

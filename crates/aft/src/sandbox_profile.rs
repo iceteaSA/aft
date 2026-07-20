@@ -10,6 +10,9 @@ pub const SANDBOX_PROFILE_VERSION: u32 = 1;
 pub struct SandboxProfile {
     pub v: u32,
     pub writable_roots: Vec<PathBuf>,
+    /// Mandatory write-deny paths for backends that support nested exclusions.
+    #[serde(default)]
+    pub write_deny: Vec<PathBuf>,
     pub write_deny_nested: Vec<PathBuf>,
     pub read_deny: Vec<PathBuf>,
     pub socket_deny: Vec<PathBuf>,
@@ -21,10 +24,11 @@ impl SandboxProfile {
     /// Build a profile whose existing paths are canonical before serialization.
     ///
     /// Writable roots, cache roots, and the task temp directory must already
-    /// exist. Missing deny targets are retained as normalized absolute paths so
-    /// callers can describe optional resources that may appear before launch.
+    /// exist. Missing deny targets are normalized through their nearest
+    /// existing ancestor so resources created after launch remain enforceable.
     pub fn build(
         writable_roots: Vec<PathBuf>,
+        write_deny: Vec<PathBuf>,
         write_deny_nested: Vec<PathBuf>,
         read_deny: Vec<PathBuf>,
         socket_deny: Vec<PathBuf>,
@@ -34,6 +38,7 @@ impl SandboxProfile {
         Ok(Self {
             v: SANDBOX_PROFILE_VERSION,
             writable_roots: canonicalize_required_dirs(writable_roots, "writable_roots")?,
+            write_deny: canonicalize_optional_paths(write_deny, "write_deny")?,
             write_deny_nested: canonicalize_optional_paths(write_deny_nested, "write_deny_nested")?,
             read_deny: canonicalize_optional_paths(read_deny, "read_deny")?,
             socket_deny: canonicalize_optional_paths(socket_deny, "socket_deny")?,
@@ -57,6 +62,7 @@ impl SandboxProfile {
         Ok(Self {
             v: self.v,
             writable_roots: canonicalize_required_dirs(self.writable_roots, "writable_roots")?,
+            write_deny: canonicalize_optional_paths(self.write_deny, "write_deny")?,
             write_deny_nested: canonicalize_optional_paths(
                 self.write_deny_nested,
                 "write_deny_nested",
@@ -241,6 +247,7 @@ mod tests {
         let profile = SandboxProfile::build(
             vec![project.clone()],
             Vec::new(),
+            Vec::new(),
             vec![missing.clone()],
             Vec::new(),
             vec![cache.clone()],
@@ -264,6 +271,7 @@ mod tests {
         let profile = SandboxProfile {
             v: SANDBOX_PROFILE_VERSION,
             writable_roots: vec![root.clone()],
+            write_deny: vec![root.join("missing-write-deny")],
             write_deny_nested: vec![root.join("missing-nested")],
             read_deny: vec![root.join("missing-secret")],
             socket_deny: vec![root.join("missing.sock")],
@@ -273,6 +281,7 @@ mod tests {
         .canonicalize_for_launch()
         .expect("validate profile");
 
+        assert_eq!(profile.write_deny, vec![root.join("missing-write-deny")]);
         assert_eq!(profile.write_deny_nested, vec![root.join("missing-nested")]);
         assert_eq!(profile.read_deny, vec![root.join("missing-secret")]);
         assert_eq!(profile.socket_deny, vec![root.join("missing.sock")]);

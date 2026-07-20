@@ -730,8 +730,7 @@ fn build_native_profile(
                 .map(|path| expand_home(path, &home)),
         );
 
-        let mut write_deny_nested = Vec::new();
-        let mut read_deny = vec![
+        let secret_floor = vec![
             home.join(".ssh"),
             home.join(".aws"),
             home.join(".gnupg"),
@@ -739,6 +738,12 @@ fn build_native_profile(
             home.join(".azure"),
             home.join(".config/cortexkit"),
         ];
+        // A writable project or user allow may enclose HOME. Keeping the same
+        // credential floor in the write policy prevents that broad grant from
+        // turning read protection into permission to mutate host credentials.
+        let write_deny = secret_floor.clone();
+        let mut write_deny_nested = Vec::new();
+        let mut read_deny = secret_floor;
         for root in &project_roots {
             write_deny_nested.push(root.join(".git"));
             write_deny_nested.push(root.join(".cortexkit"));
@@ -781,6 +786,7 @@ fn build_native_profile(
 
         SandboxProfile::build(
             writable_roots,
+            write_deny,
             write_deny_nested,
             read_deny,
             socket_deny,
@@ -1152,6 +1158,7 @@ mod tests {
         std::fs::create_dir_all(&temp).unwrap();
         let profile = SandboxProfile::build(
             vec![project],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

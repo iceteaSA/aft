@@ -950,6 +950,7 @@ exec "$@"
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             storage.path().to_path_buf(),
         )
         .unwrap();
@@ -1022,6 +1023,7 @@ exec "$@"
 
         let profile = SandboxProfile::build(
             vec![project.path().to_path_buf()],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
