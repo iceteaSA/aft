@@ -123,7 +123,7 @@ fn tokenize(header: &str, heredoc: Option<String>) -> Option<ParsedCommand> {
                 '`' => return None,
                 '$' if is_unsupported_variable_start(chars.peek().map(|(_, c)| *c)) => return None,
                 '\\' => match chars.next() {
-                    Some((_, escaped)) => token.push(escaped),
+                    Some((_, escaped)) => push_double_quoted_backslash(&mut token, escaped),
                     None => token.push('\\'),
                 },
                 _ => token.push(ch),
@@ -227,7 +227,7 @@ fn tokenize_word(input: &str) -> Option<(String, usize)> {
                 '\\' => match chars.next() {
                     Some((next_idx, escaped)) => {
                         consumed = next_idx + escaped.len_utf8();
-                        token.push(escaped);
+                        push_double_quoted_backslash(&mut token, escaped);
                     }
                     None => token.push('\\'),
                 },
@@ -287,6 +287,17 @@ fn read_unquoted_word(input: &str, start: usize) -> Option<(String, usize)> {
         end = start + offset + ch.len_utf8();
     }
     Some((word, end))
+}
+
+fn push_double_quoted_backslash(token: &mut String, escaped: char) {
+    match escaped {
+        '\n' => {}
+        '$' | '`' | '"' | '\\' => token.push(escaped),
+        _ => {
+            token.push('\\');
+            token.push(escaped);
+        }
+    }
 }
 
 fn is_unsupported_variable_start(next: Option<char>) -> bool {

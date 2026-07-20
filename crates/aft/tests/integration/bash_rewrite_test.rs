@@ -276,6 +276,163 @@ fn rewrites_ls_directory_and_rejects_unknown_flags() {
 }
 
 #[test]
+fn binary_rewrite_matches_bash_for_double_quoted_backslashes() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let preserved_path = project.path().join(r"read\q.txt");
+    let stripped_path = project.path().join("readq.txt");
+    fs::write(&preserved_path, "PRESERVED_READ_TARGET\n").unwrap();
+    fs::write(&stripped_path, "WRONG_READ_TARGET\n").unwrap();
+
+    let quoted_path = project.path().join("a\"q.txt");
+    fs::write(&quoted_path, "ESCAPED_QUOTE_TARGET\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let configured = aft.send(
+        &json!({
+            "id": "configure-double-quote-backslashes",
+            "session_id": "double-quote-backslashes",
+            "command": "configure",
+            "harness": "runner",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "config": user_config(json!({
+                "bash": { "rewrite": true },
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+
+    let preserved_command = format!(r#"cat "{}""#, preserved_path.display());
+    let native_preserved = std::process::Command::new("/bin/bash")
+        .args(["-lc", &preserved_command])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        native_preserved.status.success(),
+        "native cat failed: {native_preserved:?}"
+    );
+    let rewritten_preserved = aft.send(
+        &json!({
+            "id": "read-preserved-backslash",
+            "session_id": "double-quote-backslashes",
+            "command": "bash",
+            "params": {
+                "command": preserved_command,
+                "workdir": project.path(),
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        rewritten_preserved["success"], true,
+        "rewrite failed: {rewritten_preserved:?}"
+    );
+    let rewritten_stdout = format!(
+        "{}\n",
+        output(&rewritten_preserved)
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("1: "))
+            .expect("numbered read output")
+    );
+    assert_eq!(rewritten_stdout.as_bytes(), native_preserved.stdout);
+    assert!(!output(&rewritten_preserved).contains("WRONG_READ_TARGET"));
+
+    let escaped_quote_command = format!(
+        "cat \"{}\"",
+        quoted_path.display().to_string().replace('"', "\\\"")
+    );
+    let native_escaped = std::process::Command::new("/bin/bash")
+        .args(["-lc", &escaped_quote_command])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        native_escaped.status.success(),
+        "native cat failed: {native_escaped:?}"
+    );
+    let rewritten_escaped = aft.send(
+        &json!({
+            "id": "read-escaped-quote",
+            "session_id": "double-quote-backslashes",
+            "command": "bash",
+            "params": {
+                "command": escaped_quote_command,
+                "workdir": project.path(),
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        rewritten_escaped["success"], true,
+        "rewrite failed: {rewritten_escaped:?}"
+    );
+    let rewritten_stdout = format!(
+        "{}\n",
+        output(&rewritten_escaped)
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("1: "))
+            .expect("numbered read output")
+    );
+    assert_eq!(rewritten_stdout.as_bytes(), native_escaped.stdout);
+
+    let append_path = project.path().join(r"append\q.txt");
+    let wrong_append_path = project.path().join("appendq.txt");
+    fs::write(&append_path, "before\n").unwrap();
+    fs::write(&wrong_append_path, "wrong-before\n").unwrap();
+    let append_command = format!(r#"echo appended >> "{}""#, append_path.display());
+    let native_append = std::process::Command::new("/bin/bash")
+        .args(["-lc", &append_command])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        native_append.status.success(),
+        "native append failed: {native_append:?}"
+    );
+    let native_append_content = fs::read_to_string(&append_path).unwrap();
+    fs::write(&append_path, "before\n").unwrap();
+
+    let rewritten_append = aft.send(
+        &json!({
+            "id": "append-preserved-backslash",
+            "session_id": "double-quote-backslashes",
+            "command": "bash",
+            "params": {
+                "command": append_command,
+                "workdir": project.path(),
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        rewritten_append["success"], true,
+        "rewrite failed: {rewritten_append:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&append_path).unwrap(),
+        native_append_content
+    );
+    assert_eq!(
+        fs::read_to_string(&wrong_append_path).unwrap(),
+        "wrong-before\n"
+    );
+}
+
+#[test]
 fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
