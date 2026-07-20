@@ -4,12 +4,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use aft::bash_background::persistence::{read_task, task_paths, PersistedTask};
+use aft::bash_background::persistence::{
+    read_task, task_paths, write_task, PersistedTask, TaskPaths,
+};
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use aft::db::bash_tasks::{upsert_bash_task, BashTaskRow};
 use aft::harness::Harness;
+use filetime::{set_file_mtime, FileTime};
 use rusqlite::Connection;
 
 const SESSION: &str = "dual-write-session";
@@ -62,6 +65,44 @@ fn spawn_task(registry: &BgTaskRegistry, storage: &Path, project: &Path, command
             Some(project.to_path_buf()),
         )
         .expect("spawn background task")
+}
+
+fn write_gc_task(
+    conn: &Arc<Mutex<Connection>>,
+    storage: &Path,
+    project: &Path,
+    task_id: &str,
+    status: BgTaskStatus,
+    completion_delivered: bool,
+) -> TaskPaths {
+    let paths = task_paths(storage, SESSION, task_id);
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        SESSION.to_string(),
+        "true".to_string(),
+        project.to_path_buf(),
+        Some(project.to_path_buf()),
+        None,
+        true,
+        true,
+    );
+    if status.is_terminal() {
+        metadata.mark_terminal(status, Some(0), None);
+    } else {
+        metadata.status = status;
+    }
+    metadata.completion_delivered = completion_delivered;
+    write_task(&paths.json, &metadata).unwrap();
+    upsert_bash_task(
+        &conn.lock().unwrap(),
+        &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+    )
+    .unwrap();
+    let old = SystemTime::now()
+        .checked_sub(Duration::from_secs(25 * 60 * 60))
+        .unwrap();
+    set_file_mtime(&paths.json, FileTime::from_system_time(old)).unwrap();
+    paths
 }
 
 fn shell_quote_path(path: &Path) -> String {
@@ -342,6 +383,46 @@ fn bash_tasks_dual_write_harness_isolation_in_db() {
         )
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[test]
+fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
+    let deletable = write_gc_task(
+        &conn,
+        storage.path(),
+        project.path(),
+        "bash-gc-delivered",
+        BgTaskStatus::Completed,
+        true,
+    );
+    let active = write_gc_task(
+        &conn,
+        storage.path(),
+        project.path(),
+        "bash-gc-active",
+        BgTaskStatus::Running,
+        false,
+    );
+    let undelivered = write_gc_task(
+        &conn,
+        storage.path(),
+        project.path(),
+        "bash-gc-undelivered",
+        BgTaskStatus::Completed,
+        false,
+    );
+
+    assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 1);
+
+    assert!(fetch_row(&conn, "opencode", SESSION, "bash-gc-delivered").is_none());
+    assert!(!deletable.json.exists());
+    assert!(fetch_row(&conn, "opencode", SESSION, "bash-gc-active").is_some());
+    assert!(active.json.exists());
+    assert!(fetch_row(&conn, "opencode", SESSION, "bash-gc-undelivered").is_some());
+    assert!(undelivered.json.exists());
 }
 
 #[test]

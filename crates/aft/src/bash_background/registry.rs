@@ -655,6 +655,48 @@ impl BgTaskRegistry {
         }
     }
 
+    fn delete_gc_task_from_db(&self, metadata: &PersistedTask) {
+        let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
+        let Some(pool) = pool else {
+            return;
+        };
+        let harness = self
+            .inner
+            .db_harness
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(harness) = harness else {
+            crate::slog_warn!(
+                "GC bash_task DB delete skipped for {}: harness not configured",
+                metadata.task_id
+            );
+            return;
+        };
+        let conn = match pool.lock() {
+            Ok(conn) => conn,
+            Err(_) => {
+                crate::slog_warn!(
+                    "GC bash_task DB delete failed for {}: db mutex poisoned",
+                    metadata.task_id
+                );
+                return;
+            }
+        };
+        if let Err(error) = crate::db::bash_tasks::delete_delivered_terminal_bash_task(
+            &conn,
+            &harness,
+            &metadata.session_id,
+            &metadata.task_id,
+        ) {
+            crate::slog_warn!(
+                "GC bash_task DB delete failed for {}: {}",
+                metadata.task_id,
+                error
+            );
+        }
+    }
+
     pub fn record_scanner_report(
         &self,
         task_id: &str,
@@ -1755,6 +1797,7 @@ impl BgTaskRegistry {
                     let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
                     match delete_task_bundle(&paths) {
                         Ok(()) => {
+                            self.delete_gc_task_from_db(&metadata);
                             deleted += 1;
                             log::debug!(
                                 "deleted persisted background task bundle {}",

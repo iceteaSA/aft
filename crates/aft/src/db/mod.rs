@@ -8,7 +8,7 @@ pub mod bash_tasks;
 pub mod compression_events;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -117,6 +117,11 @@ ON compression_events (
   tool,
   COALESCE(task_id, char(0))
 );
+"#;
+
+const MIGRATION_V3: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_bash_tasks_project_lookup
+ON bash_tasks (harness, project_key, task_id, started_at DESC);
 "#;
 
 #[derive(Debug)]
@@ -239,6 +244,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
     let result = match version {
         1 => tx.execute_batch(MIGRATION_V1),
         2 => tx.execute_batch(MIGRATION_V2),
+        3 => tx.execute_batch(MIGRATION_V3),
         _ => Ok(()),
     }
     .and_then(|()| {
@@ -276,6 +282,7 @@ mod tests {
         "idx_bash_tasks_project_key",
         "idx_bash_tasks_status",
         "idx_bash_tasks_session_status",
+        "idx_bash_tasks_project_lookup",
         "idx_compression_session",
         "idx_compression_session_created",
         "idx_compression_project_key",
@@ -429,6 +436,60 @@ mod tests {
             "bash",
             Some("task-1"),
         ));
+    }
+
+    #[test]
+    fn migration_v3_upgrades_existing_v2_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])
+            .unwrap();
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+
+        assert_eq!(schema_version(&conn), 3);
+        assert!(sqlite_names(&conn, "index").contains(&"idx_bash_tasks_project_lookup".to_string()));
+    }
+
+    #[test]
+    fn bash_task_project_lookup_uses_composite_filter_and_order_index() {
+        let dir = tempdir().unwrap();
+        let conn = open(&dir.path().join("aft.db")).unwrap();
+        let mut statement = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                        exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                        compressed, timeout_ms, completion_delivered, output_bytes, metadata
+                 FROM bash_tasks
+                 WHERE harness = ?1 AND project_key = ?2 AND task_id = ?3
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+            )
+            .unwrap();
+        let plan = statement
+            .query_map(params!["opencode", "project-key", "bash-task"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_bash_tasks_project_lookup")),
+            "lookup plan did not use the composite index: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "lookup plan still sorts into a temporary B-tree: {plan:?}"
+        );
     }
 
     #[test]
