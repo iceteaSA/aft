@@ -46,6 +46,10 @@ fn send(aft: &mut AftProcess, request: Value) -> Value {
     aft.send(&serde_json::to_string(&request).expect("serialize request"))
 }
 
+fn normalize_display_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 fn configure_search_index(aft: &mut AftProcess, root: &Path, id: &str) -> Value {
     send(
         aft,
@@ -261,7 +265,7 @@ fn aft_search_excludes_tests_before_the_visible_result_cap() {
     );
     assert!(production_results[0]["file"]
         .as_str()
-        .is_some_and(|file| file.ends_with("/zzz/production.rs")));
+        .is_some_and(|file| normalize_display_path(file).ends_with("/zzz/production.rs")));
     assert_eq!(production_only["engine_capped"], false);
     assert_eq!(production_only["more_available"], false);
 
@@ -285,7 +289,7 @@ fn aft_search_excludes_tests_before_the_visible_result_cap() {
         .iter()
         .any(|result| result["file"]
             .as_str()
-            .is_some_and(|file| file.contains("/tests/"))));
+            .is_some_and(|file| normalize_display_path(file).contains("/tests/"))));
 
     let generic_grep = send(
         &mut aft,
@@ -303,7 +307,7 @@ fn aft_search_excludes_tests_before_the_visible_result_cap() {
         .iter()
         .any(|result| result["file"]
             .as_str()
-            .is_some_and(|file| file.contains("/tests/"))));
+            .is_some_and(|file| normalize_display_path(file).contains("/tests/"))));
 
     let normal_search = send(
         &mut aft,
@@ -323,7 +327,7 @@ fn aft_search_excludes_tests_before_the_visible_result_cap() {
         .iter()
         .any(|result| result["file"]
             .as_str()
-            .is_some_and(|file| file.ends_with("/src/small.rs"))));
+            .is_some_and(|file| normalize_display_path(file).ends_with("/src/small.rs"))));
 
     let status = aft.shutdown();
     assert!(status.success());
