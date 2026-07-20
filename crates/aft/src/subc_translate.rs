@@ -1,5 +1,6 @@
 //! Agent-facing tool → native command translation (subc edge only).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -45,18 +46,19 @@ fn resolve_home_dir() -> Option<PathBuf> {
     Some(raw)
 }
 
-fn expand_tilde(target: &str) -> String {
+fn expand_tilde(target: &str) -> Cow<'_, str> {
     if target == "~" {
         return resolve_home_dir()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|| target.to_string());
+            .map(|h| Cow::Owned(h.to_string_lossy().into_owned()))
+            .unwrap_or(Cow::Borrowed(target));
     }
     if let Some(rest) = target.strip_prefix("~/") {
         if let Some(home) = resolve_home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
+            return Cow::Owned(home.join(rest).to_string_lossy().into_owned());
         }
     }
-    target.to_string()
+    // Ordinary paths (the overwhelmingly common case) borrow — no allocation.
+    Cow::Borrowed(target)
 }
 
 /// Decode an RFC 8089 `file:` URL to a local filesystem path.
@@ -129,7 +131,7 @@ pub fn resolve_path_from_project_root(project_root: &Path, target: &str) -> Path
         .map(std::borrow::Cow::Owned)
         .unwrap_or(std::borrow::Cow::Borrowed(target));
     let expanded = expand_tilde(&target);
-    let path = Path::new(&expanded);
+    let path = Path::new(expanded.as_ref());
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
