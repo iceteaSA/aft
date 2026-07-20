@@ -21,8 +21,8 @@ use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
-    SearchIndexSnapshot,
+    sort_grep_matches_by_mtime_desc, GrepMatch, GrepPathExclusion, GrepResult, IndexStatus,
+    SearchIndex, SearchIndexSnapshot,
 };
 use crate::semantic_index::{
     EmbeddingModel, QueryBudget, SemanticIndex, SemanticIndexFingerprint, SemanticResult,
@@ -439,20 +439,19 @@ fn handle_external_grep_search(
     };
 
     let literal = effective_mode == SearchMode::Literal;
-    let grep_limit = grep_candidate_limit(top_k, include_tests);
     let mut result = search_index.snapshot().search_grep_bounded(
         &compiled,
         &[],
         &[],
         external_root,
-        grep_limit,
+        top_k,
+        grep_path_exclusion(include_tests),
         grep_executor::MAX_FALLBACK_WALK_FILES,
         grep_executor::FALLBACK_WALK_BUDGET,
     );
     result
         .matches
         .retain(|grep_match| grep_match.file.is_file());
-    result = filter_grep_result_for_tests(result, include_tests, external_root, top_k);
 
     let result_source = if literal { "literal" } else { "regex" };
     let result_values = result
@@ -793,13 +792,6 @@ fn semantic_candidate_limit(top_k: usize) -> usize {
         .clamp(SEMANTIC_OVERFETCH_FLOOR, MAX_TOP_K)
 }
 
-fn grep_candidate_limit(top_k: usize, include_tests: bool) -> usize {
-    if include_tests {
-        return top_k;
-    }
-    DEGRADED_GREP_RESULT_LIMIT.max(top_k)
-}
-
 fn project_relative_path<'a>(path: &'a Path, project_root: &'a Path) -> &'a Path {
     path.strip_prefix(project_root).unwrap_or(path)
 }
@@ -821,6 +813,10 @@ fn path_is_hidden_test_file(path: &Path, project_root: &Path) -> bool {
 
 fn path_allowed_by_include_tests(path: &Path, project_root: &Path, include_tests: bool) -> bool {
     include_tests || !path_is_hidden_test_file(path, project_root)
+}
+
+fn grep_path_exclusion(include_tests: bool) -> Option<GrepPathExclusion> {
+    (!include_tests).then_some(path_is_hidden_test_file)
 }
 
 fn path_has_unambiguous_generated_artifact_type(path: &Path) -> bool {
@@ -950,42 +946,6 @@ fn lexical_candidates_with_generated_artifact_rank(
             .then_with(|| a.ordinal.cmp(&b.ordinal))
     });
     candidates
-}
-
-fn grep_visible_file_count(matches: &[GrepMatch]) -> usize {
-    matches
-        .iter()
-        .map(|grep_match| grep_match.file.clone())
-        .collect::<HashSet<_>>()
-        .len()
-}
-
-fn filter_grep_result_for_tests(
-    mut result: GrepResult,
-    include_tests: bool,
-    project_root: &Path,
-    top_k: usize,
-) -> GrepResult {
-    if include_tests {
-        return result;
-    }
-
-    let mut visible = result
-        .matches
-        .into_iter()
-        .filter(|grep_match| !path_is_hidden_test_file(&grep_match.file, project_root))
-        .collect::<Vec<_>>();
-    let visible_total = visible.len();
-    let truncated_by_filter = visible.len() > top_k;
-    if truncated_by_filter {
-        visible.truncate(top_k);
-    }
-
-    result.matches = visible;
-    result.total_matches = visible_total;
-    result.files_with_matches = grep_visible_file_count(&result.matches);
-    result.truncated |= truncated_by_filter;
-    result
 }
 
 fn choose_mode(
@@ -1146,21 +1106,20 @@ fn handle_grep_search(
     };
 
     let literal = effective_mode == SearchMode::Literal;
-    let grep_limit = grep_candidate_limit(top_k, include_tests);
-    let scope = match grep_executor::resolve_grep_scope(ctx, None, grep_limit, &req.id) {
+    let scope = match grep_executor::resolve_grep_scope(ctx, None, top_k, &req.id) {
         Ok(scope) => scope,
         Err(response) => return response,
     };
     let params = GrepParams {
         include: Vec::new(),
         exclude: Vec::new(),
-        max_results: grep_limit,
+        max_results: top_k,
+        path_exclusion: grep_path_exclusion(include_tests),
     };
-    let mut result = grep_executor::execute(ctx, &compiled, &scope, &params);
+    let result = grep_executor::execute(ctx, &compiled, &scope, &params);
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
     }
-    result = filter_grep_result_for_tests(result, include_tests, project_root, top_k);
 
     let result_source = if literal { "literal" } else { "regex" };
     let result_values = result

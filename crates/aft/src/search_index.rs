@@ -595,6 +595,8 @@ struct QueryBuild {
     or_groups: Vec<Vec<Vec<u8>>>,
 }
 
+pub type GrepPathExclusion = fn(&Path, &Path) -> bool;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PathFilters {
     includes: Option<GlobSet>,
@@ -1548,7 +1550,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
     ) -> GrepResult {
-        self.search_grep_profiled(pattern, include, exclude, search_root, max_results)
+        self.search_grep_profiled(pattern, include, exclude, search_root, max_results, None)
             .0
     }
 
@@ -1559,6 +1561,7 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
         max_files: usize,
         budget: Duration,
     ) -> GrepResult {
@@ -1568,6 +1571,7 @@ impl SearchIndexSnapshot {
             exclude,
             search_root,
             max_results,
+            path_exclusion,
             Some((max_files, budget)),
         )
         .0
@@ -1580,6 +1584,7 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         self.search_grep_profiled_with_limits(
             pattern,
@@ -1587,6 +1592,7 @@ impl SearchIndexSnapshot {
             exclude,
             search_root,
             max_results,
+            path_exclusion,
             None,
         )
     }
@@ -1598,6 +1604,7 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
         verification_limits: Option<(usize, Duration)>,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         let matcher = match pattern {
@@ -1628,6 +1635,9 @@ impl SearchIndexSnapshot {
             .filter_map(|file_id| self.files.get(file_id as usize))
             .filter(|file| !file.path.as_os_str().is_empty())
             .filter(|file| is_within_search_root(&search_root, &file.path))
+            .filter(|file| {
+                path_exclusion.is_none_or(|exclude| !exclude(&file.path, &self.project_root))
+            })
             .filter(|file| filters.matches(&self.project_root, &file.path))
             .collect();
         let candidate_count = candidate_files.len();

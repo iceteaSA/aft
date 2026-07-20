@@ -206,3 +206,125 @@ fn verify_file_mtimes_checks_each_cached_file_once() {
 
     assert_eq!(verify_file_strict_count_for_debug(), cached_files);
 }
+
+#[test]
+fn aft_search_excludes_tests_before_the_visible_result_cap() {
+    let mut production_content = "// filler filler filler filler\n".repeat(300_000);
+    production_content.push_str("pub fn production_needle_cap_bug() -> bool { true }\n");
+    let project = setup_project(&[
+        ("zzz/production.rs", production_content.as_str()),
+        (
+            "src/small.rs",
+            "pub fn normal_small_needle() -> bool { true }\n",
+        ),
+    ]);
+    fs::create_dir_all(project.path().join("tests")).expect("create tests directory");
+    for index in 0..400 {
+        fs::write(
+            project.path().join(format!("tests/case_{index:03}.rs")),
+            "const SATURATION_SENTINEL: &str = \"needle_cap_bug\";\n",
+        )
+        .expect("write test fixture");
+    }
+
+    let mut aft = AftProcess::spawn_with_env(&[("RAYON_NUM_THREADS", OsStr::new("4"))]);
+    let configure = configure_search_index(&mut aft, project.path(), "cfg-visible-cap");
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+    let ready = wait_for_search_index_ready(&mut aft, Duration::from_secs(10));
+    assert_eq!(ready["search_index"]["status"], "ready");
+
+    let production_only = send(
+        &mut aft,
+        json!({
+            "id": "search-production-only",
+            "command": "semantic_search",
+            "query": "needle_cap_bug",
+            "hint": "literal",
+            "top_k": 10,
+            "include_tests": false,
+        }),
+    );
+    assert_eq!(
+        production_only["success"], true,
+        "aft_search failed: {production_only:?}"
+    );
+    let production_results = production_only["results"]
+        .as_array()
+        .expect("production results");
+    assert_eq!(
+        production_results.len(),
+        1,
+        "hidden test matches must not consume the visible cap: {production_only:?}"
+    );
+    assert!(production_results[0]["file"]
+        .as_str()
+        .is_some_and(|file| file.ends_with("/zzz/production.rs")));
+    assert_eq!(production_only["engine_capped"], false);
+    assert_eq!(production_only["more_available"], false);
+
+    let including_tests = send(
+        &mut aft,
+        json!({
+            "id": "search-including-tests",
+            "command": "semantic_search",
+            "query": "needle_cap_bug",
+            "hint": "literal",
+            "top_k": 10,
+            "include_tests": true,
+        }),
+    );
+    assert_eq!(including_tests["success"], true);
+    assert_eq!(including_tests["engine_capped"], true);
+    assert_eq!(including_tests["more_available"], true);
+    assert!(including_tests["results"]
+        .as_array()
+        .expect("results including tests")
+        .iter()
+        .any(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| file.contains("/tests/"))));
+
+    let generic_grep = send(
+        &mut aft,
+        json!({
+            "id": "generic-grep-tests",
+            "command": "grep",
+            "pattern": "needle_cap_bug",
+            "max_results": 10,
+        }),
+    );
+    assert_eq!(generic_grep["success"], true);
+    assert!(generic_grep["matches"]
+        .as_array()
+        .expect("generic grep matches")
+        .iter()
+        .any(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| file.contains("/tests/"))));
+
+    let normal_search = send(
+        &mut aft,
+        json!({
+            "id": "normal-small-search",
+            "command": "semantic_search",
+            "query": "normal_small_needle",
+            "hint": "literal",
+            "top_k": 10,
+            "include_tests": false,
+        }),
+    );
+    assert_eq!(normal_search["success"], true);
+    assert!(normal_search["results"]
+        .as_array()
+        .expect("normal search results")
+        .iter()
+        .any(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| file.ends_with("/src/small.rs"))));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}

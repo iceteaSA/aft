@@ -618,6 +618,7 @@ mod tests {
             &[],
             &root,
             10,
+            None,
             1,
             std::time::Duration::from_secs(1),
         );

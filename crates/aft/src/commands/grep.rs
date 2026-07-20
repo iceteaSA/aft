@@ -92,6 +92,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         include,
         exclude,
         max_results,
+        path_exclusion: None,
     };
     let (result, phases) = grep_executor::execute_profiled(ctx, &compiled, &scope, &params);
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;

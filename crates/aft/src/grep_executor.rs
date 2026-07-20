@@ -16,8 +16,8 @@ use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, has_any_project_file_from, read_searchable_text, resolve_search_scope,
-    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, GrepMatch, GrepQueryPhaseTimings,
-    GrepResult, IndexStatus, PathFilters,
+    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, GrepMatch, GrepPathExclusion,
+    GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -37,6 +37,7 @@ pub struct GrepParams {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub max_results: usize,
+    pub path_exclusion: Option<GrepPathExclusion>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -288,10 +289,15 @@ fn execute_root_profiled(
         } else {
             IndexStatus::Fallback
         };
-        return (
-            grep_explicit_file(&root.search_root, pattern, max_results, index_status),
-            GrepExecutionPhaseTimings::default(),
-        );
+        let result = if params
+            .path_exclusion
+            .is_some_and(|exclude| exclude(&root.search_root, project_root))
+        {
+            empty_grep_result(index_status, false)
+        } else {
+            grep_explicit_file(&root.search_root, pattern, max_results, index_status)
+        };
+        return (result, GrepExecutionPhaseTimings::default());
     }
 
     let snapshot_started = Instant::now();
@@ -316,6 +322,7 @@ fn execute_root_profiled(
             &params.exclude,
             &root.search_root,
             max_results,
+            params.path_exclusion,
         );
         query.post_filter += scope_elapsed;
         return (
@@ -346,12 +353,27 @@ fn execute_root_profiled(
             &params.exclude,
             max_results,
             index_status,
+            params.path_exclusion,
         ),
         GrepExecutionPhaseTimings {
             snapshot_acquire,
             ..GrepExecutionPhaseTimings::default()
         },
     )
+}
+
+fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepResult {
+    GrepResult {
+        matches: Vec::new(),
+        total_matches: 0,
+        files_searched: 0,
+        files_with_matches: 0,
+        index_status,
+        truncated: false,
+        fully_degraded,
+        engine_capped: false,
+        walk_truncated: false,
+    }
 }
 
 /// Grep a single explicitly-named file directly, bypassing the trigram index
@@ -543,6 +565,8 @@ pub(crate) fn for_each_bounded_fallback_walk_file<F>(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
+    project_root: &Path,
+    path_exclusion: Option<GrepPathExclusion>,
     mut on_file: F,
 ) -> bool
 where
@@ -552,6 +576,8 @@ where
         filter_root,
         search_root,
         filters,
+        project_root,
+        path_exclusion,
         MAX_FALLBACK_WALK_FILES,
         FALLBACK_WALK_BUDGET,
         &mut on_file,
@@ -562,6 +588,8 @@ fn for_each_bounded_fallback_walk_file_with_limits<F>(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
+    project_root: &Path,
+    path_exclusion: Option<GrepPathExclusion>,
     max_files: usize,
     budget: Duration,
     on_file: &mut F,
@@ -584,6 +612,9 @@ where
             continue;
         }
         let path = entry.into_path();
+        if path_exclusion.is_some_and(|exclude| exclude(&path, project_root)) {
+            continue;
+        }
         if filters.matches(filter_root, &path) {
             files_seen += 1;
             if files_seen > max_files {
@@ -624,6 +655,7 @@ pub fn fallback_grep_bench(
         exclude,
         max_results,
         IndexStatus::Fallback,
+        None,
     )
 }
 
@@ -636,6 +668,7 @@ fn fallback_grep(
     exclude: &[String],
     max_results: usize,
     index_status: IndexStatus,
+    path_exclusion: Option<GrepPathExclusion>,
 ) -> GrepResult {
     let filters = build_path_filters(include, exclude).unwrap_or_default();
 
@@ -684,8 +717,13 @@ fn fallback_grep(
         matches.extend(partial);
     };
 
-    let walk_truncated =
-        for_each_bounded_fallback_walk_file(filter_root, search_root, &filters, |path| {
+    let walk_truncated = for_each_bounded_fallback_walk_file(
+        filter_root,
+        search_root,
+        &filters,
+        project_root,
+        path_exclusion,
+        |path| {
             if stop_scan.load(Ordering::Relaxed) {
                 return;
             }
@@ -693,7 +731,8 @@ fn fallback_grep(
             if batch.len() >= 256 {
                 flush_batch(&mut batch, &mut matches);
             }
-        });
+        },
+    );
     flush_batch(&mut batch, &mut matches);
 
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
@@ -967,6 +1006,65 @@ mod tests {
             engine_capped: false,
             walk_truncated: false,
         }
+    }
+
+    #[test]
+    fn optional_path_exclusion_controls_visible_totals_without_affecting_default_grep() {
+        fn excludes_tests(path: &Path, root: &Path) -> bool {
+            path.strip_prefix(root)
+                .is_ok_and(|relative| relative.starts_with("tests"))
+        }
+
+        let project = tempfile::tempdir().expect("project");
+        let test_file = project.path().join("tests/case.rs");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(test_file.parent().expect("test parent")).expect("test dir");
+        std::fs::create_dir_all(source_file.parent().expect("source parent")).expect("source dir");
+        std::fs::write(&test_file, "const NEEDLE: &str = \"needle\";\n").expect("test file");
+        std::fs::write(&source_file, "pub fn needle() {}\n").expect("source file");
+        let pattern = match crate::pattern_compile::compile(
+            "needle",
+            crate::pattern_compile::CompileOpts {
+                literal: true,
+                ..crate::pattern_compile::CompileOpts::default()
+            },
+        ) {
+            crate::pattern_compile::CompileResult::Ok(pattern) => pattern,
+            other => panic!("compile literal: {other:?}"),
+        };
+
+        let unfiltered = fallback_grep(
+            project.path(),
+            project.path(),
+            project.path(),
+            &pattern,
+            &[],
+            &[],
+            10,
+            IndexStatus::Fallback,
+            None,
+        );
+        assert_eq!(unfiltered.total_matches, 2);
+        assert_eq!(unfiltered.matches.len(), 2);
+
+        let visible = fallback_grep(
+            project.path(),
+            project.path(),
+            project.path(),
+            &pattern,
+            &[],
+            &[],
+            10,
+            IndexStatus::Fallback,
+            Some(excludes_tests),
+        );
+        assert_eq!(visible.total_matches, 1);
+        assert_eq!(visible.matches.len(), 1);
+        assert_eq!(visible.files_searched, 1);
+        assert_eq!(visible.files_with_matches, 1);
+        assert_eq!(visible.matches[0].file, source_file);
+        assert!(!visible.truncated);
+        assert!(!visible.engine_capped);
     }
 
     #[test]
