@@ -216,8 +216,38 @@ fn coerce_optional_int_result(
     Ok(Some(n as u64))
 }
 
-fn agent_args_map(args: &Value) -> Map<String, Value> {
-    args.as_object().cloned().unwrap_or_default()
+fn agent_args_map(args: Value) -> Map<String, Value> {
+    match args {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    }
+}
+
+pub(crate) fn supports_tool(bare_name: &str) -> bool {
+    matches!(
+        bare_name,
+        "bash"
+            | "status"
+            | "read"
+            | "write"
+            | "edit"
+            | "apply_patch"
+            | "grep"
+            | "glob"
+            | "search"
+            | "outline"
+            | "zoom"
+            | "inspect"
+            | "callgraph"
+            | "conflicts"
+            | "ast_search"
+            | "ast_replace"
+            | "delete"
+            | "move"
+            | "import"
+            | "refactor"
+            | "safety"
+    )
 }
 
 fn insert_resolved_file(map: &mut Map<String, Value>, project_root: &Path, file_path: &str) {
@@ -233,7 +263,15 @@ pub fn subc_translate(
     agent_args: &Value,
     project_root: &Path,
 ) -> Result<Translated, TranslateError> {
-    subc_translate_with_context(
+    subc_translate_owned(bare_name, agent_args.clone(), project_root)
+}
+
+pub fn subc_translate_owned(
+    bare_name: &str,
+    agent_args: Value,
+    project_root: &Path,
+) -> Result<Translated, TranslateError> {
+    subc_translate_owned_with_context(
         bare_name,
         agent_args,
         project_root,
@@ -244,6 +282,15 @@ pub fn subc_translate(
 pub fn subc_translate_with_context(
     bare_name: &str,
     agent_args: &Value,
+    project_root: &Path,
+    ctx: TranslateContext,
+) -> Result<Translated, TranslateError> {
+    subc_translate_owned_with_context(bare_name, agent_args.clone(), project_root, ctx)
+}
+
+pub fn subc_translate_owned_with_context(
+    bare_name: &str,
+    agent_args: Value,
     project_root: &Path,
     ctx: TranslateContext,
 ) -> Result<Translated, TranslateError> {
@@ -290,13 +337,11 @@ fn coerce_boolean(value: &Value) -> bool {
     }
 }
 
-fn translate_bash(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
-    let map_in = args
-        .as_object()
-        .and_then(|obj| obj.get("params"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_else(|| agent_args_map(args));
+fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let mut map_in = agent_args_map(args);
+    if let Some(Value::Object(params)) = map_in.remove("params") {
+        map_in = params;
+    }
     let command = map_in
         .get("command")
         .and_then(Value::as_str)
@@ -424,7 +469,7 @@ fn translate_bash(args: &Value, project_root: &Path) -> Result<Translated, Trans
     })
 }
 
-fn translate_callgraph(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_callgraph(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let op = map_in
         .get("op")
@@ -515,7 +560,7 @@ fn insert_common_mutation_flags(out: &mut Map<String, Value>, ctx: TranslateCont
     out.insert("preview".to_string(), Value::Bool(ctx.preview));
 }
 
-fn translate_read(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_read(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let file_path = map_in
         .get("filePath")
@@ -557,24 +602,23 @@ fn translate_read(args: &Value, project_root: &Path) -> Result<Translated, Trans
 }
 
 fn translate_write(
-    args: &Value,
+    args: Value,
     project_root: &Path,
     ctx: TranslateContext,
 ) -> Result<Translated, TranslateError> {
-    let map_in = agent_args_map(args);
-    let file_path = map_in
-        .get("filePath")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| invalid_request("'filePath' is required"))?;
-    let content = map_in
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_request("write: missing required param 'content'"))?;
+    let mut map_in = agent_args_map(args);
+    let file_path = match map_in.remove("filePath") {
+        Some(Value::String(path)) if !path.is_empty() => path,
+        _ => return Err(invalid_request("'filePath' is required")),
+    };
+    let content = match map_in.remove("content") {
+        Some(Value::String(content)) => content,
+        _ => return Err(invalid_request("write: missing required param 'content'")),
+    };
 
     let mut out = Map::new();
-    insert_resolved_file(&mut out, project_root, file_path);
-    out.insert("content".to_string(), Value::String(content.to_string()));
+    insert_resolved_file(&mut out, project_root, &file_path);
+    out.insert("content".to_string(), Value::String(content));
     out.insert("create_dirs".to_string(), Value::Bool(true));
     insert_common_mutation_flags(&mut out, ctx);
 
@@ -585,7 +629,7 @@ fn translate_write(
 }
 
 fn translate_edit(
-    args: &Value,
+    args: Value,
     project_root: &Path,
     ctx: TranslateContext,
 ) -> Result<Translated, TranslateError> {
@@ -718,7 +762,7 @@ fn translate_edit(
     ))
 }
 
-fn translate_apply_patch(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_apply_patch(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let patch_text = map_in
         .get("patchText")
@@ -737,7 +781,7 @@ fn translate_apply_patch(args: &Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_grep(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let pattern = map_in
         .get("pattern")
@@ -780,7 +824,7 @@ fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, Trans
     })
 }
 
-fn translate_ast_search(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_ast_search(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let pattern = map_in
         .get("pattern")
@@ -813,7 +857,7 @@ fn translate_ast_search(args: &Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_ast_replace(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_ast_replace(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let pattern = map_in
         .get("pattern")
@@ -859,7 +903,7 @@ fn insert_present_renamed(
     }
 }
 
-fn translate_delete(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_delete(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let files = map_in
         .get("files")
@@ -890,7 +934,7 @@ fn translate_delete(args: &Value, project_root: &Path) -> Result<Translated, Tra
     })
 }
 
-fn translate_move(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_move(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let file_path = map_in
         .get("filePath")
@@ -922,7 +966,7 @@ fn translate_move(args: &Value, project_root: &Path) -> Result<Translated, Trans
     })
 }
 
-fn translate_import(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_import(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let op = map_in
         .get("op")
@@ -970,7 +1014,7 @@ fn translate_import(args: &Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_refactor(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_refactor(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let op = map_in
         .get("op")
@@ -1056,7 +1100,7 @@ fn translate_refactor(args: &Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_safety(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let op = map_in
         .get("op")
@@ -1144,7 +1188,7 @@ fn insert_non_empty_array(out: &mut Map<String, Value>, map_in: &Map<String, Val
     }
 }
 
-fn translate_glob(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_glob(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let pattern = map_in
         .get("pattern")
@@ -1248,7 +1292,7 @@ fn resolve_grep_path_arg(project_root: &Path, raw: &str) -> String {
         .join(" ")
 }
 
-fn translate_search(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_search(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let query = map_in
         .get("query")
@@ -1285,7 +1329,7 @@ fn translate_search(args: &Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_outline(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let files_flag = map_in
         .get("files")
@@ -1484,7 +1528,7 @@ fn translate_zoom_targets(
     Ok(out)
 }
 
-fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
 
     let has_targets = zoom_targets_provided(map_in.get("targets"));
@@ -1618,7 +1662,7 @@ fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, Trans
     })
 }
 
-fn translate_conflicts(args: &Value) -> Result<Translated, TranslateError> {
+fn translate_conflicts(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let mut out = Map::new();
     if let Some(path_val) = map_in.get("path") {
@@ -1635,7 +1679,7 @@ fn translate_conflicts(args: &Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_inspect(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+fn translate_inspect(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let mut out = Map::new();
 
@@ -1681,4 +1725,82 @@ fn translate_inspect(args: &Value, project_root: &Path) -> Result<Translated, Tr
         command: "inspect".into(),
         args: out,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_write_translation_moves_content_buffer() {
+        let content = "x".repeat(256 * 1024);
+        let content_ptr = content.as_ptr();
+        let content_len = content.len();
+        let mut arguments = Map::new();
+        arguments.insert(
+            "filePath".to_string(),
+            Value::String("src/generated.ts".to_string()),
+        );
+        arguments.insert("content".to_string(), Value::String(content));
+
+        let translated =
+            subc_translate_owned("write", Value::Object(arguments), Path::new("/project"))
+                .expect("write translation succeeds");
+        let translated_content = translated
+            .args
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("translated write keeps content");
+
+        assert_eq!(translated_content.len(), content_len);
+        assert_eq!(translated_content.as_ptr(), content_ptr);
+    }
+
+    // supports_tool() gates whether run_tool_call translates or passes a name
+    // through as a native command. If a translate arm is added but the
+    // allowlist isn't updated, that tool would silently bypass translation and
+    // dispatch as a raw native command — this proves the two sets agree.
+    #[test]
+    fn supports_tool_covers_every_translated_arm() {
+        for name in [
+            "bash",
+            "status",
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "grep",
+            "glob",
+            "search",
+            "outline",
+            "zoom",
+            "inspect",
+            "callgraph",
+            "conflicts",
+            "ast_search",
+            "ast_replace",
+            "delete",
+            "move",
+            "import",
+            "refactor",
+            "safety",
+        ] {
+            // Every name the allowlist claims support for must actually
+            // translate (not return unsupported_tool). A no-arg call may fail
+            // validation, but it must never be unsupported_tool.
+            let err =
+                subc_translate_owned(name, Value::Object(Map::new()), Path::new("/project")).err();
+            assert_ne!(
+                err.as_ref().map(|e| e.code),
+                Some("unsupported_tool"),
+                "{name} is in supports_tool but has no translate arm"
+            );
+            assert!(
+                supports_tool(name),
+                "{name} translates but is missing from supports_tool"
+            );
+        }
+        // A name that is not a tool must be rejected by both.
+        assert!(!supports_tool("definitely_not_a_tool"));
+    }
 }

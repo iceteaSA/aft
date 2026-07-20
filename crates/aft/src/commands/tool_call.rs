@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::run_tool_call::{
-    run_tool_call, strip_agent_preview_arg, DispatchFn, ToolCallContext, ToolCallOutcome,
+    run_tool_call, strip_agent_preview_arg_owned, DispatchFn, ToolCallContext, ToolCallOutcome,
 };
 
 type StandaloneDispatch = fn(RawRequest, &AppContext) -> Response;
@@ -71,7 +71,7 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         preview,
     };
 
-    let sanitized_arguments = strip_agent_preview_arg(&arguments);
+    let sanitized_arguments = strip_agent_preview_arg_owned(arguments);
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         name,
         &sanitized_arguments,
@@ -80,7 +80,7 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
 
     match run_tool_call(
         name,
-        &sanitized_arguments,
+        sanitized_arguments,
         &format_context,
         &tool_ctx,
         ctx,

@@ -258,9 +258,9 @@ pub(super) fn submit_deferred_bash(
                     );
                 }
 
-                let mut translated = match crate::subc_translate::subc_translate(
+                let mut translated = match crate::subc_translate::subc_translate_owned(
                     "bash",
-                    &arguments,
+                    arguments,
                     &project_root_for_spawn,
                 ) {
                     Ok(translated) => translated,

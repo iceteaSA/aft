@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -151,7 +150,7 @@ pub struct ToolCallContext {
 
 pub fn run_tool_call(
     bare_name: &str,
-    args: &Value,
+    args: Value,
     format_context: &crate::subc_format::FormatContext,
     ctx: &ToolCallContext,
     app_ctx: &AppContext,
@@ -159,38 +158,39 @@ pub fn run_tool_call(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
-    let sanitized_args = strip_agent_preview_arg(args);
+    let sanitized_args = strip_agent_preview_arg_owned(args);
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
         preview: ctx.preview,
     };
-    let (command, translated_args) = match crate::subc_translate::subc_translate_with_context(
-        bare_name,
-        &sanitized_args,
-        ctx.project_root.as_path(),
-        translate_context,
-    ) {
-        Ok(translated) => (translated.command, translated.args),
-        // Return validation errors from the translation step immediately. Only
-        // the special unsupported_tool error can fall through, allowing native
-        // NDJSON commands such as configure/undo to reach dispatch unchanged.
-        Err(err) if err.code != "unsupported_tool" => {
-            if let Some(trace) = phase_trace.as_mut() {
-                trace.mark_translate_done();
-                trace.mark_execute_done();
+    let (command, translated_args) = if crate::subc_translate::supports_tool(bare_name) {
+        match crate::subc_translate::subc_translate_owned_with_context(
+            bare_name,
+            sanitized_args,
+            ctx.project_root.as_path(),
+            translate_context,
+        ) {
+            Ok(translated) => (translated.command, translated.args),
+            Err(err) => {
+                if let Some(trace) = phase_trace.as_mut() {
+                    trace.mark_translate_done();
+                    trace.mark_execute_done();
+                }
+                let response = Response::error(ctx.request_id.clone(), err.code, err.message);
+                let result = tool_call_result_from_response(bare_name, format_context, response);
+                if let Some(trace) = phase_trace.as_mut() {
+                    trace.mark_format_done();
+                    trace.mark_finalize_done();
+                }
+                return ToolCallOutcome::Unary(result);
             }
-            let response = Response::error(ctx.request_id.clone(), err.code, err.message);
-            let result = tool_call_result_from_response(bare_name, format_context, response);
-            if let Some(trace) = phase_trace.as_mut() {
-                trace.mark_format_done();
-                trace.mark_finalize_done();
-            }
-            return ToolCallOutcome::Unary(result);
         }
-        Err(_) => {
-            let map = sanitized_args.as_object().cloned().unwrap_or_default();
-            (bare_name.to_string(), map)
-        }
+    } else {
+        let map = match sanitized_args {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        (bare_name.to_string(), map)
     };
 
     let mut map = translated_args;
@@ -242,19 +242,6 @@ pub fn run_tool_call(
     }
 
     ToolCallOutcome::Unary(ToolCallResult { text, response })
-}
-
-pub(crate) fn strip_agent_preview_arg(args: &Value) -> Cow<'_, Value> {
-    let Some(map) = args.as_object() else {
-        return Cow::Borrowed(args);
-    };
-    if !map.contains_key("preview") {
-        return Cow::Borrowed(args);
-    }
-
-    let mut sanitized = map.clone();
-    sanitized.remove("preview");
-    Cow::Owned(Value::Object(sanitized))
 }
 
 pub(crate) fn strip_agent_preview_arg_owned(mut args: Value) -> Value {

@@ -4087,7 +4087,7 @@ async fn handle_tool_call(
                     };
                     match run_tool_call(
                         &bare_name,
-                        &arguments,
+                        arguments,
                         &format_context,
                         &tool_call_context,
                         ctx,
