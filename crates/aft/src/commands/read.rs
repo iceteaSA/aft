@@ -1004,6 +1004,13 @@ fn handle_streaming_range_read(
 
 /// Handle directory listing.
 fn handle_directory(req: &RawRequest, path: &Path) -> Response {
+    // This server-owned field lets transparent bash rewrites preserve `ls`
+    // visibility. Direct read calls omit it and retain the existing show-all default.
+    let include_hidden = req
+        .params
+        .get("include_hidden")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
     let mut entries: Vec<String> = Vec::new();
 
     let read_dir = match fs::read_dir(path) {
@@ -1024,6 +1031,9 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
         };
 
         let name = entry.file_name().to_string_lossy().to_string();
+        if !include_hidden && name.starts_with('.') {
+            continue;
+        }
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
 
         if is_dir {

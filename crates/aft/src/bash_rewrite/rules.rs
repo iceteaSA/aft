@@ -444,6 +444,7 @@ fn ls_request(command: &str) -> Option<Value> {
     }
 
     let mut path = None;
+    let mut include_hidden = false;
     for arg in parsed.args.iter().skip(1) {
         if let Some(flags) = arg.strip_prefix('-') {
             if flags.is_empty() {
@@ -454,10 +455,15 @@ fn ls_request(command: &str) -> Option<Value> {
                     // -R: recursive listing — `read` of a directory is
                     // single-level only, but the result is still a useful
                     // approximation of "what's in this tree".
-                    // -a: show hidden files — `read` of a directory already
-                    // includes hidden files via fs::read_dir(), so this is
-                    // a no-op compared to plain `ls`.
-                    'R' | 'a' => {}
+                    'R' => {}
+                    // Plain `ls` hides dotfiles, while `read` normally includes
+                    // them. Preserve the caller's explicit request to show all
+                    // entries without changing direct `read` behavior.
+                    'a' => include_hidden = true,
+                    // `ls -A` shows hidden entries except `.` and `..`. Keep this
+                    // distinct spelling unsupported so native bash preserves its
+                    // exact contract.
+                    'A' => return None,
                     // -l: long format. Shows size, mtime, permissions, owner.
                     // `read` returns directory entries (no metadata) or file
                     // contents (not metadata at all). Rewriting drops the
@@ -491,7 +497,7 @@ fn ls_request(command: &str) -> Option<Value> {
         return None;
     }
 
-    Some(json!({ "file": target }))
+    Some(json!({ "file": target, "include_hidden": include_hidden }))
 }
 
 #[cfg(test)]

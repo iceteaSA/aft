@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 // Warn-level log capture is shared across all integration test modules via a
 // single process-global, thread-local-capturing logger. See test_helpers.
-use crate::test_helpers::{init_test_logger, take_logs};
+use crate::test_helpers::{init_test_logger, take_logs, user_config, AftProcess};
 
 fn context(root: &std::path::Path, enabled: bool) -> AppContext {
     AppContext::new(
@@ -272,6 +272,107 @@ fn rewrites_ls_directory_and_rejects_unknown_flags() {
     );
     assert!(output(&data).contains("lib.rs"));
     assert!(rewrite("ls -h src", &ctx).is_none());
+    assert!(rewrite("ls -A src", &ctx).is_none());
+}
+
+#[test]
+fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let tree = project.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("visible.txt"), "visible\n").unwrap();
+    fs::write(tree.join(".secret"), "secret\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let configured = aft.send(
+        &json!({
+            "id": "configure-ls-hidden",
+            "session_id": "ls-hidden-rewrite",
+            "command": "configure",
+            "harness": "runner",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "config": user_config(json!({
+                "bash": { "rewrite": true },
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+
+    let plain = aft.send(
+        &json!({
+            "id": "ls-hidden-plain",
+            "session_id": "ls-hidden-rewrite",
+            "command": "bash",
+            "params": {
+                "command": format!("ls {}", tree.display()),
+                "workdir": project.path(),
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        plain["entries"],
+        json!(["visible.txt"]),
+        "plain ls: {plain:?}"
+    );
+    assert!(
+        plain["output"]
+            .as_str()
+            .is_some_and(|value| value.contains("Prefer `read` tool over bash.")),
+        "plain ls did not traverse the rewrite path: {plain:?}"
+    );
+
+    let native = std::process::Command::new("/bin/bash")
+        .args(["-lc", "ls tree"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "native ls failed: {native:?}");
+    assert_eq!(String::from_utf8(native.stdout).unwrap(), "visible.txt\n");
+
+    let all = aft.send(
+        &json!({
+            "id": "ls-hidden-all",
+            "session_id": "ls-hidden-rewrite",
+            "command": "bash",
+            "params": {
+                "command": format!("ls -a {}", tree.display()),
+                "workdir": project.path(),
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        all["entries"],
+        json!([".secret", "visible.txt"]),
+        "ls -a: {all:?}"
+    );
+
+    let direct = aft.send(
+        &json!({
+            "id": "read-hidden-direct",
+            "session_id": "ls-hidden-rewrite",
+            "command": "read",
+            "file": tree,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        direct["entries"],
+        json!([".secret", "visible.txt"]),
+        "direct read must retain its show-all default: {direct:?}"
+    );
 }
 
 /// Regression for a real user report: `ls -l FILENAME` was being rewritten
