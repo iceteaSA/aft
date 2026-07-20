@@ -4389,11 +4389,11 @@ fn random_slug() -> String {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-    #[cfg(windows)]
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -6124,6 +6124,108 @@ mod tests {
 
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
         let _ = registry.kill(&task_id, "session");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rehydrating_sandboxed_task_never_respawns_persisted_command() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let sandbox_temp = storage.path().join("sandbox-temp");
+        fs::create_dir(&sandbox_temp).unwrap();
+        let launcher = project.path().join("passthrough-launcher.sh");
+        fs::write(
+            &launcher,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 78\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&launcher, permissions).unwrap();
+
+        let profile = crate::sandbox_profile::SandboxProfile::build(
+            vec![project.path().to_path_buf()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            sandbox_temp,
+        )
+        .unwrap();
+        let plan = SpawnPlan::launcher_for_test(profile, launcher);
+        let spawn_marker = project.path().join("spawn-count");
+        let stop_marker = project.path().join("stop-command");
+        let quote =
+            |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        let command = format!(
+            "printf 'spawn\\n' >> {}; while [ ! -e {} ]; do sleep 0.05; done",
+            quote(&spawn_marker),
+            quote(&stop_marker)
+        );
+
+        let original = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let task_id = original
+            .spawn(
+                plan,
+                &command,
+                "sandbox-rehydrate".to_string(),
+                project.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap();
+        let started = Instant::now();
+        while !spawn_marker.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "original sandboxed task did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        original.detach();
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted
+            .replay_session(storage.path(), "sandbox-rehydrate")
+            .unwrap();
+        let replayed = restarted
+            .status(
+                &task_id,
+                "sandbox-rehydrate",
+                Some(project.path()),
+                Some(storage.path()),
+                4096,
+            )
+            .expect("rehydrated sandbox task");
+        assert_eq!(replayed.info.status, BgTaskStatus::Running);
+        assert!(replayed.sandbox_native);
+
+        std::thread::sleep(Duration::from_millis(650));
+        assert_eq!(
+            fs::read_to_string(&spawn_marker).unwrap().lines().count(),
+            1,
+            "registry replay must observe the persisted process without spawning its command"
+        );
+
+        fs::write(&stop_marker, "stop").unwrap();
+        let terminal = wait_for_terminal_snapshot(
+            &restarted,
+            &task_id,
+            "sandbox-rehydrate",
+            project.path(),
+            storage.path(),
+        );
+        assert_eq!(terminal.info.status, BgTaskStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(&spawn_marker).unwrap().lines().count(),
+            1
+        );
+        restarted.detach();
     }
 
     #[cfg(windows)]

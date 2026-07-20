@@ -994,20 +994,26 @@ exec "$@"
 
     #[cfg(unix)]
     #[test]
-    fn launcher_exit_78_is_persisted_for_structured_error_mapping() {
+    fn launcher_init_failure_is_terminal_without_unsandboxed_retry() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
+        use crate::response_finalize::DispatchOutcome;
         use crate::sandbox_profile::SandboxProfile;
         use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let launcher = project.path().join("unavailable-sandbox-launcher.sh");
+        let launcher_spawns = project.path().join("launcher-spawns");
+        let command_marker = project.path().join("command-must-not-run");
         fs::write(
             &launcher,
-            "#!/bin/sh\necho 'sandbox_unavailable: test backend failed' >&2\nexit 78\n",
+            format!(
+                "#!/bin/sh\nprintf 'spawn\\n' >> '{}'\necho 'sandbox_unavailable: test backend failed' >&2\nexit 78\n",
+                launcher_spawns.display()
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&launcher).unwrap().permissions();
@@ -1025,37 +1031,150 @@ exec "$@"
         .unwrap();
         let plan = SpawnPlan::launcher_for_test(profile, launcher);
         let ctx = spawn_test_context(project.path(), storage.path());
-        let request = spawn_test_request("sandbox-unavailable", "echo never-runs", false);
-        let response = with_spawn_plan_for_test(plan, || handle(&request, &ctx));
-        assert!(response.success, "launcher spawn failed: {response:?}");
-        let task_id = response.data["task_id"].as_str().unwrap();
+        let mut request = spawn_test_request(
+            "sandbox-unavailable",
+            &format!("printf command-ran > '{}'", command_marker.display()),
+            false,
+        );
+        request.params["params"]["foreground_orchestrate"] = json!(true);
 
-        let started = Instant::now();
-        loop {
-            let snapshot = ctx
-                .bash_background()
-                .status(
-                    task_id,
-                    "sandbox-spawn-test",
-                    Some(project.path()),
-                    Some(storage.path()),
-                    4096,
-                )
-                .expect("sandbox task status");
-            if snapshot.info.status.is_terminal() {
-                assert_eq!(
-                    snapshot.exit_code,
-                    Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
-                );
-                assert!(snapshot.output_preview.contains("sandbox_unavailable:"));
-                assert!(snapshot.sandbox_unavailable);
-                break;
+        let spawn_response = with_spawn_plan_for_test(plan, || handle(&request, &ctx));
+        assert!(
+            spawn_response.success,
+            "launcher spawn failed: {spawn_response:?}"
+        );
+        let task_id = spawn_response.data["task_id"].as_str().unwrap().to_string();
+        let outcome =
+            crate::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawn_response);
+        let terminal = match outcome {
+            DispatchOutcome::Immediate(response) => response,
+            DispatchOutcome::Deferred(mut pending) => {
+                let started = Instant::now();
+                loop {
+                    if let Some(response) = (pending.poll)(&ctx) {
+                        break response;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "sandbox launcher failure did not terminate"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "launcher failure was not persisted: {snapshot:?}"
+        };
+        assert!(!terminal.success, "terminal response: {terminal:?}");
+        assert_eq!(terminal.data["code"], "sandbox_unavailable");
+        assert_eq!(
+            terminal.data["exit_code"],
+            crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE
+        );
+
+        std::thread::sleep(Duration::from_millis(650));
+        let status_request: RawRequest = serde_json::from_value(json!({
+            "id": "sandbox-unavailable-status",
+            "command": "bash_status",
+            "session_id": "sandbox-spawn-test",
+            "params": { "task_id": task_id },
+        }))
+        .unwrap();
+        let status = crate::commands::bash_status::handle(&status_request, &ctx);
+        assert!(!status.success, "status response: {status:?}");
+        assert_eq!(status.data["code"], "sandbox_unavailable");
+        assert_eq!(
+            status.data["exit_code"],
+            crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE
+        );
+        assert_eq!(
+            fs::read_to_string(&launcher_spawns)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "sandbox launcher must be spawned exactly once"
+        );
+        assert!(
+            !command_marker.exists(),
+            "sandbox failure must never retry the command unsandboxed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_retry_reclassified_as_first_party_resolves_native_plan() {
+        use crate::sandbox_spawn::{
+            clear_sandbox_spawn_test_seam, install_sandbox_spawn_test_seam,
+            sandbox_spawn_test_observations, with_authenticated_principal, AuthenticatedPrincipal,
+            PrincipalTrust, RequestedSandboxTier,
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        ctx.update_config(|config| {
+            config.sandbox.enabled = true;
+            config.bash_permissions = true;
+        });
+        install_sandbox_spawn_test_seam(project.path().to_path_buf());
+
+        // Native first-party scans are report-only, so use an untrusted route
+        // for the initial prompt and then exercise the adverse case where the
+        // retry is reclassified as first-party under the same enabled policy.
+        let mut request = spawn_test_request("permission-retry", "git status --short", false);
+        request.params["params"]["permissions_requested"] = json!(true);
+        let untrusted = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::Untrusted,
+            route_channel: 9,
+            route_epoch: 4,
+            project_root: project.path().to_path_buf(),
+            harness: "mcp:test".to_string(),
+            session_id: "sandbox-spawn-test".to_string(),
+            principal_id: Some("unverified".to_string()),
+        };
+        let permission_required =
+            with_authenticated_principal(untrusted, || handle(&request, &ctx));
+        assert!(!permission_required.success);
+        assert_eq!(permission_required.data["code"], ERROR_PERMISSION_REQUIRED);
+
+        let mut grants = Vec::new();
+        for ask in permission_required.data["asks"].as_array().unwrap() {
+            let candidates = ask["always"]
+                .as_array()
+                .filter(|values| !values.is_empty())
+                .or_else(|| ask["patterns"].as_array())
+                .unwrap();
+            grants.extend(
+                candidates
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string),
             );
-            std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(!grants.is_empty());
+        assert!(grants.iter().all(|grant| !grant.starts_with("esc_")));
+        request.params["params"]["permissions_granted"] = json!(grants);
+
+        let retried = handle(&request, &ctx);
+        assert!(retried.success, "permission retry failed: {retried:?}");
+        let task_id = retried.data["task_id"].as_str().unwrap();
+        let snapshot = ctx
+            .bash_background()
+            .status(
+                task_id,
+                "sandbox-spawn-test",
+                Some(project.path()),
+                Some(storage.path()),
+                4096,
+            )
+            .expect("retried sandbox task status");
+        assert!(
+            snapshot.sandbox_native,
+            "permission grants must not select an unsandboxed spawn plan"
+        );
+
+        let observations = sandbox_spawn_test_observations(project.path());
+        clear_sandbox_spawn_test_seam(project.path());
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].requested_tier, RequestedSandboxTier::Native);
+        stop_spawned_test_task(&ctx, &retried);
     }
 }
