@@ -195,13 +195,6 @@ impl SpawnPlan {
         matches!(self, Self::Launcher { .. })
     }
 
-    pub(crate) fn host_environment(&self) -> Option<&ChildEnvironment> {
-        match self {
-            Self::Host { environment, .. } => Some(environment),
-            Self::Unsandboxed | Self::Launcher { .. } | Self::Refused { .. } => None,
-        }
-    }
-
     #[cfg(unix)]
     pub(crate) fn host_shell_path(&self) -> Option<&Path> {
         match self {
@@ -950,12 +943,60 @@ pub(crate) fn detached_command_for_plan(
     Ok(command)
 }
 
+fn isolated_environment_for_plan(
+    plan: &SpawnPlan,
+    request_environment: &HashMap<String, String>,
+) -> Option<ChildEnvironment> {
+    match plan {
+        SpawnPlan::Host { environment, .. } => Some(environment.clone()),
+        SpawnPlan::Launcher { profile, .. } => Some(sandboxed_child_environment(
+            request_environment,
+            &profile.temp_dir,
+        )),
+        SpawnPlan::Unsandboxed | SpawnPlan::Refused { .. } => None,
+    }
+}
+
+fn sandboxed_child_environment(
+    request_environment: &HashMap<String, String>,
+    temp_dir: &Path,
+) -> ChildEnvironment {
+    let mut environment = std::env::vars_os()
+        .filter(|(key, _)| sandbox_base_environment_key(key))
+        .collect::<ChildEnvironment>();
+    // PATH must be AFT's enriched value rather than the daemon's original
+    // value, which can omit package-manager and user tool locations.
+    environment.insert(
+        OsString::from("PATH"),
+        crate::effective_path::effective_path().to_os_string(),
+    );
+    for (key, value) in request_environment {
+        environment.insert(OsString::from(key), OsString::from(value));
+    }
+    for key in ["TMPDIR", "TEMP", "TMP"] {
+        environment.insert(OsString::from(key), temp_dir.as_os_str().to_os_string());
+    }
+    environment
+}
+
+fn sandbox_base_environment_key(key: &OsStr) -> bool {
+    key.to_str().is_some_and(|key| {
+        matches!(key, "HOME" | "USER" | "LOGNAME" | "SHELL" | "TERM" | "LANG")
+            || key.starts_with("LC_")
+    })
+}
+
 #[cfg(unix)]
-pub(crate) fn apply_sandbox_environment(plan: &SpawnPlan, command: &mut Command) {
-    if let Some(environment) = plan.host_environment() {
+pub(crate) fn apply_sandbox_environment(
+    plan: &SpawnPlan,
+    command: &mut Command,
+    request_environment: &HashMap<String, String>,
+) {
+    if let Some(environment) = isolated_environment_for_plan(plan, request_environment) {
+        // Host snapshots and native-launcher allowlists are complete child
+        // environments. Clear the daemon environment first so loader hooks,
+        // shell startup hooks, and cloud credentials cannot leak around them.
         command.env_clear().envs(environment);
-    } else if let Some(temp_dir) = plan.temp_dir() {
-        command.env("TMPDIR", temp_dir).env("TEMP", temp_dir);
     }
 }
 
@@ -974,18 +1015,16 @@ pub(crate) fn pty_command_for_plan(
         command.arg(arg);
     }
     command.cwd(workdir.as_os_str());
-    if let Some(environment) = plan.host_environment() {
+    if let Some(environment) = isolated_environment_for_plan(plan, env) {
         command.env_clear();
         for (key, value) in environment {
             command.env(key, value);
         }
     } else {
+        // Sandbox-disabled PTYs retain the historical full inheritance and add
+        // only request overrides.
         for (key, value) in env {
             command.env(key, value);
-        }
-        if let Some(temp_dir) = plan.temp_dir() {
-            command.env("TMPDIR", temp_dir);
-            command.env("TEMP", temp_dir);
         }
     }
     Ok(command)
@@ -1141,10 +1180,108 @@ mod tests {
             .arg("-c")
             .arg("test -z \"$SHOULD_DISAPPEAR\" && printf %s \"$APPROVED\"")
             .env("SHOULD_DISAPPEAR", "yes");
-        apply_sandbox_environment(&plan, &mut command);
+        apply_sandbox_environment(&plan, &mut command, &HashMap::new());
         let output = command.output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"snapshot");
+    }
+
+    #[test]
+    fn launcher_plan_clears_ambient_environment_and_applies_safe_base() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let temp = root.path().join("temp");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        let profile = SandboxProfile::build(
+            vec![project],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        let expected_temp = profile.temp_dir.clone();
+        let plan = SpawnPlan::launcher_for_test(profile, PathBuf::from("/usr/bin/true"));
+        let request_environment = HashMap::from([
+            ("TERM".to_string(), "aft-test-term".to_string()),
+            ("REQUEST_SENTINEL".to_string(), "request-value".to_string()),
+        ]);
+        let mut command = Command::new("/usr/bin/env");
+        command
+            .env("LD_PRELOAD", "/untrusted/loader.so")
+            .env("DYLD_INSERT_LIBRARIES", "/untrusted/loader.dylib")
+            .env("BASH_ENV", "/untrusted/bash-env")
+            .env("AWS_SECRET_ACCESS_KEY", "ambient-secret");
+
+        apply_sandbox_environment(&plan, &mut command, &request_environment);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+
+        for leaked in [
+            "LD_PRELOAD=",
+            "DYLD_INSERT_LIBRARIES=",
+            "BASH_ENV=",
+            "AWS_SECRET_ACCESS_KEY=",
+        ] {
+            assert!(
+                !output.contains(leaked),
+                "ambient variable leaked: {leaked}"
+            );
+        }
+        assert!(output.contains("REQUEST_SENTINEL=request-value\n"));
+        assert!(output.contains("TERM=aft-test-term\n"));
+        assert!(output.contains(&format!(
+            "PATH={}\n",
+            crate::effective_path::effective_path().to_string_lossy()
+        )));
+        if let Some(home) = std::env::var_os("HOME") {
+            assert!(output.contains(&format!("HOME={}\n", home.to_string_lossy())));
+        }
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            assert!(output.contains(&format!("{key}={}\n", expected_temp.display())));
+        }
+    }
+
+    #[test]
+    fn unsandboxed_plan_preserves_inherited_and_request_environment() {
+        let plan = SpawnPlan::Unsandboxed;
+        let request_environment =
+            HashMap::from([("REQUEST_SENTINEL".to_string(), "request-value".to_string())]);
+        #[cfg(target_os = "macos")]
+        let loader_hook = "/usr/lib/libSystem.B.dylib";
+        #[cfg(target_os = "linux")]
+        let loader_hook = "libc.so.6";
+        let mut command = Command::new("/usr/bin/env");
+        command
+            .env("UNSANDBOXED_PARENT_SENTINEL", "raw-parent")
+            .env("LD_PRELOAD", loader_hook)
+            .env("DYLD_INSERT_LIBRARIES", loader_hook)
+            .env("AWS_SECRET_ACCESS_KEY", "ambient-cloud-secret")
+            .envs(&request_environment);
+
+        let before = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+            .collect::<Vec<_>>();
+        apply_sandbox_environment(&plan, &mut command, &request_environment);
+        let after = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before, "unsandboxed environment overrides changed");
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(output.contains("UNSANDBOXED_PARENT_SENTINEL=raw-parent\n"));
+        assert!(output.contains(&format!("LD_PRELOAD={loader_hook}\n")));
+        #[cfg(target_os = "linux")]
+        assert!(output.contains(&format!("DYLD_INSERT_LIBRARIES={loader_hook}\n")));
+        assert!(output.contains("AWS_SECRET_ACCESS_KEY=ambient-cloud-secret\n"));
+        assert!(output.contains("REQUEST_SENTINEL=request-value\n"));
     }
 
     #[test]

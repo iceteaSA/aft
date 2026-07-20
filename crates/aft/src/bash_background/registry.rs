@@ -4238,7 +4238,7 @@ fn spawn_detached_child(
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
-        crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut command);
+        crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut command, env);
         command
             .spawn()
             .map_err(|e| format!("failed to spawn background bash command: {e}"))

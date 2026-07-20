@@ -62,6 +62,25 @@ fn foreground(aft: &mut AftProcess, id: &str, command: &str) -> Value {
     )
 }
 
+fn foreground_with_env(aft: &mut AftProcess, id: &str, command: &str, env: Value) -> Value {
+    aft.send(
+        &json!({
+            "id": id,
+            "method": "bash",
+            "session_id": "native-sandbox-session",
+            "params": {
+                "command": command,
+                "foreground_orchestrate": true,
+                "permissions_requested": true,
+                "permissions_granted": [command],
+                "compressed": false,
+                "env": env,
+            },
+        })
+        .to_string(),
+    )
+}
+
 fn status(aft: &mut AftProcess, task_id: &str, output_mode: Option<&str>) -> Value {
     let mut params = json!({ "task_id": task_id });
     if let Some(output_mode) = output_mode {
@@ -239,6 +258,162 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
         "disabled scanner response: {permission:?}"
     );
     assert_eq!(permission["code"], "permission_required");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
+    let fixture = tempfile::tempdir().unwrap();
+    let project = fixture.path().join("project");
+    let storage = fixture.path().join("artifacts");
+    let home = fixture.path().join("home");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+
+    #[cfg(target_os = "macos")]
+    let loader_hook = "/usr/lib/libSystem.B.dylib";
+    #[cfg(target_os = "linux")]
+    let loader_hook = "libc.so.6";
+    #[cfg(target_os = "macos")]
+    let dyld_hook = "/usr/lib/libSystem.B.dylib";
+    #[cfg(target_os = "linux")]
+    let dyld_hook = "/untrusted/loader.dylib";
+    let ambient = [
+        ("HOME", OsStr::new(&home)),
+        ("TERM", OsStr::new("aft-test-term")),
+        ("LD_PRELOAD", OsStr::new(loader_hook)),
+        ("DYLD_INSERT_LIBRARIES", OsStr::new(dyld_hook)),
+        ("BASH_ENV", OsStr::new("/untrusted/bash-env")),
+        ("AWS_SECRET_ACCESS_KEY", OsStr::new("ambient-cloud-secret")),
+    ];
+    let mut aft = AftProcess::spawn_with_env(&ambient);
+    let configured = configure_native(&mut aft, &project, &storage, true);
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+    let request_env = json!({ "AFT_REQUEST_ENV_TEST": "request-value" });
+
+    let sandboxed = foreground_with_env(
+        &mut aft,
+        "native-filtered-environment",
+        "/usr/bin/env",
+        request_env.clone(),
+    );
+    assert_eq!(
+        sandboxed["status"], "completed",
+        "sandboxed env: {sandboxed:?}"
+    );
+    let sandboxed_output = sandboxed["output"].as_str().unwrap_or_default();
+    for key in [
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "BASH_ENV",
+        "AWS_SECRET_ACCESS_KEY",
+    ] {
+        assert!(
+            !sandboxed_output
+                .lines()
+                .any(|line| line.starts_with(&format!("{key}="))),
+            "ambient {key} leaked into sandboxed child: {sandboxed_output}"
+        );
+    }
+    for expected in [
+        format!("HOME={}", home.display()),
+        "TERM=aft-test-term".to_string(),
+        "AFT_REQUEST_ENV_TEST=request-value".to_string(),
+    ] {
+        assert!(
+            sandboxed_output.lines().any(|line| line == expected),
+            "allowlisted/request environment missing {expected}: {sandboxed_output}"
+        );
+    }
+    assert!(
+        sandboxed_output
+            .lines()
+            .any(|line| line.starts_with("PATH=") && line.len() > 5),
+        "enriched PATH missing from sandboxed child: {sandboxed_output}"
+    );
+
+    let pty_launch = aft.send(
+        &json!({
+            "id": "native-filtered-pty-environment",
+            "method": "bash",
+            "session_id": "native-sandbox-session",
+            "params": {
+                "command": "/usr/bin/env | /usr/bin/grep -E '^(HOME|TERM|AFT_REQUEST_ENV_TEST|LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|AWS_SECRET_ACCESS_KEY)='",
+                "pty": true,
+                "permissions_requested": true,
+                "compressed": false,
+                "env": { "AFT_REQUEST_ENV_TEST": "request-value" },
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        pty_launch["success"], true,
+        "PTY launch failed: {pty_launch:?}"
+    );
+    let pty_task_id = pty_launch["task_id"].as_str().expect("PTY task id");
+    let pty_terminal = wait_for_terminal(&mut aft, pty_task_id, Some("screen"));
+    let pty_output = pty_terminal["pty_screen"].as_str().unwrap_or_default();
+    for key in [
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "BASH_ENV",
+        "AWS_SECRET_ACCESS_KEY",
+    ] {
+        assert!(
+            !pty_output
+                .lines()
+                .any(|line| line.trim_end().starts_with(&format!("{key}="))),
+            "ambient {key} leaked into sandboxed PTY: {pty_terminal:?}"
+        );
+    }
+    for expected in [
+        "HOME=",
+        "TERM=aft-test-term",
+        "AFT_REQUEST_ENV_TEST=request-value",
+    ] {
+        assert!(
+            pty_output.contains(expected),
+            "sandboxed PTY environment missing {expected}: {pty_terminal:?}"
+        );
+    }
+
+    let disabled = configure_native(&mut aft, &project, &storage, false);
+    assert_eq!(disabled["success"], true, "disable failed: {disabled:?}");
+    let unsandboxed = foreground_with_env(
+        &mut aft,
+        "disabled-inherited-environment",
+        "/usr/bin/env",
+        request_env,
+    );
+    assert_eq!(
+        unsandboxed["status"], "completed",
+        "unsandboxed env: {unsandboxed:?}"
+    );
+    let unsandboxed_output = unsandboxed["output"].as_str().unwrap_or_default();
+    for expected in [
+        format!("LD_PRELOAD={loader_hook}"),
+        "BASH_ENV=/untrusted/bash-env".to_string(),
+        "AWS_SECRET_ACCESS_KEY=ambient-cloud-secret".to_string(),
+        "AFT_REQUEST_ENV_TEST=request-value".to_string(),
+    ] {
+        assert!(
+            unsandboxed_output.lines().any(|line| line == expected),
+            "sandbox-disabled child changed inherited {expected}: {unsandboxed_output}"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    assert!(
+        unsandboxed_output
+            .lines()
+            .any(|line| line == format!("DYLD_INSERT_LIBRARIES={dyld_hook}")),
+        "sandbox-disabled Linux child changed inherited DYLD_INSERT_LIBRARIES: {unsandboxed_output}"
+    );
 
     assert!(aft.shutdown().success());
 }
