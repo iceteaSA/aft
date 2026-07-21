@@ -1900,6 +1900,15 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
+    // A task directory swapped underneath the daemon must never let deletion
+    // touch the impostor's control content. The two platforms enforce this the
+    // same guarantee through different mechanisms, so each is asserted against
+    // its real mechanism rather than a shared code path.
+    //
+    // Unix: POSIX permits renaming a directory while a fd is held open on it, so
+    // the swap succeeds on disk and `remove_directory_task`'s `same_identity`
+    // check is what refuses the deletion.
+    #[cfg(unix)]
     #[test]
     fn deletion_refuses_replaced_task_directory_without_touching_victim() {
         let storage = tempfile::tempdir().unwrap();
@@ -1916,6 +1925,30 @@ mod tests {
             fs::read(first.paths.control_dir.join("victim")).unwrap(),
             b"victim-bytes"
         );
+    }
+
+    // Windows: the daemon's retained `PinnedDir` handle on the task directory
+    // makes the OS refuse to rename it (Access denied), so the swap cannot occur
+    // at all while the daemon is live — the impostor's content is never reachable
+    // for deletion. Assert that structural refusal directly.
+    #[cfg(windows)]
+    #[test]
+    fn deletion_refuses_replaced_task_directory_without_touching_victim() {
+        let storage = tempfile::tempdir().unwrap();
+        let first = create_task_layout(storage.path(), "session", &valid_id(40)).unwrap();
+        let second = create_task_layout(storage.path(), "session", &valid_id(41)).unwrap();
+        let victim = second.paths.control_dir.join("victim");
+        fs::write(&victim, b"victim-bytes").unwrap();
+
+        // The daemon still holds `first`'s pinned directory handles, so moving
+        // its task directory out of the way is refused by the OS.
+        let moved_first = first.paths.session_dir.join("moved-first");
+        let refusal = fs::rename(&first.paths.dir, &moved_first)
+            .expect_err("open pinned-dir handle must block the task-dir rename on Windows");
+        assert_eq!(refusal.kind(), io::ErrorKind::PermissionDenied);
+
+        // The victim's control content is untouched because the swap never happened.
+        assert_eq!(fs::read(&victim).unwrap(), b"victim-bytes");
     }
 
     #[test]

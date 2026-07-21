@@ -6371,14 +6371,22 @@ mod tests {
 
     #[cfg(windows)]
     fn wait_for_file(path: &Path) -> String {
+        // Task io/ artifacts are now pre-created empty (O_EXCL) at spawn under
+        // the control/io split, then filled by the child (stdout/stderr) or the
+        // daemon after observing exit (the exit marker). Existence is therefore
+        // no longer a readiness signal — wait for non-empty content, matching
+        // production's read_exit_marker, which treats an empty marker as "not
+        // yet written".
         let started = Instant::now();
         loop {
-            if path.exists() {
-                return fs::read_to_string(path).expect("read file");
+            if let Ok(content) = fs::read_to_string(path) {
+                if !content.trim().is_empty() {
+                    return content;
+                }
             }
             assert!(
                 started.elapsed() < Duration::from_secs(30),
-                "timed out waiting for {}",
+                "timed out waiting for non-empty {}",
                 path.display()
             );
             std::thread::sleep(Duration::from_millis(100));
