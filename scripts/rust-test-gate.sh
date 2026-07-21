@@ -33,41 +33,54 @@ run_phase() {
 run_phase "cargo test --workspace --lib --bins --quiet" \
   cargo test --workspace --lib --bins --quiet
 
-# macOS: the first exec of a freshly-linked binary pays a syspolicyd
-# assessment that can take 30-90s when the daemon is busy (it caches per
-# inode afterwards). Integration tests spawn target/debug/aft; without this
-# warm-up the whole first wave of spawning tests queues behind one
-# assessment and dies together at the per-test timeout. Build + ad-hoc sign
-# + exec once so the assessment happens HERE, visibly, instead of as a
-# 90-test failure storm.
-if [[ "$(uname)" == "Darwin" ]]; then
-  # Separately, XprotectService itself sometimes wedges (Developer Tools
-  # exemptions do not cover XProtect malware scans): fresh-script execs take
-  # 10s+ or hang outright, so tests that install shims or exec new binaries
-  # time out with no real failure. Probe with a throwaway script; on a slow
-  # exec, kill the wedged scanners (they respawn clean) and re-probe.
-  # Opt out with AFT_GATE_NO_XPROTECT_REMEDIATION=1.
-  probe_exec_ms() {
-    local dir script started
-    dir="$(mktemp -d)"
-    script="$dir/exec-probe.sh"
-    printf '#!/bin/sh\nexit 0\n' > "$script"
-    chmod +x "$script"
-    started=$(date +%s%N 2>/dev/null || echo 0)
-    "$script" >/dev/null 2>&1 || true
-    if [[ "$started" == 0 ]]; then echo 0; else echo $((($(date +%s%N) - started) / 1000000)); fi
-    rm -rf "$dir"
-  }
-  probe_ms=$(probe_exec_ms)
-  if [[ "$probe_ms" -gt 1500 && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
-    echo "==> fresh-exec probe took ${probe_ms}ms — XProtect assessment wedge; killing wedged scanners"
-    pkill -9 -f XprotectService 2>/dev/null || true
-    pkill -9 syspolicyd 2>/dev/null || true
-    sleep 3
-    echo "    re-probe: $(probe_exec_ms)ms"
+# macOS: the first exec of a freshly-linked binary pays a one-time
+# syspolicyd assessment + XProtect scan tax (measured 1-4s cold, ~25ms once
+# cached per inode). nextest exec's EVERY test-harness binary in
+# target/*/deps, and the integration tests additionally spawn
+# target/debug/aft. Without warming, the first wave of those cold execs
+# queues behind the busy scanner during the TIMED run and dies together at
+# the per-test timeout (the 16-test SIGTERM-at-400s storm). Pay the tax HERE,
+# untimed: ad-hoc sign (cuts the cold tax ~3.5x) + exec-once every test
+# binary so the timed run hits the warm 25ms path.
+#
+# NOTE: an earlier version tried `pkill XprotectService/syspolicyd` on a slow
+# probe — that is a no-op without sudo (both run as root; pkill returns
+# "Operation not permitted"). The real, sudo-free lever is sign+warm below.
+# Opt out with AFT_GATE_NO_XPROTECT_REMEDIATION=1.
+warm_macos_test_binaries() {
+  # Ask cargo for the EXACT set of test-harness executables it built (the
+  # `executable` field in the build JSON — ~24 binaries, not the thousands of
+  # incremental fragments under deps/). Ad-hoc sign each (cuts the cold tax
+  # ~3.5x) and exec `--list` once (pays + caches the assessment without
+  # running tests). $@ = the cargo build args that define the profile/scope.
+  local bins
+  bins="$(cargo test "$@" --no-run --message-format=json 2>/dev/null | python3 -c "
+import sys, json
+seen = set()
+for line in sys.stdin:
+    try: o = json.loads(line)
+    except Exception: continue
+    e = o.get('executable')
+    if e: seen.add(e)
+for p in sorted(seen): print(p)
+")"
+  local bin
+  while IFS= read -r bin; do
+    [[ -n "$bin" && -x "$bin" ]] || continue
+    codesign -f -s - "$bin" 2>/dev/null || true
+    "$bin" --list >/dev/null 2>&1 || true
+  done <<< "$bins"
+  # The CLI binary is spawned as a subprocess by integration tests but is not
+  # a test harness, so it never appears as an `executable`; warm it explicitly.
+  if [[ -x target/debug/aft ]]; then
+    codesign -f -s - target/debug/aft 2>/dev/null || true
+    target/debug/aft --version >/dev/null 2>&1 || true
   fi
-  run_phase "warm target/debug/aft exec assessment (macOS syspolicyd)" \
-    bash -c 'cargo build -p agent-file-tools --quiet && codesign -f -s - target/debug/aft 2>/dev/null && target/debug/aft --version >/dev/null'
+}
+if [[ "$(uname)" == "Darwin" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
+  run_phase "warm macOS exec assessment: sign + warm every debug test binary" \
+    bash -c "$(declare -f warm_macos_test_binaries)
+      warm_macos_test_binaries --workspace"
 fi
 
 run_phase "cargo nextest run --workspace -E kind(test) - binary(=watcher_integration)" \
