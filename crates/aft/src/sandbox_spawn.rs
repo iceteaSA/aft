@@ -2498,6 +2498,14 @@ fn sandboxed_child_environment(
         crate::effective_path::effective_path().to_os_string(),
     );
     for (key, value) in request_environment {
+        // A request-supplied environment reaches the OUTER launcher / `/bin/sh`
+        // supervisor, which exec before Landlock/Seatbelt is installed. A
+        // dynamic-loader or shell/interpreter startup hook here would execute
+        // code OUTSIDE confinement, so those keys are dropped even though they
+        // arrived through the (otherwise honored) request environment.
+        if is_preexec_hijack_env_key(key.as_str()) {
+            continue;
+        }
         environment.insert(OsString::from(key), OsString::from(value));
     }
     for key in ["TMPDIR", "TEMP", "TMP"] {
@@ -2511,6 +2519,48 @@ fn sandbox_base_environment_key(key: &OsStr) -> bool {
         matches!(key, "HOME" | "USER" | "LOGNAME" | "SHELL" | "TERM" | "LANG")
             || key.starts_with("LC_")
     })
+}
+
+/// Environment keys that make a process load a library or run code during its
+/// own startup — before a native sandbox is installed in the launcher chain.
+/// These are refused from the request environment regardless of value so an
+/// injected `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / `BASH_ENV` cannot execute
+/// outside confinement. Matching is case-sensitive; POSIX environment names are
+/// case-sensitive and the loaders only honor the exact upper-case spellings.
+fn is_preexec_hijack_env_key(key: &str) -> bool {
+    // Dynamic-loader families (glibc/musl `LD_*`, macdyld `DYLD_*`): the whole
+    // prefix executes/loads at exec time, so block the family, not a fixed set.
+    if key.starts_with("LD_") || key.starts_with("DYLD_") {
+        return true;
+    }
+    matches!(
+        key,
+        // POSIX/bash shell startup + trace hooks (the supervisor is `/bin/sh`).
+        "BASH_ENV"
+            | "ENV"
+            | "SHELLOPTS"
+            | "BASHOPTS"
+            | "PROMPT_COMMAND"
+            | "PS4"
+            | "IFS"
+            // Interpreter auto-run / library-injection hooks.
+            | "PYTHONSTARTUP"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "PERL5OPT"
+            | "PERL5LIB"
+            | "PERLLIB"
+            | "PERL5DB"
+            | "RUBYOPT"
+            | "RUBYLIB"
+            | "NODE_OPTIONS"
+            // glibc auxiliary loader hooks.
+            | "GCONV_PATH"
+            | "LOCPATH"
+            | "NLSPATH"
+            | "HOSTALIASES"
+            | "RESOLV_HOST_CONF"
+    )
 }
 
 #[cfg(unix)]
@@ -2764,6 +2814,73 @@ mod tests {
         for key in ["TMPDIR", "TEMP", "TMP"] {
             assert!(output.contains(&format!("{key}={}\n", expected_temp.display())));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_environment_cannot_inject_preexec_hijack_variables() {
+        // The pre-sandbox boundary: a request-supplied environment is applied to
+        // the OUTER launcher / `/bin/sh` supervisor, which run BEFORE Landlock or
+        // Seatbelt is installed. A loader/shell/interpreter startup hook arriving
+        // through the request env must be dropped, or injected code executes
+        // outside confinement. (The sibling test covers the ambient direction;
+        // this covers the request-supplied direction the re-audit flagged.)
+        let project = tempfile::tempdir().unwrap();
+        let temp = project.path().join("sandbox-temp");
+        std::fs::create_dir(&temp).unwrap();
+        let profile = crate::sandbox_profile::SandboxProfile::build(
+            vec![project.path().to_path_buf()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        let plan = SpawnPlan::launcher_for_test(profile, PathBuf::from("/usr/bin/true"));
+
+        // Every dangerous key arrives through the REQUEST environment this time.
+        let hijacks = [
+            ("LD_PRELOAD", "/untrusted/loader.so"),
+            ("LD_LIBRARY_PATH", "/untrusted/lib"),
+            ("LD_AUDIT", "/untrusted/audit.so"),
+            ("DYLD_INSERT_LIBRARIES", "/untrusted/loader.dylib"),
+            ("DYLD_LIBRARY_PATH", "/untrusted/dylib"),
+            ("BASH_ENV", "/untrusted/bash-env"),
+            ("ENV", "/untrusted/sh-env"),
+            ("PROMPT_COMMAND", "/untrusted/cmd"),
+            ("PS4", "evil"),
+            ("PYTHONSTARTUP", "/untrusted/py"),
+            ("PYTHONPATH", "/untrusted/pypath"),
+            ("PERL5OPT", "-M/untrusted"),
+            ("RUBYOPT", "-r/untrusted"),
+            ("NODE_OPTIONS", "--require=/untrusted"),
+            ("GCONV_PATH", "/untrusted/gconv"),
+            ("LOCPATH", "/untrusted/loc"),
+        ];
+        let request_environment: HashMap<String, String> = hijacks
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .chain([("REQUEST_SENTINEL".to_string(), "kept".to_string())])
+            .collect();
+
+        let mut command = Command::new("/usr/bin/env");
+        apply_sandbox_environment(&plan, &mut command, &request_environment);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+
+        for (key, _) in hijacks {
+            assert!(
+                !output.contains(&format!("{key}=")),
+                "request-supplied hijack var reached the pre-sandbox child: {key}\n{output}"
+            );
+        }
+        // A benign request var still flows through, proving we filtered rather
+        // than dropped the whole request environment.
+        assert!(output.contains("REQUEST_SENTINEL=kept\n"), "{output}");
     }
 
     #[test]
