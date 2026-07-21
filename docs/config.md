@@ -200,6 +200,15 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
     }
   },
 
+  // Native sandbox for first-party bash and PTY commands. Default: false.
+  "sandbox": {
+    "enabled": false,
+    // Additional writable roots. User config only.
+    "write_allow": [],
+    // Additional paths to hide from sandboxed commands.
+    "read_deny": []
+  },
+
   "experimental": {
     // Use the experimental Astral `ty` Python type checker.
     // Implied when `lsp.python === "ty"`.
@@ -214,6 +223,36 @@ AFT auto-detects the formatter and checker from project config files (`biome.jso
 (biome, oxfmt, prettier, tsc, pyright) are discovered in
 `node_modules/.bin` before falling back to the system PATH. You only need per-language overrides
 if auto-detection picks the wrong tool or you want to pin a specific formatter.
+
+## Native command sandbox
+
+Set `sandbox.enabled` to route first-party bash and PTY commands through Seatbelt on macOS or Landlock on Linux. Unsupported platforms, unavailable kernels, Landlock ABIs below V3, invalid profiles, and policies that cannot preserve the credential floor fail closed with a structured `sandbox_unavailable` response. Sandboxed commands receive a private task temporary directory through `TMPDIR`, `TMP`, and `TEMP`; Linux does not grant the shared `/tmp` tree.
+
+The mandatory credential floor is `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.azure`, `~/.config/gcloud`, and `~/.config/cortexkit`. Linux canonicalizes these paths and constructs a read allowlist that omits them. A writable project, cache, temporary directory, or `write_allow` path that overlaps this floor is refused because Landlock cannot subtract write rights. Ordinary `read_deny` paths inside writable roots are supported: writes remain allowed while read grants are split around the denied path.
+
+| Protection | macOS Seatbelt | Linux Landlock |
+| --- | --- | --- |
+| Credential floor reads and writes | Denied | Denied by omission; overlapping writable roots are refused |
+| Project, task artifact, cache, and private task-temp access | Read/write | Read/write |
+| Other existing HOME children | Readable; HOME remains unwritable | Readable only when present at launch; new children are denied until the next launch |
+| System files | Readable; unwritable | Curated read-only roots; `/proc` is readable, `/sys` is limited, `/run/user`, `/var/run`, `/dev/shm`, `/dev/kmsg`, and shared `/tmp` are omitted |
+| Git metadata | Writable so `git add` and `git commit` work | Writable inside project roots |
+| Resolved Git hooks, including linked-worktree and `core.hooksPath` locations | Read/write denied after the project allow rule | Read denied; writes inside a writable project remain allowed |
+| Nested `.cortexkit` writes | Denied | Not enforceable inside a writable project |
+| Unix-domain socket connections such as Docker and SSH agent sockets | Denied by path | Not mediated; connections remain allowed |
+| TCP, UDP, DNS, and raw sockets | Open | Open |
+| Unsupported native platform | `sandbox_unavailable` | `sandbox_unavailable` |
+
+### Linux guarantee boundary
+
+The Linux guarantee applies to canonical paths without pre-existing aliases into a granted tree. Granted project, cache, task, and system trees are treated as trusted content. The following limitations are deliberate and surfaced honestly:
+
+- Landlock rules are additive, so nested write-denies under a writable project cannot protect `.git/hooks` or `.cortexkit`. The launcher handles and grants `REFER` only with writable-root rules, which keeps normal in-project renames working and rejects creation of a hard link that would widen access to a denied secret. A pre-existing hard link inside a granted tree remains readable or writable through that alias.
+- Landlock does not mediate `AF_UNIX` connects. Docker sockets, `SSH_AUTH_SOCK`, and other pathname Unix sockets can still be reached when normal filesystem permissions allow it.
+- Pre-existing bind mounts, case-insensitive filesystem aliases, and overlayfs aliases can expose an object through a granted path. These alias classes are outside the canonical-path guarantee.
+- `/proc` is granted wholesale for process and toolchain compatibility. With Yama `ptrace_scope=0`, another same-UID process may expose `/proc/<pid>/environ`, `maps`, or `mem`. Missing, unreadable, or unparseable Yama configuration is treated conservatively as exposed and produces a warning. Yama does not cover every `/proc` surface.
+
+Compared with Codex's default sandbox, AFT is stricter about credential reads: Codex workspace-write can read the host filesystem, including HOME secrets. Codex is stricter about network access and repository metadata: its default disables network access and keeps `.git` read-only, while AFT deliberately leaves the network open and permits Git metadata writes. Neither posture should be described as uniformly stricter.
 
 ## Config schema migration
 

@@ -33,8 +33,9 @@ docker run --rm \
     /tmp/aft-sandbox-s1-target/debug/aft sandbox-launch --support
 
     echo "Linux first-party probe battery:"
-    # P1/P2/P3/P6 assert the write allowlist; P4/P5/P8 assert ALLOWED plus
-    # the structured unenforced warning; P7 records hardlinks; P9 covers PTY.
+    # P1/P2/P3/P6 assert the write allowlist; P4/P8 assert documented
+    # Linux gaps; P5 asserts the read floor; P7 asserts the hard-link alias
+    # gap; the Refer probes cover link laundering and in-project rename.
     cargo test --quiet -p agent-file-tools --test sandbox_launch_probe -- \
       --test-threads=1 --nocapture
 
