@@ -105,7 +105,8 @@ command=$2
 exit_fd=$3
 "$shell" -c "$command"
 code=$?
-printf "%s" "$code" >&"$exit_fd"
+# POSIX sh (dash) rejects `>&"$var"`; eval expands the fd to a literal first.
+eval "printf '%s' \"\$code\" >&$exit_fd"
 exit "$code"
 "#;
 #[cfg(unix)]
@@ -2649,9 +2650,9 @@ shift 4
 "$launcher" sandbox-launch --profile-json "$profile_json" -- "$@"
 code=$?
 if [ "$code" -eq 78 ]; then
-  printf "%s" sandbox_unavailable >&"$failure_fd"
+  eval "printf '%s' sandbox_unavailable >&$failure_fd"
   if [ ! -s "/dev/fd/$exit_fd" ]; then
-    printf "%s" "$code" >&"$exit_fd"
+    eval "printf '%s' \"\$code\" >&$exit_fd"
   fi
 fi
 exit "$code""#,
