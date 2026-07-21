@@ -18,13 +18,21 @@
 //! AFT's internal tooling.
 
 use std::cell::RefCell;
+#[cfg(any(test, target_os = "linux"))]
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
+#[cfg(target_os = "linux")]
+use std::ffi::{CStr, CString};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::fs::DirBuilder;
 use std::fs::File;
 #[cfg(unix)]
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::fd::RawFd;
 #[cfg(not(unix))]
@@ -1147,6 +1155,12 @@ fn build_native_profile(
     if !home.is_absolute() {
         return Err(format!("HOME must be absolute: {}", home.display()));
     }
+    let home = home
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize HOME {}: {error}", home.display()))?;
+    if !home.is_dir() {
+        return Err(format!("HOME is not a directory: {}", home.display()));
+    }
 
     let mut project_roots = Vec::new();
     if let Some(root) = &ctx.config().project_root {
@@ -1164,14 +1178,23 @@ fn build_native_profile(
         );
     }
 
-    for root in &project_roots {
+    for root in &mut project_roots {
         if !root.is_dir() {
             return Err(format!(
                 "project root is not an existing directory: {}",
                 root.display()
             ));
         }
+        *root = root.canonicalize().map_err(|error| {
+            format!(
+                "failed to canonicalize project root {}: {error}",
+                root.display()
+            )
+        })?;
     }
+    project_roots.sort_unstable();
+    project_roots.dedup();
+
     if !task_bundle_dir.is_dir() {
         return Err(format!(
             "task io directory is not an existing directory: {}",
@@ -1183,8 +1206,12 @@ fn build_native_profile(
         .map_err(|error| format!("failed to canonicalize task io directory: {error}"))?;
     let session_store = session_store_for_task_io(&task_io_dir)?;
 
+    let git_policies = project_roots
+        .iter()
+        .map(|root| resolve_git_policy(root))
+        .collect::<Result<Vec<_>, _>>()?;
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
-    let result = {
+    let result = (|| {
         let mut writable_roots = project_roots.clone();
         writable_roots.push(task_io_dir.clone());
         writable_roots.extend(
@@ -1203,17 +1230,18 @@ fn build_native_profile(
             home.join(".azure"),
             home.join(".config/cortexkit"),
         ];
-        // A writable project or user allow may enclose HOME. Keeping the same
-        // credential floor in the write policy prevents that broad grant from
-        // turning read protection into permission to mutate host credentials.
+        // The credential floor denies both read and write. Linux rejects any
+        // writable overlap because Landlock cannot subtract write rights.
         let write_deny = secret_floor.clone();
         let mut write_deny_nested = Vec::new();
         let mut read_deny = secret_floor;
-        for root in &project_roots {
+        for (root, git_policy) in project_roots.iter().zip(&git_policies) {
             write_deny_nested.push(root.join(".git"));
             write_deny_nested.push(root.join(".cortexkit"));
-            read_deny.push(root.join(".git/hooks"));
+            read_deny.extend(git_policy.hooks.iter().cloned());
         }
+        #[cfg(target_os = "linux")]
+        read_deny.push(PathBuf::from("/run/user"));
         read_deny.extend(
             ctx.config()
                 .sandbox
@@ -1260,15 +1288,40 @@ fn build_native_profile(
             temp_dir.clone(),
         )
         .map_err(|error| error.to_string())?;
-        // Payload and output descriptors are opened before confinement. Denying
-        // the complete store prevents a task from enumerating or reading any
-        // task control/output path, including siblings created after launch.
+        // Seatbelt starts from allow-all reads, so it must deny the complete
+        // store. Landlock instead omits the store while splitting read grants,
+        // then adds only the prepared task's exact payload files.
+        #[cfg(target_os = "macos")]
         if !profile.read_deny.contains(&session_store) {
             profile.read_deny.push(session_store.clone());
         }
         refuse_store_overlap(&profile, &session_store, &task_io_dir)?;
+
+        #[cfg(target_os = "linux")]
+        let profile = {
+            let git_read_roots = git_policies
+                .iter()
+                .flat_map(|policy| policy.read_roots.iter().cloned())
+                .collect::<Vec<_>>();
+            profile.read_allow = build_linux_read_allow(
+                &profile,
+                &home,
+                &git_read_roots,
+                std::slice::from_ref(&session_store),
+            )?;
+            profile = profile
+                .canonicalize_for_launch()
+                .map_err(|error| error.to_string())?;
+            validate_final_read_rules(&profile.read_allow, &profile.read_deny)?;
+            assert!(
+                validate_final_read_rules(&profile.read_allow, &profile.read_deny).is_ok(),
+                "final Landlock read grants overlap a denied path"
+            );
+            profile
+        };
+
         Ok(profile)
-    };
+    })();
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -1343,6 +1396,752 @@ fn refuse_store_overlap(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct GitPolicy {
+    #[cfg(target_os = "linux")]
+    read_roots: Vec<PathBuf>,
+    hooks: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
+    let dot_git = project_root.join(".git");
+    let metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GitPolicy {
+                #[cfg(target_os = "linux")]
+                read_roots: Vec::new(),
+                hooks: vec![dot_git.join("hooks")],
+            });
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect Git metadata {}: {error}",
+                dot_git.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing sandbox profile with symlinked Git metadata: {}",
+            dot_git.display()
+        ));
+    }
+
+    let git_dir = if metadata.is_dir() {
+        dot_git.canonicalize().map_err(|error| {
+            format!(
+                "failed to canonicalize Git directory {}: {error}",
+                dot_git.display()
+            )
+        })?
+    } else if metadata.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).map_err(|error| {
+            format!(
+                "failed to read linked-worktree Git pointer {}: {error}",
+                dot_git.display()
+            )
+        })?;
+        let pointer = pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "linked-worktree Git pointer is malformed: {}",
+                    dot_git.display()
+                )
+            })?;
+        let pointer = PathBuf::from(pointer);
+        let pointer = if pointer.is_absolute() {
+            pointer
+        } else {
+            project_root.join(pointer)
+        };
+        pointer.canonicalize().map_err(|error| {
+            format!(
+                "failed to resolve linked-worktree Git directory {}: {error}",
+                pointer.display()
+            )
+        })?
+    } else {
+        return Err(format!(
+            "Git metadata is neither a file nor directory: {}",
+            dot_git.display()
+        ));
+    };
+    if !git_dir.is_dir() {
+        return Err(format!(
+            "resolved Git directory is not a directory: {}",
+            git_dir.display()
+        ));
+    }
+
+    let commondir_file = git_dir.join("commondir");
+    let common_dir = match std::fs::read_to_string(&commondir_file) {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!(
+                    "Git commondir pointer is empty: {}",
+                    commondir_file.display()
+                ));
+            }
+            let value = PathBuf::from(value);
+            let value = if value.is_absolute() {
+                value
+            } else {
+                git_dir.join(value)
+            };
+            value.canonicalize().map_err(|error| {
+                format!(
+                    "failed to resolve Git commondir {}: {error}",
+                    value.display()
+                )
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+        Err(error) => {
+            return Err(format!(
+                "failed to read Git commondir {}: {error}",
+                commondir_file.display()
+            ));
+        }
+    };
+    if !common_dir.is_dir() {
+        return Err(format!(
+            "resolved Git commondir is not a directory: {}",
+            common_dir.display()
+        ));
+    }
+
+    let hooks = resolve_hooks_path(project_root, &common_dir)?;
+    #[cfg(target_os = "linux")]
+    let read_roots = {
+        let mut read_roots = vec![git_dir, common_dir];
+        read_roots.sort_unstable();
+        read_roots.dedup();
+        read_roots
+    };
+    Ok(GitPolicy {
+        #[cfg(target_os = "linux")]
+        read_roots,
+        hooks: vec![hooks],
+    })
+}
+
+#[cfg(unix)]
+fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf, String> {
+    let configured = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["config", "--path", "core.hooksPath"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to query core.hooksPath for {}: {error}",
+                project_root.display()
+            )
+        })?;
+    if configured.status.success() {
+        let configured = String::from_utf8(configured.stdout).map_err(|error| {
+            format!(
+                "core.hooksPath for {} is not UTF-8: {error}",
+                project_root.display()
+            )
+        })?;
+        if configured.trim().is_empty() {
+            return Err(format!(
+                "core.hooksPath for {} is empty",
+                project_root.display()
+            ));
+        }
+        let resolved = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+            .output()
+            .map_err(|error| {
+                format!(
+                    "failed to resolve core.hooksPath for {}: {error}",
+                    project_root.display()
+                )
+            })?;
+        if !resolved.status.success() {
+            return Err(format!(
+                "git could not resolve core.hooksPath for {}: {}",
+                project_root.display(),
+                String::from_utf8_lossy(&resolved.stderr).trim()
+            ));
+        }
+        let resolved = String::from_utf8(resolved.stdout).map_err(|error| {
+            format!(
+                "resolved core.hooksPath for {} is not UTF-8: {error}",
+                project_root.display()
+            )
+        })?;
+        let resolved = PathBuf::from(resolved.trim());
+        if !resolved.is_absolute() {
+            return Err(format!(
+                "git returned a non-absolute core.hooksPath for {}: {}",
+                project_root.display(),
+                resolved.display()
+            ));
+        }
+        return canonicalize_policy_path(resolved, "core.hooksPath");
+    }
+
+    if configured.status.code() != Some(1) || !configured.stdout.is_empty() {
+        return Err(format!(
+            "git could not query core.hooksPath for {}: {}",
+            project_root.display(),
+            String::from_utf8_lossy(&configured.stderr).trim()
+        ));
+    }
+    canonicalize_policy_path(common_dir.join("hooks"), "Git hooks")
+}
+
+#[cfg(unix)]
+fn canonicalize_policy_path(path: PathBuf, field: &str) -> Result<PathBuf, String> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut ancestor = path.clone();
+            let mut tail = Vec::new();
+            loop {
+                match ancestor.canonicalize() {
+                    Ok(mut canonical) => {
+                        for component in tail.iter().rev() {
+                            canonical.push(component);
+                        }
+                        return Ok(canonical);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let component =
+                            ancestor.file_name().map(ToOwned::to_owned).ok_or_else(|| {
+                                format!(
+                                    "failed to canonicalize {field} path {}: {error}",
+                                    path.display()
+                                )
+                            })?;
+                        tail.push(component);
+                        if !ancestor.pop() {
+                            return Err(format!(
+                                "failed to canonicalize {field} path {}: {error}",
+                                path.display()
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to canonicalize {field} path {}: {error}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Err(error) => Err(format!(
+            "failed to canonicalize {field} path {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone)]
+struct IntendedReadGrant {
+    path: PathBuf,
+    force_children: bool,
+    mandatory: bool,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedReadChild {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+trait ReadDirectoryLister {
+    fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String>;
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_read_allow(
+    profile: &SandboxProfile,
+    home: &Path,
+    git_read_roots: &[PathBuf],
+    omitted_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mandatory_floor = &profile.write_deny;
+    validate_mandatory_floor_overlap(profile.write_allow_roots(), mandatory_floor)?;
+
+    let mut intended = Vec::new();
+    for path in [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/etc",
+        "/opt",
+        "/run",
+        "/proc",
+        "/sys/devices/system/cpu",
+        "/sys/fs/cgroup",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+        "/dev/ptmx",
+        "/dev/pts",
+        "/dev/fd",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+    ] {
+        if let Some(path) = canonicalize_existing_static(Path::new(path))? {
+            intended.push(IntendedReadGrant {
+                path,
+                force_children: false,
+                mandatory: true,
+            });
+        }
+    }
+    if let Some(path) = canonicalize_existing_static(Path::new("/var"))? {
+        intended.push(IntendedReadGrant {
+            path,
+            // Enumerating /var avoids following the /var/run symlink back into /run.
+            force_children: true,
+            mandatory: true,
+        });
+    }
+
+    intended.push(IntendedReadGrant {
+        path: home.to_path_buf(),
+        force_children: true,
+        mandatory: false,
+    });
+    intended.extend(
+        profile
+            .write_allow_roots()
+            .into_iter()
+            .map(|path| IntendedReadGrant {
+                path: path.to_path_buf(),
+                force_children: false,
+                mandatory: false,
+            }),
+    );
+    intended.extend(
+        git_read_roots
+            .iter()
+            .cloned()
+            .map(|path| IntendedReadGrant {
+                path,
+                force_children: false,
+                mandatory: false,
+            }),
+    );
+
+    let split_denies = profile
+        .read_deny
+        .iter()
+        .chain(omitted_roots)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut lister = SecureReadDirectoryLister;
+    split_read_grants(&intended, &split_denies, &mut lister)
+}
+
+#[cfg(target_os = "linux")]
+fn canonicalize_existing_static(path: &Path) -> Result<Option<PathBuf>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => path.canonicalize().map(Some).map_err(|error| {
+            format!(
+                "failed to canonicalize static read root {}: {error}",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to inspect static read root {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn split_read_grants(
+    intended: &[IntendedReadGrant],
+    denies: &[PathBuf],
+    lister: &mut impl ReadDirectoryLister,
+) -> Result<Vec<PathBuf>, String> {
+    let mut emitted = BTreeSet::new();
+    for grant in intended {
+        split_read_grant(grant, denies, lister, &mut emitted)?;
+    }
+    let emitted = emitted.into_iter().collect::<Vec<_>>();
+    validate_final_read_rules(&emitted, denies)?;
+    Ok(emitted)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn split_read_grant(
+    grant: &IntendedReadGrant,
+    denies: &[PathBuf],
+    lister: &mut impl ReadDirectoryLister,
+    emitted: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    if let Some(deny) = denies
+        .iter()
+        .find(|deny| grant.path == **deny || grant.path.starts_with(deny))
+    {
+        if grant.mandatory {
+            return Err(format!(
+                "sandbox_unavailable: mandatory read root {} is denied by {}",
+                grant.path.display(),
+                deny.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    let contains_deny = denies.iter().any(|deny| deny.starts_with(&grant.path));
+    if !grant.force_children && !contains_deny {
+        emitted.insert(grant.path.clone());
+        return Ok(());
+    }
+
+    let children = lister.children(&grant.path).map_err(|error| {
+        format!(
+            "sandbox_unavailable: cannot split read root {}: {error}",
+            grant.path.display()
+        )
+    })?;
+    for child in children {
+        let child_contains_deny = denies.iter().any(|deny| deny.starts_with(&child.path));
+        if child_contains_deny && !child.is_dir {
+            return Err(format!(
+                "sandbox_unavailable: deny chain crosses non-directory path {}",
+                child.path.display()
+            ));
+        }
+        split_read_grant(
+            &IntendedReadGrant {
+                path: child.path,
+                force_children: false,
+                mandatory: false,
+            },
+            denies,
+            lister,
+            emitted,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn validate_mandatory_floor_overlap<'a>(
+    writable_roots: impl IntoIterator<Item = &'a Path>,
+    mandatory_floor: &[PathBuf],
+) -> Result<(), String> {
+    for writable in writable_roots {
+        for secret in mandatory_floor {
+            if paths_overlap(writable, secret) {
+                return Err(format!(
+                    "writable root {} overlaps mandatory secret floor {}",
+                    writable.display(),
+                    secret.display()
+                ));
+            }
+            }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn validate_final_read_rules(read_allow: &[PathBuf], denies: &[PathBuf]) -> Result<(), String> {
+    for grant in read_allow {
+        for deny in denies {
+            if paths_overlap(grant, deny) {
+                return Err(format!(
+                    "sandbox_unavailable: final read grant {} overlaps denied path {}",
+                    grant.display(),
+                    deny.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+#[cfg(target_os = "linux")]
+struct SecureReadDirectoryLister;
+
+#[cfg(target_os = "linux")]
+impl ReadDirectoryLister for SecureReadDirectoryLister {
+    fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String> {
+        let parent_fd = open_absolute_no_symlinks(parent, true)?;
+        let duplicate = unsafe { libc::dup(parent_fd.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(format!(
+                "failed to duplicate directory fd for {}: {}",
+                parent.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        let directory = unsafe { libc::fdopendir(duplicate) };
+        if directory.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(duplicate) };
+            return Err(format!(
+                "failed to enumerate directory {}: {error}",
+                parent.display()
+            ));
+        }
+
+        let result = (|| {
+            let mut children = Vec::new();
+            loop {
+                unsafe { *libc::__errno_location() = 0 };
+                let entry = unsafe { libc::readdir(directory) };
+                if entry.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(0) {
+                        break;
+                    }
+                    return Err(format!(
+                        "failed while enumerating {}: {error}",
+                        parent.display()
+                    ));
+                }
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                let name = OsStr::from_bytes(name);
+                let diagnostic_path = parent.join(name);
+                let diagnostic = std::fs::symlink_metadata(&diagnostic_path).map_err(|error| {
+                    format!(
+                        "directory entry changed while inspecting {}: {error}",
+                        diagnostic_path.display()
+                    )
+                })?;
+                if diagnostic.file_type().is_symlink() {
+                    continue;
+                }
+
+                let child_fd =
+                    open_child_no_symlinks(parent_fd.as_raw_fd(), name).map_err(|error| {
+                        format!(
+                            "directory entry changed while opening {}: {error}",
+                            diagnostic_path.display()
+                        )
+                    })?;
+                let metadata = fstat_fd(&child_fd).map_err(|error| {
+                    format!(
+                        "failed to inspect opened directory entry {}: {error}",
+                        diagnostic_path.display()
+                    )
+                })?;
+                if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                    continue;
+                }
+                children.push(ListedReadChild {
+                    path: diagnostic_path,
+                    is_dir: metadata.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                });
+            }
+            children.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+            Ok(children)
+        })();
+        unsafe { libc::closedir(directory) };
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+#[cfg(target_os = "linux")]
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+#[cfg(target_os = "linux")]
+const RESOLVE_BENEATH: u64 = 0x08;
+
+#[cfg(target_os = "linux")]
+fn open_absolute_no_symlinks(path: &Path, directory: bool) -> Result<OwnedFd, String> {
+    if !path.is_absolute() {
+        return Err(format!("path is not absolute: {}", path.display()));
+    }
+    let root = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root < 0 {
+        return Err(format!(
+            "failed to open filesystem root: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let root = unsafe { OwnedFd::from_raw_fd(root) };
+    let components = normalized_relative_components(path)?;
+    if components.is_empty() {
+        return Ok(root);
+    }
+
+    let relative = components
+        .iter()
+        .fold(PathBuf::new(), |path, component| path.join(component));
+    let relative = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| format!("path contains NUL: {}", path.display()))?;
+    let flags = libc::O_PATH | libc::O_CLOEXEC | if directory { libc::O_DIRECTORY } else { 0 };
+    let how = OpenHow {
+        flags: flags as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    let opened = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        ) as libc::c_int
+    };
+    if opened >= 0 {
+        return Ok(unsafe { OwnedFd::from_raw_fd(opened) });
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(format!(
+            "secure open failed for {}: {error}",
+            path.display()
+        ));
+    }
+
+    let mut current = root;
+    for (index, component) in components.iter().enumerate() {
+        let component = CString::new(component.as_bytes())
+            .map_err(|_| format!("path contains NUL: {}", path.display()))?;
+        let last = index + 1 == components.len();
+        let mut flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if !last || directory {
+            flags |= libc::O_DIRECTORY;
+        }
+        let opened = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
+        if opened < 0 {
+            return Err(format!(
+                "component-wise secure open failed for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        let opened = unsafe { OwnedFd::from_raw_fd(opened) };
+        let metadata = fstat_fd(&opened)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(format!(
+                "secure open encountered a symlink: {}",
+                path.display()
+            ));
+        }
+        current = opened;
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn open_child_no_symlinks(parent_fd: i32, name: &OsStr) -> Result<OwnedFd, std::io::Error> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    let opened = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            parent_fd,
+            name.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        ) as libc::c_int
+    };
+    if opened >= 0 {
+        return Ok(unsafe { OwnedFd::from_raw_fd(opened) });
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(error);
+    }
+
+    let opened = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let opened = unsafe { OwnedFd::from_raw_fd(opened) };
+    let metadata = fstat_fd(&opened)?;
+    if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    Ok(opened)
+}
+
+#[cfg(target_os = "linux")]
+fn fstat_fd(fd: &OwnedFd) -> Result<libc::stat, std::io::Error> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), metadata.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { metadata.assume_init() })
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_relative_components(path: &Path) -> Result<Vec<&OsStr>, String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(component) => components.push(component),
+            _ => {
+                return Err(format!(
+                    "path is not normalized for secure open: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(components)
 }
 
 #[cfg(unix)]
@@ -2589,5 +3388,278 @@ mod policy_tests {
                 "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod read_allow_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeLister {
+        entries: BTreeMap<PathBuf, Result<Vec<ListedReadChild>, String>>,
+    }
+
+    impl FakeLister {
+        fn directory(mut self, parent: &str, children: &[(&str, bool)]) -> Self {
+            let parent = PathBuf::from(parent);
+            self.entries.insert(
+                parent.clone(),
+                Ok(children
+                    .iter()
+                    .map(|(name, is_dir)| ListedReadChild {
+                        path: parent.join(name),
+                        is_dir: *is_dir,
+                    })
+                    .collect()),
+            );
+            self
+        }
+
+        fn failure(mut self, parent: &str, message: &str) -> Self {
+            self.entries
+                .insert(PathBuf::from(parent), Err(message.to_string()));
+            self
+        }
+    }
+
+    impl ReadDirectoryLister for FakeLister {
+        fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String> {
+            self.entries
+                .remove(parent)
+                .unwrap_or_else(|| Err(format!("unexpected enumeration of {}", parent.display())))
+        }
+    }
+
+    fn grant(path: &str, force_children: bool, mandatory: bool) -> IntendedReadGrant {
+        IntendedReadGrant {
+            path: PathBuf::from(path),
+            force_children,
+            mandatory,
+        }
+    }
+
+    #[test]
+    fn read_grants_split_home_across_all_deny_chains() {
+        let mut lister = FakeLister::default()
+            .directory(
+                "/home/alice",
+                &[
+                    (".ssh", true),
+                    (".config", true),
+                    ("work", true),
+                    ("notes", false),
+                ],
+            )
+            .directory(
+                "/home/alice/.config",
+                &[("gcloud", true), ("cortexkit", true), ("editor", true)],
+            )
+            .directory("/home/alice/work", &[("private", true), ("src", true)]);
+        let denies = [
+            "/home/alice/.ssh",
+            "/home/alice/.config/gcloud",
+            "/home/alice/.config/cortexkit",
+            "/home/alice/work/private",
+        ]
+        .map(PathBuf::from);
+
+        let emitted = split_read_grants(&[grant("/home/alice", true, false)], &denies, &mut lister)
+            .expect("split HOME grants");
+
+        assert_eq!(
+            emitted,
+            [
+                "/home/alice/.config/editor",
+                "/home/alice/notes",
+                "/home/alice/work/src",
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn secure_enumeration_omits_home_child_symlinks() {
+        let mut lister = FakeLister::default()
+            .directory("/home/alice", &[("ordinary", true), ("plain-file", false)]);
+        let emitted = split_read_grants(
+            &[grant("/home/alice", true, false)],
+            &[PathBuf::from("/home/alice/.ssh")],
+            &mut lister,
+        )
+        .expect("split HOME grants");
+
+        assert_eq!(
+            emitted,
+            ["/home/alice/ordinary", "/home/alice/plain-file"].map(PathBuf::from)
+        );
+        assert!(!emitted.iter().any(|path| path.ends_with("secret-link")));
+    }
+
+    #[test]
+    fn enumeration_race_refuses_instead_of_weakening_the_floor() {
+        let mut lister = FakeLister::default().failure("/home/alice", "entry disappeared");
+        let error = split_read_grants(
+            &[grant("/home/alice", true, false)],
+            &[PathBuf::from("/home/alice/.ssh")],
+            &mut lister,
+        )
+        .expect_err("racing enumeration must fail closed");
+
+        assert!(error.contains("cannot split read root /home/alice"));
+        assert!(error.contains("entry disappeared"));
+    }
+
+    #[test]
+    fn mandatory_floor_rejects_equal_containing_and_nested_writable_roots() {
+        let floor = vec![PathBuf::from("/home/alice/.ssh")];
+        for writable in [
+            Path::new("/home/alice/.ssh"),
+            Path::new("/home/alice"),
+            Path::new("/home/alice/.ssh/cache"),
+        ] {
+            let error = validate_mandatory_floor_overlap([writable], &floor)
+                .expect_err("mandatory floor overlap must refuse");
+            assert!(error.contains("overlaps mandatory secret floor"));
+        }
+        validate_mandatory_floor_overlap([Path::new("/home/alice/project")], &floor)
+            .expect("disjoint writable root");
+    }
+
+    #[test]
+    fn ordinary_read_deny_under_writable_root_is_split_not_refused() {
+        let mut lister =
+            FakeLister::default().directory("/project", &[("private", true), ("src", true)]);
+        let writable_root = PathBuf::from("/project");
+        let emitted = split_read_grants(
+            &[IntendedReadGrant {
+                path: writable_root.clone(),
+                force_children: false,
+                mandatory: false,
+            }],
+            &[PathBuf::from("/project/private")],
+            &mut lister,
+        )
+        .expect("ordinary deny should be expressible");
+
+        assert_eq!(emitted, vec![PathBuf::from("/project/src")]);
+        assert_eq!(writable_root, PathBuf::from("/project"));
+    }
+
+    #[test]
+    fn static_var_grant_splits_when_home_is_beneath_it() {
+        let mut lister = FakeLister::default()
+            .directory("/var", &[("home", true), ("log", true)])
+            .directory("/var/home", &[("alice", true)])
+            .directory("/var/home/alice", &[(".ssh", true), ("work", true)]);
+        let emitted = split_read_grants(
+            &[grant("/var", true, true)],
+            &[PathBuf::from("/var/home/alice/.ssh")],
+            &mut lister,
+        )
+        .expect("split /var around HOME floor");
+
+        assert_eq!(
+            emitted,
+            ["/var/home/alice/work", "/var/log"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn run_user_is_removed_by_canonical_deny_chain() {
+        let mut lister = FakeLister::default().directory("/run", &[("lock", true), ("user", true)]);
+        let emitted = split_read_grants(
+            &[grant("/run", false, true)],
+            &[PathBuf::from("/run/user")],
+            &mut lister,
+        )
+        .expect("split /run");
+
+        assert_eq!(emitted, vec![PathBuf::from("/run/lock")]);
+    }
+
+    #[test]
+    fn final_validation_rejects_every_overlap_direction() {
+        let deny = vec![PathBuf::from("/home/alice/.ssh")];
+        for grant in [
+            PathBuf::from("/home/alice"),
+            PathBuf::from("/home/alice/.ssh"),
+            PathBuf::from("/home/alice/.ssh/key"),
+        ] {
+            assert!(validate_final_read_rules(&[grant], &deny).is_err());
+        }
+        validate_final_read_rules(&[PathBuf::from("/home/alice/work")], &deny)
+            .expect("disjoint final grant");
+    }
+
+    #[test]
+    fn grant_beneath_ordinary_deny_is_dropped_but_mandatory_grant_refuses() {
+        let deny = vec![PathBuf::from("/restricted")];
+        let mut lister = FakeLister::default();
+        let emitted = split_read_grants(
+            &[grant("/restricted/project", false, false)],
+            &deny,
+            &mut lister,
+        )
+        .expect("ordinary grant is optional");
+        assert!(emitted.is_empty());
+
+        let error = split_read_grants(
+            &[grant("/restricted/system", false, true)],
+            &deny,
+            &mut lister,
+        )
+        .expect_err("mandatory grant under deny must refuse");
+        assert!(error.contains("mandatory read root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_worktree_resolves_common_git_dir_and_shared_hooks() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let main = fixture.path().join("main");
+        let worktree = fixture.path().join("linked");
+        std::fs::create_dir(&main).expect("main repository");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&main)
+            .status()
+            .expect("git init")
+            .success());
+        std::fs::write(main.join("tracked"), b"tracked").expect("tracked file");
+        assert!(Command::new("git")
+            .args(["add", "tracked"])
+            .current_dir(&main)
+            .status()
+            .expect("git add")
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=AFT Test",
+                "-c",
+                "user.email=aft@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(&main)
+            .status()
+            .expect("git commit")
+            .success());
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-q"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .current_dir(&main)
+            .status()
+            .expect("git worktree add")
+            .success());
+
+        let policy = resolve_git_policy(&worktree).expect("resolve linked worktree policy");
+        let common = main.join(".git").canonicalize().expect("common git dir");
+        assert_eq!(policy.hooks, vec![common.join("hooks")]);
+        #[cfg(target_os = "linux")]
+        assert!(policy.read_roots.contains(&common));
     }
 }
