@@ -21,16 +21,23 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::DirBuilder;
+use std::fs::File;
 #[cfg(unix)]
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::fd::RawFd;
+#[cfg(not(unix))]
+type RawFd = i32;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -82,7 +89,19 @@ pub(crate) type ChildEnvironment = BTreeMap<OsString, OsString>;
 #[cfg(unix)]
 const ESCALATION_GRANT_TTL: Duration = Duration::from_secs(120);
 #[cfg(unix)]
-const ESCALATION_DIGEST_TAG: &[u8] = b"aft-escalation-v1";
+const ESCALATION_DIGEST_TAG: &[u8] = b"aft-escalation-payload-v3";
+#[cfg(unix)]
+const PAYLOAD_WRAPPER: &[u8] = br#"#!/bin/sh
+shell=$1
+command=$2
+exit_fd=$3
+"$shell" -c "$command"
+code=$?
+printf "%s" "$code" >&"$exit_fd"
+exit "$code"
+"#;
+#[cfg(unix)]
+const ENVIRONMENT_TAG: &[u8] = b"AFTENV1\0";
 #[cfg(unix)]
 const ESCALATION_TIER: &[u8] = b"host";
 
@@ -94,7 +113,8 @@ struct EscalationGrant {
     digest: blake3::Hash,
     expires_at: Instant,
     consumed: bool,
-    environment: ChildEnvironment,
+    session_dir: PathBuf,
+    task_id: String,
 }
 
 #[cfg(unix)]
@@ -150,6 +170,92 @@ pub enum SandboxTaskKind {
     BashPty,
 }
 
+#[cfg(unix)]
+struct PreparedTaskInner {
+    paths: crate::bash_background::persistence::TaskPaths,
+    dirs: crate::bash_background::persistence::TaskDirs,
+    digest: blake3::Hash,
+    environment: ChildEnvironment,
+    command_bytes: Arc<Vec<u8>>,
+    wrapper_bytes: Arc<Vec<u8>>,
+    _command_file: Arc<File>,
+    _wrapper_file: Arc<File>,
+    _environment_file: Arc<File>,
+}
+
+/// A materialized payload whose bytes have already been validated through held handles.
+#[cfg(unix)]
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct PreparedTask(Arc<PreparedTaskInner>);
+
+#[cfg(unix)]
+impl std::fmt::Debug for PreparedTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedTask")
+            .field("task_id", &self.0.paths.task_id)
+            .field("digest", &self.0.digest.to_hex().as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl PartialEq for PreparedTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.paths.task_id == other.0.paths.task_id
+            && self.0.paths.session_dir == other.0.paths.session_dir
+            && self.0.digest == other.0.digest
+    }
+}
+
+#[cfg(unix)]
+impl Eq for PreparedTask {}
+
+#[cfg(unix)]
+pub(crate) struct PayloadInvocation {
+    pub(crate) wrapper_text: OsString,
+    pub(crate) command_text: OsString,
+}
+
+#[cfg(unix)]
+impl PreparedTask {
+    #[cfg(test)]
+    pub(crate) fn paths(&self) -> &crate::bash_background::persistence::TaskPaths {
+        &self.0.paths
+    }
+
+    pub(crate) fn resolved_task(&self) -> crate::bash_background::persistence::ResolvedTask {
+        crate::bash_background::persistence::ResolvedTask {
+            paths: self.0.paths.clone(),
+            dirs: self.0.dirs.clone(),
+        }
+    }
+
+    pub(crate) fn environment(&self) -> &ChildEnvironment {
+        &self.0.environment
+    }
+
+    pub(crate) fn command_text(&self) -> Result<&str, String> {
+        std::str::from_utf8(&self.0.command_bytes)
+            .map_err(|error| format!("verified bash command is not UTF-8: {error}"))
+    }
+
+    pub(crate) fn payload_read_grants(&self) -> Vec<PathBuf> {
+        control_payload_read_grants(&self.0.paths.io_dir)
+            .expect("prepared task paths already passed strict validation")
+    }
+
+    pub(crate) fn invocation(&self) -> Result<PayloadInvocation, String> {
+        let wrapper = std::str::from_utf8(&self.0.wrapper_bytes)
+            .map_err(|error| format!("verified wrapper payload is not UTF-8: {error}"))?;
+        Ok(PayloadInvocation {
+            wrapper_text: OsString::from(wrapper),
+            command_text: OsString::from(self.command_text()?),
+        })
+    }
+}
+
 /// Complete process-launch decision consumed by a spawn primitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnPlan {
@@ -162,6 +268,11 @@ pub enum SpawnPlan {
         profile: SandboxProfile,
         launcher_path: PathBuf,
     },
+    #[cfg(unix)]
+    Prepared {
+        plan: Box<SpawnPlan>,
+        task: PreparedTask,
+    },
     Refused {
         code: &'static str,
         message: String,
@@ -170,43 +281,79 @@ pub enum SpawnPlan {
 }
 
 impl SpawnPlan {
-    pub(crate) fn refusal_code(&self) -> Option<&'static str> {
+    fn policy(&self) -> &Self {
+        #[cfg(unix)]
+        if let Self::Prepared { plan, .. } = self {
+            return plan.policy();
+        }
+        self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_prepared_task(self, task: PreparedTask) -> Self {
+        if matches!(self, Self::Refused { .. }) {
+            self
+        } else {
+            Self::Prepared {
+                plan: Box::new(self),
+                task,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn prepared_task(&self) -> Option<&PreparedTask> {
         match self {
+            Self::Prepared { task, .. } => Some(task),
+            _ => None,
+        }
+    }
+
+    pub fn payload_read_grants(&self) -> Vec<PathBuf> {
+        #[cfg(unix)]
+        if let Some(task) = self.prepared_task() {
+            return task.payload_read_grants();
+        }
+        Vec::new()
+    }
+
+    pub(crate) fn refusal_code(&self) -> Option<&'static str> {
+        match self.policy() {
             Self::Refused { code, .. } => Some(code),
-            Self::Unsandboxed | Self::Host { .. } | Self::Launcher { .. } => None,
+            _ => None,
         }
     }
 
     pub(crate) fn refusal_message(&self) -> Option<&str> {
-        match self {
+        match self.policy() {
             Self::Refused { message, .. } => Some(message),
-            Self::Unsandboxed | Self::Host { .. } | Self::Launcher { .. } => None,
+            _ => None,
         }
     }
 
     pub(crate) fn refusal_mismatch_class(&self) -> Option<&'static str> {
-        match self {
+        match self.policy() {
             Self::Refused { mismatch_class, .. } => *mismatch_class,
-            Self::Unsandboxed | Self::Host { .. } | Self::Launcher { .. } => None,
+            _ => None,
         }
     }
 
     pub(crate) fn is_native_launcher(&self) -> bool {
-        matches!(self, Self::Launcher { .. })
+        matches!(self.policy(), Self::Launcher { .. })
     }
 
     #[cfg(unix)]
     pub(crate) fn host_shell_path(&self) -> Option<&Path> {
-        match self {
+        match self.policy() {
             Self::Host { shell_path, .. } => Some(shell_path),
-            Self::Unsandboxed | Self::Launcher { .. } | Self::Refused { .. } => None,
+            _ => None,
         }
     }
 
     pub(crate) fn temp_dir(&self) -> Option<&Path> {
-        match self {
+        match self.policy() {
             Self::Launcher { profile, .. } => Some(&profile.temp_dir),
-            Self::Unsandboxed | Self::Host { .. } | Self::Refused { .. } => None,
+            _ => None,
         }
     }
 
@@ -295,15 +442,15 @@ pub(crate) fn principal_is_first_party(principal: &AuthenticatedPrincipal) -> bo
 }
 
 #[cfg(unix)]
-pub(crate) fn capture_child_environment(overrides: &HashMap<String, String>) -> ChildEnvironment {
-    let mut environment = std::env::vars_os().collect::<ChildEnvironment>();
-    for (key, value) in overrides {
-        environment.insert(OsString::from(key), OsString::from(value));
-    }
-    environment
+pub(crate) fn approved_payload_environment(
+    overrides: &HashMap<String, String>,
+    temp_dir: &Path,
+) -> ChildEnvironment {
+    sandboxed_child_environment(overrides, temp_dir)
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mint_host_escalation_grant(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
@@ -312,6 +459,8 @@ pub(crate) fn mint_host_escalation_grant(
     cwd: &Path,
     shell_path: &Path,
     environment: &ChildEnvironment,
+    storage_dir: &Path,
+    session_id: &str,
 ) -> Result<String, String> {
     mint_host_escalation_grant_at(
         ctx,
@@ -321,6 +470,8 @@ pub(crate) fn mint_host_escalation_grant(
         cwd,
         shell_path,
         environment,
+        storage_dir,
+        session_id,
         Instant::now(),
     )
 }
@@ -335,8 +486,27 @@ fn mint_host_escalation_grant_at(
     cwd: &Path,
     shell_path: &Path,
     environment: &ChildEnvironment,
+    storage_dir: &Path,
+    session_id: &str,
     now: Instant,
 ) -> Result<String, String> {
+    let task = crate::bash_background::persistence::allocate_task_layout(storage_dir, session_id)
+        .map_err(|error| format!("failed to allocate escalation payload bundle: {error}"))?;
+    let prepared = match prepare_task_payload(
+        &task,
+        command,
+        root,
+        cwd,
+        principal,
+        shell_path,
+        environment,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = crate::bash_background::persistence::delete_resolved_task(&task);
+            return Err(error);
+        }
+    };
     let mut store = ctx.escalation_grants().lock();
     let grant_id = loop {
         let mut random = [0_u8; 16];
@@ -350,10 +520,11 @@ fn mint_host_escalation_grant_at(
     let grant = EscalationGrant {
         principal: principal.clone(),
         root: root.to_path_buf(),
-        digest: escalation_digest(command, root, cwd, principal, shell_path, environment),
+        digest: prepared.0.digest,
         expires_at: now + ESCALATION_GRANT_TTL,
         consumed: false,
-        environment: environment.clone(),
+        session_dir: prepared.0.paths.session_dir.clone(),
+        task_id: prepared.0.paths.task_id.clone(),
     };
     store.grants.insert(grant_id.clone(), grant);
     Ok(grant_id)
@@ -365,46 +536,267 @@ fn consume_host_escalation_grant_at(
     principal: &AuthenticatedPrincipal,
     attempt: &HostEscalationAttempt,
     now: Instant,
-) -> Result<ChildEnvironment, EscalationRefusal> {
-    let mut store = ctx.escalation_grants().lock();
-    let Some(grant) = store.grants.get_mut(&attempt.grant_id) else {
-        return Err(EscalationRefusal::DigestMismatch);
-    };
-    if grant.principal != *principal {
-        return Err(EscalationRefusal::WrongPrincipal);
-    }
-    if grant.root != attempt.root {
+) -> Result<PreparedTask, EscalationRefusal> {
+    let (digest, session_dir, task_id) = {
+        let mut store = ctx.escalation_grants().lock();
+        let Some(grant) = store.grants.get_mut(&attempt.grant_id) else {
+            return Err(EscalationRefusal::DigestMismatch);
+        };
+        if grant.consumed {
+            return Err(EscalationRefusal::Consumed);
+        }
+        if now >= grant.expires_at {
+            grant.consumed = true;
+            return Err(EscalationRefusal::Expired);
+        }
+        if grant.principal != *principal {
+            grant.consumed = true;
+            return Err(EscalationRefusal::WrongPrincipal);
+        }
+        if grant.root != attempt.root {
+            grant.consumed = true;
+            return Err(EscalationRefusal::DigestMismatch);
+        }
         grant.consumed = true;
-        grant.environment.clear();
-        return Err(EscalationRefusal::DigestMismatch);
-    }
-    if now >= grant.expires_at {
-        grant.environment.clear();
-        return Err(EscalationRefusal::Expired);
-    }
-    if grant.consumed {
-        return Err(EscalationRefusal::Consumed);
-    }
-    let digest = escalation_digest(
+        (
+            grant.digest,
+            grant.session_dir.clone(),
+            grant.task_id.clone(),
+        )
+    };
+
+    let task = crate::bash_background::persistence::resolve_uninitialized_task_layout(
+        &session_dir,
+        &task_id,
+    )
+    .map_err(|_| EscalationRefusal::DigestMismatch)?;
+    verify_payload(
+        task,
         &attempt.command,
         &attempt.root,
         &attempt.cwd,
         principal,
         &attempt.shell_path,
         &attempt.environment,
-    );
-    if digest != grant.digest {
-        grant.consumed = true;
-        grant.environment.clear();
-        return Err(EscalationRefusal::DigestMismatch);
-    }
-    grant.consumed = true;
-    Ok(std::mem::take(&mut grant.environment))
+        Some(digest),
+        true,
+    )
+    .map_err(|_| EscalationRefusal::DigestMismatch)
 }
 
 #[cfg(unix)]
-fn escalation_digest(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_task_payload(
+    task: &crate::bash_background::persistence::ResolvedTask,
     command: &[u8],
+    root: &Path,
+    cwd: &Path,
+    principal: &AuthenticatedPrincipal,
+    shell_path: &Path,
+    environment: &ChildEnvironment,
+) -> Result<PreparedTask, String> {
+    materialize_payload(
+        crate::bash_background::persistence::ResolvedTask {
+            paths: task.paths.clone(),
+            dirs: task.dirs.clone(),
+        },
+        command,
+        root,
+        cwd,
+        principal,
+        shell_path,
+        environment,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn materialize_payload(
+    task: crate::bash_background::persistence::ResolvedTask,
+    command_bytes: &[u8],
+    root: &Path,
+    cwd: &Path,
+    principal: &AuthenticatedPrincipal,
+    shell_path: &Path,
+    environment: &ChildEnvironment,
+) -> Result<PreparedTask, String> {
+    let environment_bytes = encode_environment(environment);
+    let digest = payload_digest(
+        &task.paths.task_id,
+        command_bytes,
+        PAYLOAD_WRAPPER,
+        &environment_bytes,
+        root,
+        cwd,
+        principal,
+        shell_path,
+        environment,
+    );
+    crate::bash_background::persistence::create_control_file(
+        &task.dirs,
+        crate::bash_background::persistence::COMMAND_FILE,
+        command_bytes,
+    )
+    .map_err(|error| format!("failed to materialize command payload: {error}"))?;
+    crate::bash_background::persistence::create_control_file(
+        &task.dirs,
+        crate::bash_background::persistence::WRAPPER_FILE,
+        PAYLOAD_WRAPPER,
+    )
+    .map_err(|error| format!("failed to materialize wrapper payload: {error}"))?;
+    crate::bash_background::persistence::create_control_file(
+        &task.dirs,
+        crate::bash_background::persistence::ENVIRONMENT_FILE,
+        &environment_bytes,
+    )
+    .map_err(|error| format!("failed to materialize environment payload: {error}"))?;
+    crate::bash_background::persistence::create_control_file(
+        &task.dirs,
+        crate::bash_background::persistence::MANIFEST_FILE,
+        digest.as_bytes(),
+    )
+    .map_err(|error| format!("failed to materialize payload manifest: {error}"))?;
+    verify_payload(
+        task,
+        command_bytes,
+        root,
+        cwd,
+        principal,
+        shell_path,
+        environment,
+        Some(digest),
+        true,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn verify_payload(
+    task: crate::bash_background::persistence::ResolvedTask,
+    expected_command: &[u8],
+    root: &Path,
+    cwd: &Path,
+    principal: &AuthenticatedPrincipal,
+    shell_path: &Path,
+    expected_environment: &ChildEnvironment,
+    expected_digest: Option<blake3::Hash>,
+    reject_extra_objects: bool,
+) -> Result<PreparedTask, String> {
+    if reject_extra_objects {
+        validate_payload_control_names(&task)?;
+    }
+
+    let mut command = crate::bash_background::persistence::open_control_file(
+        &task,
+        crate::bash_background::persistence::COMMAND_FILE,
+    )
+    .map_err(|error| format!("failed to open command payload: {error}"))?;
+    let mut wrapper = crate::bash_background::persistence::open_control_file(
+        &task,
+        crate::bash_background::persistence::WRAPPER_FILE,
+    )
+    .map_err(|error| format!("failed to open wrapper payload: {error}"))?;
+    let mut environment_file = crate::bash_background::persistence::open_control_file(
+        &task,
+        crate::bash_background::persistence::ENVIRONMENT_FILE,
+    )
+    .map_err(|error| format!("failed to open environment payload: {error}"))?;
+    let mut manifest = crate::bash_background::persistence::open_control_file(
+        &task,
+        crate::bash_background::persistence::MANIFEST_FILE,
+    )
+    .map_err(|error| format!("failed to open payload manifest: {error}"))?;
+
+    let command_bytes = read_held_payload(&mut command)?;
+    let wrapper_bytes = read_held_payload(&mut wrapper)?;
+    let environment_bytes = read_held_payload(&mut environment_file)?;
+    let manifest_bytes = read_held_payload(&mut manifest)?;
+    let environment = decode_environment(&environment_bytes)?;
+    let digest = payload_digest(
+        &task.paths.task_id,
+        &command_bytes,
+        &wrapper_bytes,
+        &environment_bytes,
+        root,
+        cwd,
+        principal,
+        shell_path,
+        expected_environment,
+    );
+    if command_bytes != expected_command
+        || environment != *expected_environment
+        || manifest_bytes.as_slice() != digest.as_bytes()
+        || expected_digest.is_some_and(|expected| expected != digest)
+    {
+        return Err("escalation payload manifest digest mismatch".to_string());
+    }
+    if reject_extra_objects {
+        validate_payload_control_names(&task)?;
+    }
+    command
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind command payload: {error}"))?;
+    wrapper
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind wrapper payload: {error}"))?;
+    environment_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind environment payload: {error}"))?;
+    Ok(PreparedTask(Arc::new(PreparedTaskInner {
+        paths: task.paths,
+        dirs: task.dirs,
+        digest,
+        environment,
+        command_bytes: Arc::new(command_bytes),
+        wrapper_bytes: Arc::new(wrapper_bytes),
+        _command_file: Arc::new(command),
+        _wrapper_file: Arc::new(wrapper),
+        _environment_file: Arc::new(environment_file),
+    })))
+}
+
+#[cfg(unix)]
+fn validate_payload_control_names(
+    task: &crate::bash_background::persistence::ResolvedTask,
+) -> Result<(), String> {
+    let mut names = task
+        .dirs
+        .control
+        .list_names()
+        .map_err(|error| format!("failed to enumerate escalation payload: {error}"))?;
+    names.sort();
+    let mut expected = [
+        OsString::from(crate::bash_background::persistence::COMMAND_FILE),
+        OsString::from(crate::bash_background::persistence::ENVIRONMENT_FILE),
+        OsString::from(crate::bash_background::persistence::MANIFEST_FILE),
+        OsString::from(crate::bash_background::persistence::WRAPPER_FILE),
+    ];
+    expected.sort();
+    if names.as_slice() != expected.as_slice() {
+        return Err(format!(
+            "escalation payload contains a missing or extra object: {names:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_held_payload(file: &mut File) -> Result<Vec<u8>, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind held payload: {error}"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read held payload: {error}"))?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn payload_digest(
+    task_id: &str,
+    command: &[u8],
+    wrapper: &[u8],
+    environment_bytes: &[u8],
     root: &Path,
     cwd: &Path,
     principal: &AuthenticatedPrincipal,
@@ -413,7 +805,28 @@ fn escalation_digest(
 ) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hash_field(&mut hasher, ESCALATION_DIGEST_TAG);
-    hash_field(&mut hasher, command);
+    hash_field(&mut hasher, task_id.as_bytes());
+    for (role, name, bytes) in [
+        (
+            b"command".as_slice(),
+            crate::bash_background::persistence::COMMAND_FILE,
+            command,
+        ),
+        (
+            b"wrapper".as_slice(),
+            crate::bash_background::persistence::WRAPPER_FILE,
+            wrapper,
+        ),
+        (
+            b"environment".as_slice(),
+            crate::bash_background::persistence::ENVIRONMENT_FILE,
+            environment_bytes,
+        ),
+    ] {
+        hash_field(&mut hasher, role);
+        hash_field(&mut hasher, name.as_bytes());
+        hash_field(&mut hasher, bytes);
+    }
     hash_field(&mut hasher, &os_bytes(root.as_os_str()));
     hash_field(&mut hasher, &os_bytes(cwd.as_os_str()));
     hash_principal(&mut hasher, principal);
@@ -426,6 +839,69 @@ fn escalation_digest(
         hash_field(&mut hasher, &os_bytes(value));
     }
     hasher.finalize()
+}
+
+#[cfg(unix)]
+fn encode_environment(environment: &ChildEnvironment) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(ENVIRONMENT_TAG);
+    bytes.extend_from_slice(&(environment.len() as u64).to_be_bytes());
+    for (key, value) in environment {
+        let key = os_bytes(key);
+        let value = os_bytes(value);
+        bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&key);
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&value);
+    }
+    bytes
+}
+
+#[cfg(unix)]
+fn decode_environment(bytes: &[u8]) -> Result<ChildEnvironment, String> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut cursor = ENVIRONMENT_TAG.len();
+    if !bytes.starts_with(ENVIRONMENT_TAG) {
+        return Err("invalid environment payload tag".to_string());
+    }
+    let count = read_u64(bytes, &mut cursor)?;
+    let mut environment = ChildEnvironment::new();
+    for _ in 0..count {
+        let key_len = read_u64(bytes, &mut cursor)? as usize;
+        let key = take_bytes(bytes, &mut cursor, key_len)?;
+        let value_len = read_u64(bytes, &mut cursor)? as usize;
+        let value = take_bytes(bytes, &mut cursor, value_len)?;
+        if environment
+            .insert(OsString::from_vec(key), OsString::from_vec(value))
+            .is_some()
+        {
+            return Err("duplicate key in environment payload".to_string());
+        }
+    }
+    if cursor != bytes.len() {
+        return Err("trailing bytes in environment payload".to_string());
+    }
+    Ok(environment)
+}
+
+#[cfg(unix)]
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let field = take_bytes(bytes, cursor, 8)?;
+    Ok(u64::from_be_bytes(field.try_into().map_err(|_| {
+        "invalid environment length field".to_string()
+    })?))
+}
+
+#[cfg(unix)]
+fn take_bytes(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<u8>, String> {
+    let end = cursor
+        .checked_add(len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| "truncated environment payload".to_string())?;
+    let value = bytes[*cursor..end].to_vec();
+    *cursor = end;
+    Ok(value)
 }
 
 #[cfg(unix)]
@@ -566,10 +1042,11 @@ pub fn resolve_sandbox_spawn(
                 return escalation_refused(EscalationRefusal::DigestMismatch);
             };
             return match consume_host_escalation_grant_at(ctx, principal, attempt, Instant::now()) {
-                Ok(environment) => SpawnPlan::Host {
+                Ok(prepared) => SpawnPlan::Host {
                     shell_path: attempt.shell_path.clone(),
-                    environment,
-                },
+                    environment: prepared.environment().clone(),
+                }
+                .with_prepared_task(prepared),
                 Err(refusal) => escalation_refused(refusal),
             };
         }
@@ -697,15 +1174,19 @@ fn build_native_profile(
     }
     if !task_bundle_dir.is_dir() {
         return Err(format!(
-            "task artifact directory is not an existing directory: {}",
+            "task io directory is not an existing directory: {}",
             task_bundle_dir.display()
         ));
     }
+    let task_io_dir = task_bundle_dir
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize task io directory: {error}"))?;
+    let session_store = session_store_for_task_io(&task_io_dir)?;
 
-    let temp_dir = create_task_temp_dir(task_bundle_dir)?;
+    let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = {
         let mut writable_roots = project_roots.clone();
-        writable_roots.push(task_bundle_dir.to_path_buf());
+        writable_roots.push(task_io_dir.clone());
         writable_roots.extend(
             ctx.config()
                 .sandbox
@@ -768,7 +1249,7 @@ fn build_native_profile(
             socket_deny.push(PathBuf::from(agent_socket));
         }
 
-        SandboxProfile::build(
+        let mut profile = SandboxProfile::build(
             writable_roots,
             write_deny,
             write_deny_nested,
@@ -777,12 +1258,90 @@ fn build_native_profile(
             cache_roots,
             temp_dir.clone(),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        // Payload and output descriptors are opened before confinement. Denying
+        // the complete store prevents a task from enumerating or reading any
+        // task control/output path, including siblings created after launch.
+        if !profile.read_deny.contains(&session_store) {
+            profile.read_deny.push(session_store.clone());
+        }
+        refuse_store_overlap(&profile, &session_store, &task_io_dir)?;
+        Ok(profile)
     };
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
     result
+}
+
+#[cfg(unix)]
+pub(crate) fn control_payload_read_grants(task_io: &Path) -> Result<Vec<PathBuf>, String> {
+    if task_io.file_name() != Some(OsStr::new("io")) {
+        return Err("task payload grants require the directory-layout io path".to_string());
+    }
+    let task_dir = task_io
+        .parent()
+        .ok_or_else(|| "task io directory has no task parent".to_string())?;
+    let task_id = task_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "task directory has no UTF-8 identity".to_string())?;
+    crate::bash_background::persistence::validate_task_id(task_id)
+        .map_err(|error| error.to_string())?;
+    let control = task_dir.join("control");
+    Ok(vec![
+        control.join(crate::bash_background::persistence::COMMAND_FILE),
+        control.join(crate::bash_background::persistence::WRAPPER_FILE),
+        control.join(crate::bash_background::persistence::ENVIRONMENT_FILE),
+    ])
+}
+
+#[cfg(unix)]
+fn session_store_for_task_io(task_io: &Path) -> Result<PathBuf, String> {
+    let Some(task_dir) = task_io.parent() else {
+        return Err("task io directory has no task parent".to_string());
+    };
+    let directory_layout = task_io.file_name() == Some(OsStr::new("io"))
+        && task_dir
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|task_id| {
+                crate::bash_background::persistence::validate_task_id(task_id).is_ok()
+            });
+    let candidate = if directory_layout {
+        task_dir
+            .parent()
+            .ok_or_else(|| "task directory has no session parent".to_string())?
+    } else {
+        task_io
+    };
+    candidate
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize bash task session store: {error}"))
+}
+
+#[cfg(unix)]
+fn refuse_store_overlap(
+    profile: &SandboxProfile,
+    session_store: &Path,
+    task_io: &Path,
+) -> Result<(), String> {
+    for root in profile.write_allow_roots() {
+        if root == task_io || root.starts_with(task_io) {
+            continue;
+        }
+        if root == session_store
+            || root.starts_with(session_store)
+            || session_store.starts_with(root)
+        {
+            return Err(format!(
+                "sandbox writable root overlaps the bash task session store: writable={} store={}",
+                root.display(),
+                session_store.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -920,31 +1479,100 @@ pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() ->
 /// Windows detached spawns route through the shell-candidate ladder, which
 /// enforces the plan inline, so this helper is Unix-only.
 #[cfg(unix)]
+pub(crate) const CHILD_EXIT_FD: RawFd = 3;
+#[cfg(unix)]
+pub(crate) const CHILD_FAILURE_FD: RawFd = 4;
+
+#[cfg(unix)]
+pub(crate) fn apply_marker_fd_allowlist(
+    command: &mut Command,
+    exit_fd: RawFd,
+    failure_fd: RawFd,
+) -> Result<(RawFd, RawFd), String> {
+    use std::os::unix::process::CommandExt;
+
+    let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let fd_limit = if fd_limit > 0 {
+        (fd_limit as RawFd).min(65_536)
+    } else {
+        1_024
+    };
+    unsafe {
+        command.pre_exec(move || {
+            let exit_copy = libc::fcntl(exit_fd, libc::F_DUPFD_CLOEXEC, 5);
+            if exit_copy < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let failure_copy = libc::fcntl(failure_fd, libc::F_DUPFD_CLOEXEC, 5);
+            if failure_copy < 0 {
+                let error = std::io::Error::last_os_error();
+                libc::close(exit_copy);
+                return Err(error);
+            }
+            if libc::dup2(exit_copy, CHILD_EXIT_FD) < 0
+                || libc::dup2(failure_copy, CHILD_FAILURE_FD) < 0
+            {
+                let error = std::io::Error::last_os_error();
+                libc::close(exit_copy);
+                libc::close(failure_copy);
+                return Err(error);
+            }
+            libc::close(exit_copy);
+            libc::close(failure_copy);
+            for fd in 5..fd_limit {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok((CHILD_EXIT_FD, CHILD_FAILURE_FD))
+}
+
+#[cfg(unix)]
 pub(crate) fn detached_command_for_plan(
     plan: &SpawnPlan,
     program: &OsStr,
     args: &[OsString],
     task_marker: &Path,
-    exit_marker: &Path,
-) -> Result<Command, String> {
-    let (program, args) =
-        command_argv_for_plan(plan, program, args, task_marker, Some(exit_marker))?;
+    exit_fd: RawFd,
+    failure_fd: RawFd,
+) -> Result<(Command, Option<File>), String> {
+    let (program, args, profile_handle) = command_argv_for_plan(
+        plan,
+        program,
+        args,
+        task_marker,
+        Some((exit_fd, failure_fd)),
+    )?;
+    use std::os::unix::process::CommandExt;
+
     let mut command = crate::effective_path::new_command(program);
-    command.args(args);
-    Ok(command)
+    command.args(args).process_group(0);
+    Ok((command, profile_handle))
 }
 
 fn isolated_environment_for_plan(
     plan: &SpawnPlan,
     request_environment: &HashMap<String, String>,
 ) -> Option<ChildEnvironment> {
-    match plan {
+    #[cfg(unix)]
+    if !matches!(plan.policy(), SpawnPlan::Unsandboxed) {
+        if let Some(task) = plan.prepared_task() {
+            return Some(task.environment().clone());
+        }
+    }
+    match plan.policy() {
         SpawnPlan::Host { environment, .. } => Some(environment.clone()),
         SpawnPlan::Launcher { profile, .. } => Some(sandboxed_child_environment(
             request_environment,
             &profile.temp_dir,
         )),
         SpawnPlan::Unsandboxed | SpawnPlan::Refused { .. } => None,
+        #[cfg(unix)]
+        SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
     }
 }
 
@@ -978,6 +1606,15 @@ fn sandbox_base_environment_key(key: &OsStr) -> bool {
 }
 
 #[cfg(unix)]
+pub(crate) fn approved_environment_for_plan(
+    plan: &SpawnPlan,
+    request_environment: &HashMap<String, String>,
+) -> ChildEnvironment {
+    isolated_environment_for_plan(plan, request_environment)
+        .unwrap_or_else(|| approved_payload_environment(request_environment, &std::env::temp_dir()))
+}
+
+#[cfg(unix)]
 pub(crate) fn apply_sandbox_environment(
     plan: &SpawnPlan,
     command: &mut Command,
@@ -999,8 +1636,9 @@ pub(crate) fn pty_command_for_plan(
     task_marker: &Path,
     workdir: &Path,
     env: &HashMap<String, String>,
-) -> Result<CommandBuilder, String> {
-    let (program, args) = command_argv_for_plan(plan, program, args, task_marker, None)?;
+) -> Result<(CommandBuilder, Option<File>), String> {
+    let (program, args, profile_handle) =
+        command_argv_for_plan(plan, program, args, task_marker, None)?;
     let mut command = CommandBuilder::new(program);
     for arg in args {
         command.arg(arg);
@@ -1018,7 +1656,7 @@ pub(crate) fn pty_command_for_plan(
             command.env(key, value);
         }
     }
-    Ok(command)
+    Ok((command, profile_handle))
 }
 
 fn command_argv_for_plan(
@@ -1026,135 +1664,117 @@ fn command_argv_for_plan(
     program: &OsStr,
     args: &[OsString],
     task_marker: &Path,
-    exit_marker: Option<&Path>,
-) -> Result<(OsString, Vec<OsString>), String> {
-    match plan {
+    marker_fds: Option<(RawFd, RawFd)>,
+) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
+    match plan.policy() {
         SpawnPlan::Unsandboxed | SpawnPlan::Host { .. } => {
-            Ok((program.to_os_string(), args.to_vec()))
+            Ok((program.to_os_string(), args.to_vec(), None))
         }
         SpawnPlan::Refused { code, .. } => Err((*code).to_string()),
         SpawnPlan::Launcher {
             profile,
             launcher_path,
-        } => launcher_argv(
-            profile,
-            launcher_path,
-            program,
-            args,
-            task_marker,
-            exit_marker,
-        ),
+        } => {
+            #[cfg(unix)]
+            {
+                launcher_argv(
+                    profile,
+                    launcher_path,
+                    program,
+                    args,
+                    task_marker,
+                    marker_fds,
+                    plan.prepared_task(),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                launcher_argv(
+                    profile,
+                    launcher_path,
+                    program,
+                    args,
+                    task_marker,
+                    marker_fds,
+                    None,
+                )
+            }
+        }
+        #[cfg(unix)]
+        SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
     }
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn launcher_argv(
     profile: &SandboxProfile,
     launcher_path: &Path,
     program: &OsStr,
     args: &[OsString],
-    task_marker: &Path,
-    exit_marker: Option<&Path>,
-) -> Result<(OsString, Vec<OsString>), String> {
-    let profile_path = write_profile_file(profile, task_marker)?;
-    let failure_marker = sandbox_failure_marker_path(task_marker)?;
-    if let Some(exit_marker) = exit_marker {
+    _task_marker: &Path,
+    marker_fds: Option<(RawFd, RawFd)>,
+    _prepared: Option<&PreparedTask>,
+) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
+    let profile_json = serde_json::to_string(profile)
+        .map_err(|error| format!("failed to serialize sandbox profile: {error}"))?;
+    let Some((exit_fd, failure_fd)) = marker_fds else {
         let mut wrapped = vec![
-            OsString::from("-c"),
-            OsString::from(
-                r#"umask 077
-launcher=$1
-profile=$2
-exit_marker=$3
-failure_marker=$4
-shift 4
-"$launcher" sandbox-launch --profile-file "$profile" --failure-marker "$failure_marker" -- "$@"
-code=$?
-if [ "$code" -eq 78 ] && [ ! -e "$exit_marker" ]; then
-  if [ ! -e "$failure_marker" ]; then
-    printf "%s" sandbox_unavailable > "$failure_marker.tmp.$$" && mv -f "$failure_marker.tmp.$$" "$failure_marker"
-  fi
-  printf "%s" "$code" > "$exit_marker.tmp.$$" && mv -f "$exit_marker.tmp.$$" "$exit_marker"
-fi
-exit "$code""#,
-            ),
-            OsString::from("aft-sandbox-supervisor"),
-            launcher_path.as_os_str().to_os_string(),
-            profile_path.into_os_string(),
-            exit_marker.as_os_str().to_os_string(),
-            failure_marker.into_os_string(),
+            OsString::from("sandbox-launch"),
+            OsString::from("--profile-json"),
+            OsString::from(profile_json),
+            OsString::from("--"),
             program.to_os_string(),
         ];
         wrapped.extend_from_slice(args);
-        return Ok((OsString::from("/bin/sh"), wrapped));
-    }
+        return Ok((launcher_path.as_os_str().to_os_string(), wrapped, None));
+    };
 
     let mut wrapped = vec![
-        OsString::from("sandbox-launch"),
-        OsString::from("--profile-file"),
-        profile_path.into_os_string(),
-        OsString::from("--failure-marker"),
-        failure_marker.into_os_string(),
-        OsString::from("--"),
+        OsString::from("-c"),
+        OsString::from(
+            r#"launcher=$1
+profile_json=$2
+exit_fd=$3
+failure_fd=$4
+shift 4
+"$launcher" sandbox-launch --profile-json "$profile_json" -- "$@"
+code=$?
+if [ "$code" -eq 78 ]; then
+  printf "%s" sandbox_unavailable >&"$failure_fd"
+  if [ ! -s "/dev/fd/$exit_fd" ]; then
+    printf "%s" "$code" >&"$exit_fd"
+  fi
+fi
+exit "$code""#,
+        ),
+        OsString::from("aft-sandbox-supervisor"),
+        launcher_path.as_os_str().to_os_string(),
+        OsString::from(profile_json),
+        OsString::from(exit_fd.to_string()),
+        OsString::from(failure_fd.to_string()),
         program.to_os_string(),
     ];
     wrapped.extend_from_slice(args);
-    Ok((launcher_path.as_os_str().to_os_string(), wrapped))
+    Ok((OsString::from("/bin/sh"), wrapped, None))
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 fn launcher_argv(
     _profile: &SandboxProfile,
     _launcher_path: &Path,
     _program: &OsStr,
     _args: &[OsString],
     _task_marker: &Path,
-    _exit_marker: Option<&Path>,
-) -> Result<(OsString, Vec<OsString>), String> {
+    _marker_fds: Option<(i32, i32)>,
+    _prepared: Option<&()>,
+) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
     Err("sandbox_unavailable".to_string())
-}
-
-#[cfg(unix)]
-fn sandbox_failure_marker_path(task_marker: &Path) -> Result<PathBuf, String> {
-    let parent = task_marker
-        .parent()
-        .ok_or_else(|| "sandbox task marker has no parent directory".to_string())?;
-    let stem = task_marker
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("bash-task");
-    Ok(parent.join(format!("{stem}.sandbox-unavailable")))
-}
-
-#[cfg(unix)]
-fn write_profile_file(profile: &SandboxProfile, task_marker: &Path) -> Result<PathBuf, String> {
-    let parent = task_marker
-        .parent()
-        .ok_or_else(|| "sandbox task marker has no parent directory".to_string())?;
-    let stem = task_marker
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("bash-task");
-    let path = parent.join(format!("{stem}.sandbox-profile.json"));
-    let bytes = serde_json::to_vec(profile)
-        .map_err(|error| format!("failed to serialize sandbox profile: {error}"))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|error| format!("failed to create sandbox profile file: {error}"))?;
-    file.write_all(&bytes)
-        .map_err(|error| format!("failed to write sandbox profile file: {error}"))?;
-    file.sync_all()
-        .map_err(|error| format!("failed to sync sandbox profile file: {error}"))?;
-    std::fs::canonicalize(&path)
-        .map_err(|error| format!("failed to canonicalize sandbox profile file: {error}"))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -1276,12 +1896,10 @@ mod tests {
     }
 
     #[test]
-    fn product_profile_file_is_private() {
+    fn product_profile_is_passed_as_a_verified_buffer() {
         let root = tempfile::tempdir().unwrap();
-        let task_dir = root.path().join("task");
         let project = root.path().join("project");
         let temp = root.path().join("temp");
-        std::fs::create_dir_all(&task_dir).unwrap();
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&temp).unwrap();
         let profile = SandboxProfile::build(
@@ -1294,11 +1912,21 @@ mod tests {
             temp,
         )
         .unwrap();
-        let marker = task_dir.join("bash-private.json");
-
-        let path = write_profile_file(&profile, &marker).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let (_program, args, retained) = launcher_argv(
+            &profile,
+            Path::new("/bin/aft"),
+            OsStr::new("/bin/sh"),
+            &[OsString::from("-c"), OsString::from("true")],
+            Path::new("unused"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(args[0], "sandbox-launch");
+        assert_eq!(args[1], "--profile-json");
+        assert!(serde_json::from_str::<SandboxProfile>(args[2].to_str().unwrap()).is_ok());
+        assert!(retained.is_none());
+        assert!(!root.path().join("sandbox-profile.json").exists());
     }
 }
 
@@ -1431,6 +2059,8 @@ mod policy_tests {
             project,
             Path::new("/bin/sh"),
             environment,
+            &project.join(".aft-test-storage"),
+            "test-session",
             now,
         )
         .unwrap()
@@ -1508,7 +2138,7 @@ mod policy_tests {
             project.path(),
             Some(&attempt),
         );
-        assert!(matches!(first, SpawnPlan::Host { .. }));
+        assert!(matches!(first.policy(), SpawnPlan::Host { .. }));
         let second = resolve_sandbox_spawn(
             &ctx,
             &principal,
@@ -1592,13 +2222,13 @@ mod policy_tests {
             project.path(),
             Some(&happy_attempt),
         );
-        match happy {
+        match happy.policy() {
             SpawnPlan::Host {
                 shell_path,
                 environment: actual,
             } => {
                 assert_eq!(shell_path, Path::new("/bin/sh"));
-                assert_eq!(actual, environment);
+                assert_eq!(actual, &environment);
             }
             other => panic!("expected host plan, got {other:?}"),
         }
@@ -1628,6 +2258,290 @@ mod policy_tests {
         );
         assert_eq!(plan.refusal_code(), Some("sandbox_escalation_denied"));
         assert!(ctx.escalation_grants().lock().grants.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn grant_task_paths(ctx: &AppContext, grant_id: &str) -> (PathBuf, String) {
+        let store = ctx.escalation_grants().lock();
+        let grant = store.grants.get(grant_id).unwrap();
+        (grant.session_dir.clone(), grant.task_id.clone())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalated_payload_path_race_is_refused_and_burns_the_grant() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let environment = ChildEnvironment::new();
+        let grant_id = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            Instant::now(),
+        );
+        let (session_dir, task_id) = grant_task_paths(&ctx, &grant_id);
+        let command_path = session_dir
+            .join(&task_id)
+            .join("control")
+            .join(crate::bash_background::persistence::COMMAND_FILE);
+        let victim = project.path().join("victim");
+        std::fs::write(&victim, b"victim-bytes").unwrap();
+        std::fs::remove_file(&command_path).unwrap();
+        symlink(&victim, &command_path).unwrap();
+
+        let attempt = grant_attempt(grant_id.clone(), project.path(), b"true", environment);
+        let refused = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&attempt),
+        );
+        assert_eq!(refusal_class(&refused), Some("digest_mismatch"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
+        let consumed = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&attempt),
+        );
+        assert_eq!(refusal_class(&consumed), Some("consumed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_host_payload_executes_verified_buffers_after_inode_mutation() {
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let environment = ChildEnvironment::new();
+        let grant_id = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            Instant::now(),
+        );
+        let attempt = grant_attempt(grant_id, project.path(), b"true", environment);
+        let plan = resolve_sandbox_spawn(
+            &ctx,
+            &principal,
+            RequestedSandboxTier::Host,
+            SandboxTaskKind::BashForeground,
+            project.path(),
+            Some(&attempt),
+        );
+        let prepared = plan.prepared_task().expect("verified prepared task");
+        let command_path = prepared
+            .paths()
+            .control_dir
+            .join(crate::bash_background::persistence::COMMAND_FILE);
+        let victim = project.path().join("victim");
+        std::fs::write(&victim, b"victim-bytes").unwrap();
+        let payload = prepared.invocation().unwrap();
+        // Mutate the same inode after verification. Execution must use the
+        // verified in-memory buffers rather than rereading the held file.
+        std::fs::write(
+            &command_path,
+            format!("printf hacked > {}", victim.display()),
+        )
+        .unwrap();
+        let exit_path = project.path().join("exit");
+        let exit = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&exit_path)
+            .unwrap();
+        crate::bash_background::persistence::set_close_on_exec(exit.as_raw_fd(), false).unwrap();
+        let exit_fd = exit.as_raw_fd().to_string();
+        let status = Command::new("/bin/sh")
+            .args([
+                OsStr::new("-c"),
+                payload.wrapper_text.as_os_str(),
+                OsStr::new("aft-payload-wrapper"),
+                OsStr::new("/bin/sh"),
+                payload.command_text.as_os_str(),
+                OsStr::new(&exit_fd),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_spawn_drift_matrix_refuses_every_bound_field() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let approved = ChildEnvironment::from([(OsString::from("A"), OsString::from("one"))]);
+        for drift in [
+            "command",
+            "newline",
+            "encoding",
+            "cwd",
+            "root",
+            "shell",
+            "environment",
+            "environment_file_encoding",
+            "wrapper_template",
+        ] {
+            let grant_id = mint_test_grant(
+                &ctx,
+                &principal,
+                project.path(),
+                b"printf approved",
+                &approved,
+                Instant::now(),
+            );
+            let mut attempt = grant_attempt(
+                grant_id,
+                project.path(),
+                b"printf approved",
+                approved.clone(),
+            );
+            match drift {
+                "command" => attempt.command = b"printf changed".to_vec(),
+                "newline" => attempt.command.push(b'\n'),
+                "encoding" => attempt.command.push(0xff),
+                "cwd" => attempt.cwd = project.path().join("changed-cwd"),
+                "root" => attempt.root = project.path().join("changed-root"),
+                "shell" => attempt.shell_path = PathBuf::from("/bin/bash"),
+                "environment" => {
+                    attempt
+                        .environment
+                        .insert(OsString::from("A"), OsString::from("two"));
+                }
+                "environment_file_encoding" | "wrapper_template" => {
+                    let (session_dir, task_id) = grant_task_paths(&ctx, &attempt.grant_id);
+                    let name = if drift == "wrapper_template" {
+                        crate::bash_background::persistence::WRAPPER_FILE
+                    } else {
+                        crate::bash_background::persistence::ENVIRONMENT_FILE
+                    };
+                    std::fs::write(
+                        session_dir.join(task_id).join("control").join(name),
+                        b"drift",
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let refused = resolve_sandbox_spawn(
+                &ctx,
+                &principal,
+                RequestedSandboxTier::Host,
+                SandboxTaskKind::BashForeground,
+                project.path(),
+                Some(&attempt),
+            );
+            assert_eq!(refusal_class(&refused), Some("digest_mismatch"), "{drift}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_read_grant_seam_exposes_only_exact_control_objects() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let environment = ChildEnvironment::from([(OsString::from("SAFE"), OsString::from("yes"))]);
+        let layout =
+            crate::bash_background::persistence::allocate_task_layout(storage.path(), "session")
+                .unwrap();
+        let task = prepare_task_payload(
+            &layout,
+            b"true",
+            project.path(),
+            project.path(),
+            &principal,
+            Path::new("/bin/sh"),
+            &environment,
+        )
+        .unwrap();
+        let plan = SpawnPlan::Unsandboxed.with_prepared_task(task.clone());
+        let grants = plan.payload_read_grants();
+        assert_eq!(grants.len(), 3);
+        assert_eq!(grants, task.payload_read_grants());
+        assert!(grants
+            .iter()
+            .all(|path| path.parent() == Some(task.paths().control_dir.as_path())));
+        assert!(!grants.contains(&task.paths().manifest));
+        let sandbox_temp = storage.path().join("sandbox-temp");
+        std::fs::create_dir_all(&sandbox_temp).unwrap();
+        let b2_profile = SandboxProfile::build(
+            vec![project.path().to_path_buf()],
+            Vec::new(),
+            Vec::new(),
+            vec![task.paths().control_dir.clone()],
+            Vec::new(),
+            Vec::new(),
+            sandbox_temp,
+        )
+        .unwrap();
+        assert!(b2_profile
+            .read_deny
+            .contains(&std::fs::canonicalize(&task.paths().control_dir).unwrap()));
+        assert!(grants.iter().all(|path| {
+            path.parent() == Some(task.paths().control_dir.as_path())
+                && path != &task.paths().manifest
+        }));
+        assert_eq!(task.environment(), &environment);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_roots_refuse_both_session_store_overlap_directions() {
+        fn profile(base: &Path, write_root: PathBuf) -> SandboxProfile {
+            let project = base.join("project");
+            let home = base.join("home");
+            let temp = base.join("temp");
+            for path in [&project, &home, &temp, &write_root] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            SandboxProfile::build(
+                vec![project, write_root],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                temp,
+            )
+            .unwrap()
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let session = base.path().join("store/session");
+        let io = session.join("bash-0000000000000001/io");
+        let control = session.join("bash-0000000000000001/control");
+        std::fs::create_dir_all(&io).unwrap();
+        std::fs::create_dir_all(&control).unwrap();
+        let canonical_session = std::fs::canonicalize(&session).unwrap();
+        let canonical_io = std::fs::canonicalize(&io).unwrap();
+
+        let ancestor = profile(base.path(), base.path().join("store"));
+        assert!(refuse_store_overlap(&ancestor, &canonical_session, &canonical_io).is_err());
+        let descendant = profile(base.path(), control);
+        assert!(refuse_store_overlap(&descendant, &canonical_session, &canonical_io).is_err());
+        let allowed = profile(base.path(), io);
+        assert!(refuse_store_overlap(&allowed, &canonical_session, &canonical_io).is_ok());
     }
 
     #[cfg(windows)]

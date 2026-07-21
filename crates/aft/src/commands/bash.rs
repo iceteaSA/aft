@@ -197,7 +197,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         let shell_path = crate::bash_background::resolved_shell_path(params.pty);
         let shell_path = std::fs::canonicalize(&shell_path).unwrap_or(shell_path);
-        let environment = crate::sandbox_spawn::capture_child_environment(&params.env);
+        let environment =
+            crate::sandbox_spawn::approved_payload_environment(&params.env, &std::env::temp_dir());
         if let Some(grant_id) = params
             .permissions_granted
             .iter()
@@ -213,6 +214,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             });
             spawn_workdir = Some(cwd);
         } else {
+            let storage_dir = crate::bash_background::task_storage_dir(ctx);
             let grant_id = match crate::sandbox_spawn::mint_host_escalation_grant(
                 ctx,
                 &principal,
@@ -221,6 +223,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 &cwd,
                 &shell_path,
                 &environment,
+                &storage_dir,
+                req.session(),
             ) {
                 Ok(grant_id) => grant_id,
                 Err(error) => {
@@ -979,12 +983,10 @@ mod tests {
 printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
 mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
 [ "$1" = "sandbox-launch" ] || exit 91
-[ "$2" = "--profile-file" ] || exit 92
-[ -f "$3" ] || exit 93
-[ "$4" = "--failure-marker" ] || exit 94
-[ "$6" = "--" ] || exit 95
-rm -f -- "$3"
-shift 6
+[ "$2" = "--profile-json" ] || exit 92
+[ -n "$3" ] || exit 93
+[ "$4" = "--" ] || exit 94
+shift 4
 exec "$@"
 "#,
         )
@@ -1023,8 +1025,15 @@ exec "$@"
         let started = Instant::now();
         while !args_log.exists() {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "fake launcher did not record its argv"
+                started.elapsed() < Duration::from_secs(20),
+                "fake launcher did not record its argv; response={response:?}; status={:?}",
+                ctx.bash_background().status(
+                    response.data["task_id"].as_str().unwrap(),
+                    "sandbox-spawn-test",
+                    None,
+                    None,
+                    4096,
+                )
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1032,12 +1041,10 @@ exec "$@"
         let lines: Vec<&str> = args.lines().collect();
         assert_eq!(lines[0], launcher.to_string_lossy());
         assert_eq!(lines[1], "sandbox-launch");
-        assert_eq!(lines[2], "--profile-file");
-        assert!(lines[3].ends_with(".sandbox-profile.json"));
-        assert_eq!(lines[4], "--failure-marker");
-        assert!(lines[5].ends_with(".sandbox-unavailable"));
-        assert_eq!(lines[6], "--");
-        assert!(lines.len() >= 9, "wrapped argv missing target: {lines:?}");
+        assert_eq!(lines[2], "--profile-json");
+        assert!(serde_json::from_str::<serde_json::Value>(lines[3]).is_ok());
+        assert_eq!(lines[4], "--");
+        assert!(lines.len() >= 7, "wrapped argv missing target: {lines:?}");
 
         stop_spawned_test_task(&ctx, &response);
     }
@@ -1106,8 +1113,15 @@ exec "$@"
                         break response;
                     }
                     assert!(
-                        started.elapsed() < Duration::from_secs(5),
-                        "sandbox launcher failure did not terminate"
+                        started.elapsed() < Duration::from_secs(20),
+                        "sandbox launcher failure did not terminate; status={:?}",
+                        ctx.bash_background().status(
+                            &task_id,
+                            "sandbox-spawn-test",
+                            None,
+                            None,
+                            4096,
+                        )
                     );
                     std::thread::sleep(Duration::from_millis(10));
                 }

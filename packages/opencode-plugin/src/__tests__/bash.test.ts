@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, mock, test } from "bun:test";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { BridgePool, BridgeRequestOptions } from "@cortexkit/aft-bridge";
@@ -43,6 +43,39 @@ type SendCall = {
   options?: BridgeRequestOptions;
 };
 type ProgressHandler = (frame: { text: string }) => void;
+
+async function addArtifactBytes(
+  command: string,
+  params: Record<string, unknown>,
+  response: BridgeResponse,
+): Promise<BridgeResponse> {
+  if (command !== "bash_status" || response.success === false) return response;
+  const data = { ...response };
+  const attach = async (
+    pathKey: string,
+    offsetKey: string,
+    chunkKey: string,
+    nextKey: string,
+    rawKey?: string,
+  ) => {
+    const path = data[pathKey];
+    if (typeof path !== "string") return;
+    const bytes = await readFile(path);
+    const offset = Math.max(0, Number(params[offsetKey] ?? 0));
+    data[chunkKey] = bytes.subarray(offset).toString("base64");
+    data[nextKey] = bytes.length;
+    if (rawKey && (params.output_mode === "raw" || params.output_mode === "both")) {
+      data[rawKey] = bytes.toString("utf8");
+    }
+  };
+  if (data.mode === "pty") {
+    await attach("output_path", "output_offset", "output_chunk_base64", "output_next_offset", "pty_raw");
+  } else {
+    await attach("output_path", "output_offset", "output_chunk_base64", "output_next_offset");
+    await attach("stderr_path", "stderr_offset", "stderr_chunk_base64", "stderr_next_offset");
+  }
+  return data;
+}
 type SafeParseSchema = { safeParse: (value: unknown) => { success: boolean } };
 
 function createMockClient(): any {
@@ -795,7 +828,7 @@ describe("bash_status tool", () => {
         options?: BridgeRequestOptions,
       ) => {
         calls.push({ cmd, params, options });
-        return await sendImpl(cmd, params, options);
+        return addArtifactBytes(cmd, params, await sendImpl(cmd, params, options));
       },
     };
     const pool = { getBridge: () => bridge } as unknown as BridgePool;

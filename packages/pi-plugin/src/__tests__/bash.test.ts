@@ -10,7 +10,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
@@ -27,6 +27,39 @@ import {
 import type { PluginContext } from "../types.js";
 
 let projectRoot: string;
+
+async function addArtifactBytes(
+  command: string,
+  params: Record<string, unknown>,
+  response: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (command !== "bash_status" || response.success === false) return response;
+  const data = { ...response };
+  const attach = async (
+    pathKey: string,
+    offsetKey: string,
+    chunkKey: string,
+    nextKey: string,
+    rawKey?: string,
+  ) => {
+    const path = data[pathKey];
+    if (typeof path !== "string") return;
+    const bytes = await readFile(path);
+    const offset = Math.max(0, Number(params[offsetKey] ?? 0));
+    data[chunkKey] = bytes.subarray(offset).toString("base64");
+    data[nextKey] = bytes.length;
+    if (rawKey && (params.output_mode === "raw" || params.output_mode === "both")) {
+      data[rawKey] = bytes.toString("utf8");
+    }
+  };
+  if (data.mode === "pty") {
+    await attach("output_path", "output_offset", "output_chunk_base64", "output_next_offset", "pty_raw");
+  } else {
+    await attach("output_path", "output_offset", "output_chunk_base64", "output_next_offset");
+    await attach("stderr_path", "stderr_offset", "stderr_chunk_base64", "stderr_next_offset");
+  }
+  return data;
+}
 
 beforeAll(() => {
   projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
@@ -98,7 +131,8 @@ function makeTrackableMockBridge(response: Record<string, unknown> = {}): {
   const bridge = {
     send: async (...args: unknown[]) => {
       calls.push(args);
-      return { success: true, ...response };
+      const [command, params = {}] = args as [string, Record<string, unknown>];
+      return addArtifactBytes(command, params, { success: true, ...response });
     },
   } as unknown as BinaryBridge;
   return { bridge, calls };
@@ -1055,12 +1089,12 @@ describe("bash tool adapter", () => {
               match_index_chars: 4,
             };
           }
-          return {
+          return addArtifactBytes(command, params, {
             success: true,
             status: "running",
             mode: "pipes",
             output_path: outputPath,
-          };
+          });
         },
       } as unknown as BinaryBridge;
       registerBashTool(api, makeMockContext(bridge));
@@ -1201,18 +1235,18 @@ describe("bash tool adapter", () => {
       const tools = new Map<string, MockToolDef>();
       const api = makeMockApi(tools);
       const bridge = {
-        send: async (command: string) => {
+        send: async (command: string, params: Record<string, unknown> = {}) => {
           if (command === "bash_status") {
             polls += 1;
             if (polls === 2) await appendFile(spill.stdoutPath, "ADY");
           }
-          return {
+          return addArtifactBytes(command, params, {
             success: true,
             status: "running",
             mode: "pipes",
             output_path: spill.stdoutPath,
             stderr_path: spill.stderrPath,
-          };
+          });
         },
       } as unknown as BinaryBridge;
       registerBashTool(api, makeMockContext(bridge));

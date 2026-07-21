@@ -139,34 +139,17 @@ impl WindowsShell {
         cmd
     }
 
-    /// Wrap a background command so shell termination writes an exit marker.
-    /// The marker is written via temp-file + rename for PowerShell variants and
-    /// via `move /Y` for cmd.exe, matching the Unix background wrapper contract.
-    pub(crate) fn wrapper_script(&self, command: &str, exit_path: &Path) -> String {
+    /// Wrap a background command while preserving the user command's exit code.
+    /// The daemon writes the retained exit-marker handle after observing this
+    /// wrapper exit; child-side path writes are intentionally forbidden.
+    pub(crate) fn wrapper_script(&self, command: &str, _exit_path: &Path) -> String {
         match self {
             WindowsShell::Pwsh | WindowsShell::Powershell => {
-                let exit_path = powershell_single_quote(&exit_path.display().to_string());
                 let command = powershell_single_quote(command);
-                // The wrapper itself runs as a PowerShell script (invoked
-                // via `pwsh -File <path>` by `detached_shell_command_for`),
-                // so we execute the user command directly with `Invoke-Expression`
-                // instead of nesting another shell. Earlier versions wrapped
-                // the user command in an inner `& 'pwsh.exe' -Command ...`
-                // which caused PS-on-PS recursion that silently produced
-                // empty output on Windows 11 (likely a console-host issue
-                // with nested non-interactive pwsh sessions).
-                //
-                // CRITICAL: this script must contain NO literal double-quote
-                // characters. Inner `"` would break the outer-shell parse on
-                // some Windows configurations even with `-File`. We use only
-                // single-quoted strings and string concat (`+`) for any
-                // interpolation needs.
                 format!(
                     concat!(
                         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
                         "$OutputEncoding = [Console]::OutputEncoding; ",
-                        "$exitPath = {exit_path}; ",
-                        "$tmpPath = $exitPath + '.tmp.' + $PID; ",
                         "$global:LASTEXITCODE = $null; ",
                         "Invoke-Expression {command}; ",
                         "$success = $?; ",
@@ -174,54 +157,25 @@ impl WindowsShell {
                         "if ($null -ne $nativeCode) {{ $code = [int]$nativeCode }} ",
                         "elseif ($success) {{ $code = 0 }} ",
                         "else {{ $code = 1 }}; ",
-                        "[System.IO.File]::WriteAllText($tmpPath, [string]$code); ",
-                        "Move-Item -LiteralPath $tmpPath -Destination $exitPath -Force; ",
                         "exit $code"
                     ),
-                    exit_path = exit_path,
                     command = command
                 )
             }
-            WindowsShell::Cmd => {
-                // This body is written to a `.bat` file and invoked as
-                // `cmd /D /C <wrapper.bat>`. Batch files expand `%ERRORLEVEL%`
-                // per line, so we do not need `/V:ON` delayed expansion; paths
-                // containing literal `!` survive unchanged.
-                let tmp_path = format!("{}.tmp", exit_path.display());
-                format!(
-                    concat!(
-                        "@echo off\r\n",
-                        "{command}\r\n",
-                        "set CODE=%ERRORLEVEL%\r\n",
-                        "echo %CODE% > {tmp}\r\n",
-                        "move /Y {tmp} {exit} > nul\r\n",
-                        "exit /B %CODE%\r\n"
-                    ),
-                    command = command,
-                    tmp = cmd_quote(&tmp_path),
-                    exit = cmd_quote(&exit_path.display().to_string())
-                )
-            }
-            WindowsShell::Posix(shell_path) => {
-                // git-bash and friends speak POSIX, so the same temp-file +
-                // mv pattern the Unix bg-bash wrapper uses applies here. The
-                // wrapper writes the user command's $? to a temp file and
-                // atomically renames it into place so partial writes are
-                // never observable. Single-quote the user command to defang
-                // any embedded `;`, `&`, or `$` — POSIX single-quotes don't
-                // interpret anything except `'` itself, which we escape via
-                // the `'\''` close-and-reopen idiom.
-                let exit_str = exit_path.display().to_string();
-                let tmp_path = format!("{}.tmp", exit_str);
-                format!(
-                    "{} -c {} ; printf '%s' \"$?\" > {} && mv {} {}",
-                    posix_single_quote(&shell_path.display().to_string()),
-                    posix_single_quote(command),
-                    posix_single_quote(&tmp_path),
-                    posix_single_quote(&tmp_path),
-                    posix_single_quote(&exit_str),
-                )
-            }
+            WindowsShell::Cmd => format!(
+                concat!(
+                    "@echo off\r\n",
+                    "{command}\r\n",
+                    "set CODE=%ERRORLEVEL%\r\n",
+                    "exit /B %CODE%\r\n"
+                ),
+                command = command,
+            ),
+            WindowsShell::Posix(shell_path) => format!(
+                "{} -c {}",
+                posix_single_quote(&shell_path.display().to_string()),
+                posix_single_quote(command),
+            ),
         }
     }
 
@@ -455,10 +409,6 @@ fn posix_single_quote(value: &str) -> String {
 // only invoked from `bash_background::registry::detached_shell_command_for`
 // which is `#[cfg(windows)]`. The function compiles on all platforms so
 // `wrapper_script` stays cross-platform-testable.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn cmd_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
 
 #[cfg(test)]
 mod tests {
@@ -740,22 +690,18 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn posix_wrapper_writes_exit_marker_atomically() {
+    fn posix_wrapper_preserves_exit_status_without_path_writes() {
         let bash = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
         let shell = WindowsShell::Posix(bash);
         let script = shell.wrapper_script("echo hi", Path::new(r"C:\Temp\bash.exit"));
-        // The F2 wrapper invokes the resolved shell path directly (not a bare
-        // `sh -c`), so users get bash semantics (`[[ ]]`, arrays, pipefail)
-        // rather than dash. It then captures `$?` via `printf` into a tmp file
-        // and `mv`s atomically into place.
+        // Invoke the resolved shell directly so users get bash semantics while
+        // the daemon remains the sole writer of the retained exit marker.
         assert!(
             script.contains(r"'C:\Program Files\Git\bin\bash.exe' -c 'echo hi'"),
             "wrapper must invoke the resolved shell directly: {script}",
         );
-        assert!(script.contains("printf '%s' \"$?\""), "{script}");
-        assert!(script.contains("mv "), "{script}");
-        assert!(script.contains(r"C:\Temp\bash.exit"), "{script}");
-        assert!(script.contains(r"C:\Temp\bash.exit.tmp"), "{script}");
+        assert!(!script.contains("bash.exit"), "{script}");
+        assert!(!script.contains("mv "), "{script}");
     }
 
     #[test]

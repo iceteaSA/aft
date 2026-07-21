@@ -8,7 +8,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aft::bash_background::persistence::{session_tasks_dir, task_paths, write_task, PersistedTask};
+use aft::bash_background::persistence::{
+    resolve_task_layout, session_tasks_dir, task_bundle_files, task_paths, write_task,
+    PersistedTask,
+};
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -134,7 +137,19 @@ fn wait_for_status(aft: &mut AftProcess, session: &str, task_id: &str, expected:
 }
 
 fn task_file(storage: &Path, session: &str, task_id: &str, suffix: &str) -> PathBuf {
-    session_tasks_dir(storage, session).join(format!("{task_id}.{suffix}"))
+    let session_dir = session_tasks_dir(storage, session);
+    if let Ok(task) = resolve_task_layout(&session_dir, task_id) {
+        return match suffix {
+            "json" => task.paths.json,
+            "stdout" => task.paths.stdout,
+            "stderr" => task.paths.stderr,
+            "exit" => task.paths.exit,
+            "pty" => task.paths.pty,
+            "sandbox-unavailable" => task.paths.sandbox_unavailable,
+            other => task.paths.io_dir.join(other),
+        };
+    }
+    session_dir.join(format!("{task_id}.{suffix}"))
 }
 
 fn read_json(storage: &Path, session: &str, task_id: &str) -> Value {
@@ -148,7 +163,13 @@ fn registry() -> BgTaskRegistry {
 
 fn wait_for_path(path: &Path) {
     let started = Instant::now();
-    while !path.exists() {
+    let is_exit_marker = path.file_name().is_some_and(|name| name == "exit")
+        || path
+            .extension()
+            .is_some_and(|extension| extension == "exit");
+    while !path.exists()
+        || (is_exit_marker && fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0))
+    {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "timed out waiting for {}",
@@ -193,7 +214,7 @@ fn fake_task(
     status: BgTaskStatus,
     completion_delivered: bool,
 ) -> aft::bash_background::persistence::TaskPaths {
-    let paths = task_paths(storage, session, task_id);
+    let paths = task_paths(storage, session, task_id).unwrap();
     let mut metadata = PersistedTask::starting(
         task_id.to_string(),
         session.to_string(),
@@ -221,7 +242,7 @@ fn fake_task(
 fn configure_repairs_legacy_root_bash_tasks_into_harness_namespace() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let task_id = "legacy-root-task";
+    let task_id = "bash-0000000000000100";
     fake_task(
         storage.path(),
         project.path(),
@@ -424,7 +445,7 @@ fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
         .collect::<Vec<_>>();
     assert!(quarantined
         .iter()
-        .any(|name| name.starts_with("bash-legacy1.invalid.") && name.ends_with(".json")));
+        .any(|name| name.starts_with("bash-legacy1.json.invalid-")));
 }
 
 #[test]
@@ -511,7 +532,7 @@ fn gc_persisted_deletes_delivered_terminals_older_than_grace() {
             storage.path(),
             project.path(),
             SESSION,
-            &format!("bash-gc{idx}"),
+            &format!("bash-{idx:016x}"),
             BgTaskStatus::Completed,
             true,
         );
@@ -521,7 +542,13 @@ fn gc_persisted_deletes_delivered_terminals_older_than_grace() {
     let deleted = registry().maybe_gc_persisted(storage.path()).unwrap();
 
     assert_eq!(deleted, 5);
-    assert!(!session_tasks_dir(storage.path(), SESSION).exists());
+    assert!(
+        fs::read_dir(session_tasks_dir(storage.path(), SESSION))
+            .unwrap()
+            .next()
+            .is_none(),
+        "GC should leave no task entries"
+    );
 }
 
 #[test]
@@ -532,7 +559,7 @@ fn gc_persisted_keeps_undelivered_terminals() {
         storage.path(),
         project.path(),
         SESSION,
-        "bash-keep-undelivered",
+        "bash-0000000000000110",
         BgTaskStatus::Completed,
         false,
     );
@@ -550,7 +577,7 @@ fn gc_persisted_keeps_recent_files() {
         storage.path(),
         project.path(),
         SESSION,
-        "bash-keep-recent",
+        "bash-0000000000000111",
         BgTaskStatus::Completed,
         true,
     );
@@ -563,7 +590,7 @@ fn gc_persisted_keeps_recent_files() {
 #[test]
 fn gc_persisted_quarantines_corrupt_json() {
     let storage = tempfile::tempdir().unwrap();
-    let paths = task_paths(storage.path(), SESSION, "bash-corrupt");
+    let paths = task_paths(storage.path(), SESSION, "bash-0000000000000112").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(&paths.json, "not-json").unwrap();
     fs::write(&paths.stdout, "stdout").unwrap();
@@ -588,7 +615,7 @@ fn gc_persisted_quarantines_corrupt_json() {
     assert_eq!(quarantined.len(), 4);
     assert!(quarantined
         .iter()
-        .any(|name| name.starts_with("bash-corrupt.json.corrupt-")));
+        .any(|name| { name.starts_with("bash-0000000000000112.json.invalid-") }));
 }
 
 #[test]
@@ -620,7 +647,7 @@ fn maybe_gc_persisted_continues_after_per_task_deletion_failure() {
         storage.path(),
         project.path(),
         "session-fail",
-        "bash-delete-fails",
+        "bash-0000000000000113",
         BgTaskStatus::Completed,
         true,
     );
@@ -628,7 +655,7 @@ fn maybe_gc_persisted_continues_after_per_task_deletion_failure() {
         storage.path(),
         project.path(),
         "session-ok",
-        "bash-delete-succeeds",
+        "bash-0000000000000114",
         BgTaskStatus::Completed,
         true,
     );
@@ -647,12 +674,12 @@ fn maybe_gc_persisted_continues_after_per_task_deletion_failure() {
 #[test]
 fn quarantine_corrupt_json_moves_siblings_too() {
     let storage = tempfile::tempdir().unwrap();
-    let paths = task_paths(storage.path(), SESSION, "bash-corrupt-siblings");
+    let paths = task_paths(storage.path(), SESSION, "bash-0000000000000115").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(&paths.json, "not-json").unwrap();
     for extension in ["stdout", "stderr", "exit", "ps1", "bat", "sh"] {
         fs::write(
-            paths.dir.join(format!("bash-corrupt-siblings.{extension}")),
+            paths.dir.join(format!("bash-0000000000000115.{extension}")),
             extension,
         )
         .unwrap();
@@ -661,7 +688,10 @@ fn quarantine_corrupt_json_moves_siblings_too() {
 
     assert_eq!(registry().maybe_gc_persisted(storage.path()).unwrap(), 0);
 
-    assert!(!paths.dir.exists());
+    assert!(
+        task_bundle_files(&paths).iter().all(|path| !path.exists()),
+        "corrupt flat bundle siblings remained"
+    );
     let quarantine_session = storage
         .path()
         .join("bash-tasks-quarantine")
@@ -673,7 +703,7 @@ fn quarantine_corrupt_json_moves_siblings_too() {
     for extension in ["json", "stdout", "stderr", "exit", "ps1", "bat", "sh"] {
         assert!(
             quarantined.iter().any(
-                |name| name.starts_with(&format!("bash-corrupt-siblings.{extension}.corrupt-"))
+                |name| name.starts_with(&format!("bash-0000000000000115.{extension}.invalid-"))
             ),
             "missing quarantined {extension} sibling in {quarantined:?}"
         );
@@ -687,7 +717,7 @@ fn bash_status_cross_session_canonicalizes_paths() {
     let alias_project = alias_parent.path().join("project-link");
     std::os::unix::fs::symlink(canonical_project.path(), &alias_project).unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let task_id = "bash-canonical";
+    let task_id = "bash-0000000000000116";
     fake_task(
         storage.path(),
         &alias_project,
@@ -730,7 +760,9 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
             Some(project.path().to_path_buf()),
         )
         .unwrap();
-    let paths = task_paths(storage.path(), SESSION, &task_id);
+    let paths = resolve_task_layout(&session_tasks_dir(storage.path(), SESSION), &task_id)
+        .unwrap()
+        .paths;
     registry.kill(&task_id, SESSION).unwrap();
     assert_eq!(
         registry.drain_completions_for_session(Some(SESSION)).len(),
@@ -885,14 +917,14 @@ fn replay_session_recovers_killing_state() {
         storage.path(),
         project.path(),
         SESSION,
-        "bash-killing",
+        "bash-0000000000000117",
         BgTaskStatus::Killing,
         false,
     );
     fs::write(&paths.exit, "0").unwrap();
 
     registry().replay_session(storage.path(), SESSION).unwrap();
-    let replayed = read_json(storage.path(), SESSION, "bash-killing");
+    let replayed = read_json(storage.path(), SESSION, "bash-0000000000000117");
 
     assert_eq!(replayed["status"], "completed");
     assert_eq!(replayed["exit_code"], 0);
@@ -913,7 +945,7 @@ fn replay_runs_maybe_gc_persisted_once() {
         storage.path(),
         project.path(),
         SESSION,
-        "bash-after-first-gc",
+        "bash-0000000000000118",
         BgTaskStatus::Completed,
         true,
     );
@@ -1014,12 +1046,14 @@ fn exit_file_atomicity_many_short_tasks() {
         loop {
             if exit_path.exists() {
                 let content = fs::read_to_string(&exit_path).unwrap();
-                assert_eq!(
-                    content.trim(),
-                    "0",
-                    "partial exit marker for {task_id}: {content:?}"
-                );
-                break;
+                if !content.trim().is_empty() {
+                    assert_eq!(
+                        content.trim(),
+                        "0",
+                        "partial exit marker for {task_id}: {content:?}"
+                    );
+                    break;
+                }
             }
             assert!(started.elapsed() < Duration::from_secs(4));
             std::thread::sleep(Duration::from_millis(20));
@@ -1031,7 +1065,7 @@ fn exit_file_atomicity_many_short_tasks() {
 #[test]
 fn pre_spawn_metadata_starting_replays_as_failed() {
     let storage = tempfile::tempdir().unwrap();
-    let task_id = "bash-starting";
+    let task_id = "bash-0000000000000119";
     let metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
@@ -1292,7 +1326,7 @@ fn session_isolation_on_replay() {
 #[test]
 fn replay_stale_running_task_marks_killed_orphaned() {
     let storage = tempfile::tempdir().unwrap();
-    let task_id = "bash-stale";
+    let task_id = "bash-0000000000000120";
     let mut metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
@@ -1324,8 +1358,8 @@ fn replay_stale_running_task_marks_killed_orphaned() {
 fn replay_session_preserves_started_at_relative_offset() {
     let storage = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let task_id = "bash-timeout-offset";
-    let paths = task_paths(storage.path(), SESSION, task_id);
+    let task_id = "bash-0000000000000121";
+    let paths = task_paths(storage.path(), SESSION, task_id).unwrap();
     let mut metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
@@ -1372,7 +1406,7 @@ fn replay_session_preserves_started_at_relative_offset() {
 fn watchdog_marks_rehydrated_detached_task_failed_when_pid_dies_without_marker() {
     let storage = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let task_id = "bash-detached-dead-no-marker";
+    let task_id = "bash-0000000000000122";
     let mut child = Command::new("sleep")
         .arg("60")
         .stdin(Stdio::null())
@@ -1381,7 +1415,7 @@ fn watchdog_marks_rehydrated_detached_task_failed_when_pid_dies_without_marker()
         .spawn()
         .expect("spawn stand-in child process");
     let child_pid = child.id();
-    let paths = task_paths(storage.path(), SESSION, task_id);
+    let paths = task_paths(storage.path(), SESSION, task_id).unwrap();
     let mut metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
@@ -1514,7 +1548,11 @@ fn failed_spawn_cleans_up_bundle() {
         .unwrap_err();
 
     assert!(err.contains("failed to spawn background bash command"));
-    assert!(!session_tasks_dir(storage.path(), SESSION).exists());
+    let session_dir = session_tasks_dir(storage.path(), SESSION);
+    assert!(
+        !session_dir.exists() || fs::read_dir(session_dir).unwrap().next().is_none(),
+        "failed spawn left a partial task bundle"
+    );
 }
 
 #[test]
@@ -1525,7 +1563,7 @@ fn replay_completion_carries_preview() {
         storage.path(),
         project.path(),
         SESSION,
-        "bash-preview",
+        "bash-0000000000000123",
         BgTaskStatus::Completed,
         false,
     );

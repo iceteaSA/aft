@@ -1,4 +1,3 @@
-import * as fs from "node:fs/promises";
 import {
   type BridgeRequestOptions,
   coerceBoolean,
@@ -527,31 +526,19 @@ async function formatPtyStatus(
   data: Record<string, unknown>,
   requestedOutputMode: string | undefined,
 ): Promise<string> {
-  const outputPath = data.output_path as string | undefined;
-  if (!outputPath) return "\n[PTY output path unavailable]";
   const outputMode = requestedOutputMode ?? "screen";
-  const raw =
-    outputMode === "raw" || outputMode === "both" ? await fs.readFile(outputPath) : undefined;
+  const raw = typeof data.pty_raw === "string" ? data.pty_raw : "";
   let suffix = "";
   if (outputMode === "raw") {
-    suffix =
-      raw && raw.length > 0
-        ? `
-${raw.toString("utf8")}`
-        : "";
+    suffix = raw.length > 0 ? `\n${raw}` : "";
   } else if (outputMode === "both") {
-    suffix = `
-${JSON.stringify({ screen: String(data.pty_screen ?? ""), raw: raw?.toString("utf8") ?? "" }, null, 2)}`;
+    suffix = `\n${JSON.stringify({ screen: String(data.pty_screen ?? ""), raw }, null, 2)}`;
   } else {
     const screen = data.pty_screen as string | undefined;
-    suffix = screen
-      ? `
-${screen}`
-      : "";
+    suffix = screen ? `\n${screen}` : "";
   }
   if (data.status === "running") {
-    suffix += `
-PTY task is still running. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to inspect, bash_write({ taskId: "${taskId}", input: "..." }) to send keystrokes.`;
+    suffix += `\nPTY task is still running. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to inspect, bash_write({ taskId: "${taskId}", input: "..." }) to send keystrokes.`;
   }
   return suffix;
 }

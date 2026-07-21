@@ -900,3 +900,30 @@ pub(super) fn bash_denied_untrusted_response(request_id: impl Into<String>) -> R
         "remote/MCP-facade binds cannot run shell commands",
     )
 }
+
+#[cfg(test)]
+mod grant_path_tests {
+    #[test]
+    fn foreground_background_and_pty_share_submit_deferred_spawn_path() {
+        let source = include_str!("bash.rs");
+        let submit = source
+            .split("pub(super) fn submit_deferred_bash")
+            .nth(1)
+            .and_then(|source| source.split("async fn run_deferred_bash_wait").next())
+            .expect("submit_deferred_bash source");
+        assert_eq!(
+            submit.matches("dispatch(raw_req, ctx)").count(),
+            1,
+            "all bash modes must use the same authenticated dispatch"
+        );
+        let dispatch = submit.find("dispatch(raw_req, ctx)").unwrap();
+        let mode_branch = submit
+            .find("if is_pty || settings.background")
+            .expect("background/PTY branch");
+        let foreground_wait = submit
+            .find("select_foreground_wait_window_ms")
+            .expect("foreground branch");
+        assert!(dispatch < mode_branch && mode_branch < foreground_wait);
+        assert!(submit.contains("with_authenticated_principal"));
+    }
+}

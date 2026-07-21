@@ -570,6 +570,134 @@ fn webp_has_animation(bytes: &[u8]) -> bool {
     false
 }
 
+fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response {
+    let byte_size = bytes.len();
+    if let Some(media) = sniff_media(&bytes[..bytes.len().min(MEDIA_MAGIC_BYTES)]) {
+        if byte_size as u64 > MAX_FILE_READ_BYTES {
+            return media_file_too_large_response(&req.id, byte_size as u64);
+        }
+        return match media {
+            SniffedMedia::Pdf => handle_pdf_media(&req.id, bytes),
+            SniffedMedia::Image(kind) => match process_image_with_timeout(bytes, kind) {
+                Ok(image) => image_attachment_response(&req.id, image),
+                Err(reason) => media_omitted_response(&req.id, byte_size, reason),
+            },
+        };
+    }
+    if is_binary(&bytes) {
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "binary": true,
+                "complete": true,
+                "byte_size": byte_size,
+                "message": format!("Binary file ({} bytes), cannot display as text", byte_size),
+            }),
+        );
+    }
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(_) => {
+            return Response::success(
+                &req.id,
+                serde_json::json!({
+                    "binary": true,
+                    "complete": true,
+                    "byte_size": byte_size,
+                    "message": format!("Binary file ({} bytes), not valid UTF-8", byte_size),
+                }),
+            );
+        }
+    };
+    let lines = content.lines().collect::<Vec<_>>();
+    let total_lines = lines.len() as u32;
+    let limit = req
+        .params
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32)
+        .unwrap_or(DEFAULT_LIMIT);
+    let start_line = req
+        .params
+        .get("start_line")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.max(1) as u32)
+        .unwrap_or(1);
+    let end_line = req
+        .params
+        .get("end_line")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32)
+        .unwrap_or_else(|| {
+            start_line
+                .saturating_add(limit)
+                .saturating_sub(1)
+                .min(total_lines)
+        });
+    let start = (start_line.saturating_sub(1) as usize).min(lines.len());
+    let end = (end_line as usize).min(lines.len()).max(start);
+    if start >= lines.len() {
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "content": "",
+                "complete": true,
+                "total_lines": total_lines,
+                "lines_read": 0,
+                "start_line": start_line,
+                "end_line": start_line,
+                "truncated": false,
+                "byte_size": byte_size,
+            }),
+        );
+    }
+    let mut output = String::new();
+    let mut output_bytes = 0usize;
+    let mut lines_read = 0u32;
+    let mut truncated_by_size = false;
+    let width = end.to_string().len();
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let line_number = start + offset + 1;
+        let display = if line.len() > MAX_LINE_LENGTH {
+            let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
+            format!(
+                "{:>width$}: {}... (truncated)\n",
+                line_number,
+                &line[..safe_end],
+                width = width
+            )
+        } else {
+            format!("{:>width$}: {}\n", line_number, line, width = width)
+        };
+        output_bytes = output_bytes.saturating_add(display.len());
+        if output_bytes > MAX_BYTES {
+            truncated_by_size = true;
+            output.push_str(&format!(
+                "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
+                MAX_BYTES / 1024
+            ));
+            break;
+        }
+        output.push_str(&display);
+        lines_read = lines_read.saturating_add(1);
+    }
+    let actual_end = start_line + lines_read - u32::from(lines_read > 0);
+    let truncated = start > 0 || end < lines.len() || truncated_by_size;
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "content": output,
+            "complete": !truncated,
+            "total_lines": total_lines,
+            "lines_read": lines_read,
+            "start_line": start_line,
+            "end_line": actual_end,
+            "truncated": truncated,
+            "byte_size": byte_size,
+        }),
+    )
+}
+
 /// Handle a `read` request.
 ///
 /// Params:
@@ -606,6 +734,20 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(path) => path,
         Err(resp) => return resp,
     };
+
+    if let Some(result) = ctx
+        .bash_background()
+        .read_artifact_path(req.session(), path.as_path())
+    {
+        return match result {
+            Ok(bytes) => handle_registered_artifact_read(req, bytes),
+            Err(error) => Response::error(
+                &req.id,
+                "artifact_refused",
+                format!("read: task artifact refused: {error}"),
+            ),
+        };
+    }
 
     // Check existence
     if !path.exists() {

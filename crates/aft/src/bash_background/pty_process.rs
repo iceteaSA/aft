@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -15,7 +15,7 @@ use portable_pty::PtySize;
 
 use crate::sandbox_spawn::SpawnPlan;
 
-use super::persistence::{atomic_write, ExitMarker, TaskPaths};
+use super::persistence::{ExitMarker, TaskArtifact, TaskIoHandles, TaskPaths};
 use super::pty_runtime::{CompletionCoordinator, PtyRuntime};
 
 #[allow(clippy::too_many_arguments)]
@@ -30,6 +30,7 @@ pub(crate) fn spawn_pty_for_command(
     rows: u16,
     cols: u16,
     wake_tx: crossbeam_channel::Sender<()>,
+    io_handles: &mut TaskIoHandles,
 ) -> Result<PtyRuntime, String> {
     #[cfg(unix)]
     {
@@ -37,7 +38,14 @@ pub(crate) fn spawn_pty_for_command(
             .host_shell_path()
             .map(Path::to_path_buf)
             .unwrap_or_else(resolve_posix_shell);
-        let args = vec![OsString::from("-c"), OsString::from(user_command)];
+        let args = if let Some(prepared) = spawn_plan.prepared_task() {
+            vec![
+                OsString::from("-c"),
+                OsString::from(prepared.command_text()?),
+            ]
+        } else {
+            vec![OsString::from("-c"), OsString::from(user_command)]
+        };
         try_spawn_pty(
             spawn_plan,
             task_id,
@@ -50,6 +58,7 @@ pub(crate) fn spawn_pty_for_command(
             rows,
             cols,
             wake_tx,
+            io_handles,
         )
     }
     #[cfg(windows)]
@@ -85,6 +94,7 @@ pub(crate) fn spawn_pty_for_command(
                 rows,
                 cols,
                 wake_tx.clone(),
+                io_handles,
             ) {
                 Ok(runtime) => return Ok(runtime),
                 Err(error) => {
@@ -171,8 +181,9 @@ fn try_spawn_pty(
     rows: u16,
     cols: u16,
     wake_tx: crossbeam_channel::Sender<()>,
+    io_handles: &mut TaskIoHandles,
 ) -> Result<PtyRuntime, String> {
-    let command = crate::sandbox_spawn::pty_command_for_plan(
+    let (command, profile_handle) = crate::sandbox_spawn::pty_command_for_plan(
         spawn_plan,
         program,
         args,
@@ -193,6 +204,7 @@ fn try_spawn_pty(
         .slave
         .spawn_command(command)
         .map_err(|error| format!("spawn PTY command failed: {error}"))?;
+    drop(profile_handle);
     let child_pid = child.process_id();
     let killer = child.clone_killer();
     let reader = pair
@@ -214,16 +226,22 @@ fn try_spawn_pty(
     ));
 
     let writer = Arc::new(Mutex::new(writer));
+    let spill = io_handles
+        .clone_file(TaskArtifact::Pty)
+        .map_err(|error| format!("failed to clone PTY spill handle: {error}"))?;
+    let exit = io_handles
+        .clone_file(TaskArtifact::Exit)
+        .map_err(|error| format!("failed to clone PTY exit handle: {error}"))?;
     spawn_reader(
         reader,
-        paths.pty.clone(),
+        spill,
         Arc::clone(&reader_done),
         Arc::clone(&coordinator),
         Some(Arc::clone(&writer)),
     );
     spawn_waiter(
         child,
-        paths.exit.clone(),
+        exit,
         Arc::clone(&was_killed),
         Arc::clone(&exit_observed),
         Arc::clone(&coordinator),
@@ -248,20 +266,13 @@ const DSR_CARRY_OVER: usize = 3;
 
 pub(crate) fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
-    spill_path: std::path::PathBuf,
+    mut file: std::fs::File,
     reader_done: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
 ) {
     thread::spawn(move || {
         let result = (|| -> io::Result<()> {
-            if let Some(parent) = spill_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&spill_path)?;
             let mut buf = [0_u8; 8192];
             let mut dsr = DsrScanner::default();
             loop {
@@ -333,7 +344,7 @@ impl DsrScanner {
 
 pub(crate) fn spawn_waiter(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    exit_path: std::path::PathBuf,
+    mut exit_file: std::fs::File,
     was_killed: Arc<AtomicBool>,
     exit_observed: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
@@ -360,7 +371,7 @@ pub(crate) fn spawn_waiter(
             }
         };
 
-        if let Err(error) = write_exit_marker(&exit_path, &marker, &coordinator.task_id) {
+        if let Err(error) = write_exit_marker(&mut exit_file, &marker) {
             crate::slog_warn!(
                 "PTY waiter for {}:{} failed to write exit marker: {error}",
                 coordinator.session_id,
@@ -372,12 +383,18 @@ pub(crate) fn spawn_waiter(
     });
 }
 
-fn write_exit_marker(path: &Path, marker: &ExitMarker, task_id: &str) -> io::Result<()> {
+fn write_exit_marker(file: &mut File, marker: &ExitMarker) -> io::Result<()> {
+    if file.metadata()?.len() > 0 {
+        return Ok(());
+    }
     let content = match marker {
         ExitMarker::Code(code) => code.to_string(),
         ExitMarker::Killed => "killed".to_string(),
     };
-    atomic_write(path, content.as_bytes(), task_id)
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
 }
 
 // Every test in this module exercises Unix-only PTY paths (`#[cfg(unix)]`
@@ -483,6 +500,7 @@ mod tests {
     fn pty_waiter_retries_wait_on_interrupted() {
         let temp = tempfile::tempdir().unwrap();
         let exit_path = temp.path().join("task.exit");
+        let exit_file = File::create(&exit_path).unwrap();
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         let coordinator = Arc::new(CompletionCoordinator::new(
             "task".to_string(),
@@ -494,7 +512,7 @@ mod tests {
 
         spawn_waiter(
             Box::new(InterruptedOnceChild { waits: 0 }),
-            exit_path.clone(),
+            exit_file,
             was_killed,
             Arc::clone(&exit_observed),
             Arc::clone(&coordinator),

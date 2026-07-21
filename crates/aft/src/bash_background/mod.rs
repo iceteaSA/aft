@@ -15,9 +15,11 @@ pub mod watches;
 use crate::bash_permissions::PermissionAsk;
 use crate::context::AppContext;
 use crate::protocol::Response;
+#[cfg(unix)]
+use crate::sandbox_spawn::native_sandbox_enforced;
 use crate::sandbox_spawn::{
-    current_authenticated_principal, native_sandbox_enforced, resolve_sandbox_spawn,
-    HostEscalationAttempt, RequestedSandboxTier, SandboxTaskKind,
+    current_authenticated_principal, resolve_sandbox_spawn, HostEscalationAttempt,
+    RequestedSandboxTier, SandboxTaskKind,
 };
 use persistence::BgMode;
 use serde::{Deserialize, Serialize};
@@ -103,15 +105,7 @@ pub fn spawn(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         })
     });
-    let storage_dir = {
-        let config = ctx.config();
-        let root = storage_dir(config.storage_dir.as_deref());
-        config
-            .harness
-            .as_ref()
-            .map(|harness| root.join(harness.storage_segment()))
-            .unwrap_or(root)
-    };
+    let storage_dir = task_storage_dir(ctx);
     let max_running = ctx.config().max_background_bash_tasks;
     let timeout = timeout_ms.map(Duration::from_millis);
     let project_root = ctx
@@ -137,27 +131,84 @@ pub fn spawn(
     } else {
         RequestedSandboxTier::Disabled
     };
-    let task_bundle_dir = persistence::session_tasks_dir(&storage_dir, session_id);
-    if native_sandbox_enforced(ctx, &principal) {
-        if let Err(error) = std::fs::create_dir_all(&task_bundle_dir) {
-            return Response::error(
-                request_id,
-                "sandbox_unavailable",
-                format!(
-                    "native sandbox failed to create the task artifact directory: {error}; set sandbox.enabled=false to disable native sandboxing"
-                ),
-            );
+    let session_dir = persistence::session_tasks_dir(&storage_dir, session_id);
+    #[cfg(unix)]
+    let (spawn_plan, unregistered_task) = if native_sandbox_enforced(ctx, &principal)
+        && host_escalation.is_none()
+    {
+        let task = match persistence::allocate_task_layout(&storage_dir, session_id) {
+            Ok(task) => task,
+            Err(error) => {
+                return Response::error(
+                    request_id,
+                    "sandbox_unavailable",
+                    format!(
+                        "native sandbox failed to create the task artifact directory: {error}; set sandbox.enabled=false to disable native sandboxing"
+                    ),
+                );
+            }
+        };
+        let plan = resolve_sandbox_spawn(
+            ctx,
+            &principal,
+            requested_tier,
+            task_kind,
+            &task.paths.io_dir,
+            None,
+        );
+        if plan.refusal_code().is_some() {
+            (plan, Some(task))
+        } else {
+            let shell_path = resolved_shell_path(pty);
+            let root = project_root.as_deref().unwrap_or(&workdir);
+            let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);
+            match crate::sandbox_spawn::prepare_task_payload(
+                &task,
+                command.as_bytes(),
+                root,
+                &workdir,
+                &principal,
+                &shell_path,
+                &environment,
+            ) {
+                Ok(prepared) => (plan.with_prepared_task(prepared), Some(task)),
+                Err(error) => {
+                    let _ = persistence::delete_resolved_task(&task);
+                    return Response::error(
+                        request_id,
+                        "sandbox_unavailable",
+                        format!("native sandbox failed to materialize task payload: {error}"),
+                    );
+                }
+            }
         }
-    }
+    } else {
+        (
+            resolve_sandbox_spawn(
+                ctx,
+                &principal,
+                requested_tier,
+                task_kind,
+                &session_dir,
+                host_escalation.as_ref(),
+            ),
+            None,
+        )
+    };
+    #[cfg(not(unix))]
     let spawn_plan = resolve_sandbox_spawn(
         ctx,
         &principal,
         requested_tier,
         task_kind,
-        &task_bundle_dir,
+        &session_dir,
         host_escalation.as_ref(),
     );
     if let Some(code) = spawn_plan.refusal_code() {
+        #[cfg(unix)]
+        if let Some(task) = unregistered_task.as_ref() {
+            let _ = persistence::delete_resolved_task(task);
+        }
         let message = spawn_plan
             .refusal_message()
             .unwrap_or("bash process creation refused by sandbox policy");
@@ -224,10 +275,18 @@ pub fn spawn(
         }
         Err(message) if message.contains("limit exceeded") => {
             cleanup_plan.cleanup_unspawned();
+            #[cfg(unix)]
+            if let Some(task) = unregistered_task.as_ref() {
+                let _ = persistence::delete_resolved_task(task);
+            }
             Response::error(request_id, "background_task_limit_exceeded", message)
         }
         Err(message) => {
             cleanup_plan.cleanup_unspawned();
+            #[cfg(unix)]
+            if let Some(task) = unregistered_task.as_ref() {
+                let _ = persistence::delete_resolved_task(task);
+            }
             if cleanup_plan.is_native_launcher() {
                 Response::error(
                     request_id,
@@ -241,6 +300,16 @@ pub fn spawn(
             }
         }
     }
+}
+
+pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {
+    let config = ctx.config();
+    let root = storage_dir(config.storage_dir.as_deref());
+    config
+        .harness
+        .as_ref()
+        .map(|harness| root.join(harness.storage_segment()))
+        .unwrap_or(root)
 }
 
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {

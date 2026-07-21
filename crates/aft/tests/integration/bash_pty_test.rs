@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aft::bash_background::persistence::{
-    task_bundle_files, task_paths, write_task, BgMode, PersistedTask, SCHEMA_VERSION,
+    resolve_task_layout, session_tasks_dir, task_bundle_files, task_paths, write_task, BgMode,
+    PersistedTask, TaskPaths, SCHEMA_VERSION,
 };
 use aft::bash_background::pty_runtime::CompletionCoordinator;
 use aft::bash_background::{BgCompletion, BgTaskRegistry, BgTaskStatus};
@@ -13,6 +14,12 @@ const SESSION: &str = "pty-phase-1a";
 
 fn registry() -> BgTaskRegistry {
     BgTaskRegistry::new(Arc::new(Mutex::new(None)))
+}
+
+fn spawned_paths(storage: &std::path::Path, task_id: &str) -> TaskPaths {
+    resolve_task_layout(&session_tasks_dir(storage, SESSION), task_id)
+        .unwrap()
+        .paths
 }
 
 fn pty_completed_print_command(text: &str) -> String {
@@ -49,7 +56,7 @@ fn base_task(
         task.child_pid = Some(999_999);
         task.pgid = Some(999_999);
     }
-    let paths = task_paths(storage, SESSION, task_id);
+    let paths = task_paths(storage, SESSION, task_id).unwrap();
     write_task(&paths.json, &task).unwrap();
     fs::write(&paths.stdout, b"stdout").unwrap();
     fs::write(&paths.stderr, b"stderr").unwrap();
@@ -132,17 +139,24 @@ fn pty_replay_marks_killed_when_running_no_marker() {
     base_task(
         storage.path(),
         project.path(),
-        "lost",
+        "bash-0000000000000201",
         BgMode::Pty,
         BgTaskStatus::Running,
     );
 
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
-    let snapshot = registry.status("lost", SESSION, None, None, 1024).unwrap();
+    let snapshot = registry
+        .status("bash-0000000000000201", SESSION, None, None, 1024)
+        .unwrap();
     assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
     let persisted: PersistedTask = serde_json::from_str(
-        &fs::read_to_string(task_paths(storage.path(), SESSION, "lost").json).unwrap(),
+        &fs::read_to_string(
+            task_paths(storage.path(), SESSION, "bash-0000000000000201")
+                .unwrap()
+                .json,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -158,21 +172,32 @@ fn pty_replay_keeps_terminal_when_already_terminal() {
     let mut task = base_task(
         storage.path(),
         project.path(),
-        "terminal",
+        "bash-0000000000000202",
         BgMode::Pty,
         BgTaskStatus::Completed,
     );
     task.status_reason = Some("keep-me".to_string());
-    write_task(&task_paths(storage.path(), SESSION, "terminal").json, &task).unwrap();
+    write_task(
+        &task_paths(storage.path(), SESSION, "bash-0000000000000202")
+            .unwrap()
+            .json,
+        &task,
+    )
+    .unwrap();
 
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
     let snapshot = registry
-        .status("terminal", SESSION, None, None, 1024)
+        .status("bash-0000000000000202", SESSION, None, None, 1024)
         .unwrap();
     assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
     let persisted: PersistedTask = serde_json::from_str(
-        &fs::read_to_string(task_paths(storage.path(), SESSION, "terminal").json).unwrap(),
+        &fs::read_to_string(
+            task_paths(storage.path(), SESSION, "bash-0000000000000202")
+                .unwrap()
+                .json,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(persisted.status_reason.as_deref(), Some("keep-me"));
@@ -185,17 +210,17 @@ fn pty_replay_uses_exit_marker_when_present() {
     base_task(
         storage.path(),
         project.path(),
-        "marker",
+        "bash-0000000000000203",
         BgMode::Pty,
         BgTaskStatus::Running,
     );
-    let paths = task_paths(storage.path(), SESSION, "marker");
+    let paths = task_paths(storage.path(), SESSION, "bash-0000000000000203").unwrap();
     fs::write(&paths.exit, b"7").unwrap();
 
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
     let snapshot = registry
-        .status("marker", SESSION, None, None, 1024)
+        .status("bash-0000000000000203", SESSION, None, None, 1024)
         .unwrap();
     assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
     assert_eq!(snapshot.exit_code, Some(7));
@@ -205,13 +230,13 @@ fn pty_replay_uses_exit_marker_when_present() {
 fn pty_replay_accepts_schema_version_2_as_piped() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let paths = task_paths(storage.path(), SESSION, "v2-piped");
+    let paths = task_paths(storage.path(), SESSION, "bash-0000000000000204").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(
         &paths.json,
         serde_json::to_vec_pretty(&json!({
             "schema_version": 2,
-            "task_id": "v2-piped",
+            "task_id": "bash-0000000000000204",
             "session_id": SESSION,
             "command": "true",
             "workdir": project.path(),
@@ -238,7 +263,7 @@ fn pty_replay_accepts_schema_version_2_as_piped() {
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
     let snapshot = registry
-        .status("v2-piped", SESSION, None, None, 1024)
+        .status("bash-0000000000000204", SESSION, None, None, 1024)
         .unwrap();
     assert_eq!(snapshot.info.mode, BgMode::Pipes);
     assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
@@ -267,8 +292,8 @@ fn pipes_unaffected_by_pty_changes() {
         .unwrap();
     let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
     assert_eq!(snapshot.info.mode, BgMode::Pipes);
-    assert!(snapshot.output_path.unwrap().ends_with(".stdout"));
-    assert!(snapshot.stderr_path.unwrap().ends_with(".stderr"));
+    assert!(snapshot.output_path.unwrap().ends_with("stdout"));
+    assert!(snapshot.stderr_path.unwrap().ends_with("stderr"));
     assert!(snapshot.output_preview.contains("pipe-ok"));
 }
 
@@ -298,7 +323,7 @@ fn pty_waiter_writes_code_marker_on_natural_exit() {
     let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Failed);
     assert_eq!(snapshot.exit_code, Some(3));
     assert_eq!(
-        fs::read_to_string(task_paths(storage.path(), SESSION, &task_id).exit)
+        fs::read_to_string(spawned_paths(storage.path(), &task_id).exit)
             .unwrap()
             .trim(),
         "3"
@@ -394,7 +419,7 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
 #[test]
 fn pty_task_bundle_files_includes_pty_spill() {
     let storage = tempfile::tempdir().unwrap();
-    let paths = task_paths(storage.path(), SESSION, "bundle");
+    let paths = task_paths(storage.path(), SESSION, "bash-0000000000000205").unwrap();
     let files = task_bundle_files(&paths);
     assert!(files.iter().any(|path| path == &paths.pty));
 }
@@ -403,13 +428,13 @@ fn pty_task_bundle_files_includes_pty_spill() {
 fn pty_v2_task_rehydrates_then_upgrades_to_current_schema_on_next_persist() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let paths = task_paths(storage.path(), SESSION, "v2-upgrade");
+    let paths = task_paths(storage.path(), SESSION, "bash-0000000000000206").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(
         &paths.json,
         serde_json::to_vec_pretty(&json!({
             "schema_version": 2,
-            "task_id": "v2-upgrade",
+            "task_id": "bash-0000000000000206",
             "session_id": SESSION,
             "command": "true",
             "mode": "pty",
@@ -438,8 +463,9 @@ fn pty_v2_task_rehydrates_then_upgrades_to_current_schema_on_next_persist() {
     let before: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&paths.json).unwrap()).unwrap();
     assert_eq!(before["schema_version"], 2);
-    let acked = registry.ack_completions_for_session(Some(SESSION), &["v2-upgrade".to_string()]);
-    assert_eq!(acked, vec!["v2-upgrade".to_string()]);
+    let acked =
+        registry.ack_completions_for_session(Some(SESSION), &["bash-0000000000000206".to_string()]);
+    assert_eq!(acked, vec!["bash-0000000000000206".to_string()]);
     let after: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&paths.json).unwrap()).unwrap();
     assert_eq!(after["schema_version"], SCHEMA_VERSION);
@@ -499,7 +525,7 @@ fn pty_write_to_cat() {
         "cat",
         Duration::from_secs(30),
     );
-    let paths = task_paths(storage.path(), SESSION, &task_id);
+    let paths = spawned_paths(storage.path(), &task_id);
 
     assert_eq!(
         registry.write_pty(&task_id, SESSION, b"hello\n").unwrap(),
@@ -524,7 +550,7 @@ fn pty_write_to_cmd_dir() {
         "cmd.exe",
         Duration::from_secs(30),
     );
-    let paths = task_paths(storage.path(), SESSION, &task_id);
+    let paths = spawned_paths(storage.path(), &task_id);
 
     registry
         .write_pty(&task_id, SESSION, b"dir & exit\r\n")
@@ -562,7 +588,7 @@ fn pty_write_python_repl_round_trip() {
         python,
         Duration::from_secs(30),
     );
-    let paths = task_paths(storage.path(), SESSION, &task_id);
+    let paths = spawned_paths(storage.path(), &task_id);
 
     // Barrier: require a successful version probe before spawning because Windows app
     // execution aliases start successfully but exit without Python. Then wait for the REPL
@@ -813,7 +839,7 @@ fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
 
     registry.kill(&task_id, SESSION).unwrap();
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
-    let marker = fs::read_to_string(task_paths(storage.path(), SESSION, &task_id).exit).unwrap();
+    let marker = fs::read_to_string(spawned_paths(storage.path(), &task_id).exit).unwrap();
     assert_eq!(marker.trim(), "killed");
 }
 
@@ -884,7 +910,7 @@ fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
     assert_eq!(snapshot.info.mode, BgMode::Pty);
     assert_eq!(snapshot.output_preview, "");
     assert!(!snapshot.output_truncated);
-    assert!(snapshot.output_path.unwrap().ends_with(".pty"));
+    assert!(snapshot.output_path.unwrap().ends_with("pty"));
     assert_eq!(snapshot.stderr_path, None);
 }
 

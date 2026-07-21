@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use aft::bash_background::persistence::{
-    read_task, task_paths, write_task, PersistedTask, TaskPaths,
+    read_task, resolve_task_layout, session_tasks_dir, task_paths, write_task, PersistedTask,
+    TaskPaths,
 };
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use aft::db::bash_tasks::{upsert_bash_task, BashTaskRow};
@@ -49,6 +50,12 @@ fn registry_with_db(storage: &Path, harness: Harness) -> (BgTaskRegistry, Arc<Mu
     (registry, shared)
 }
 
+fn resolved_paths(storage: &Path, session_id: &str, task_id: &str) -> TaskPaths {
+    resolve_task_layout(&session_tasks_dir(storage, session_id), task_id)
+        .unwrap()
+        .paths
+}
+
 fn spawn_task(registry: &BgTaskRegistry, storage: &Path, project: &Path, command: &str) -> String {
     registry
         .spawn(
@@ -75,7 +82,7 @@ fn write_gc_task(
     status: BgTaskStatus,
     completion_delivered: bool,
 ) -> TaskPaths {
-    let paths = task_paths(storage, SESSION, task_id);
+    let paths = task_paths(storage, SESSION, task_id).unwrap();
     let mut metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
@@ -152,12 +159,13 @@ fn wait_for_status(
 }
 
 fn wait_for_json_status(storage: &Path, session_id: &str, task_id: &str, expected: BgTaskStatus) {
-    let paths = task_paths(storage, session_id, task_id);
     let started = Instant::now();
     loop {
-        if let Ok(task) = read_task(&paths.json) {
-            if task.status == expected {
-                return;
+        if let Ok(paths) = resolve_task_layout(&session_tasks_dir(storage, session_id), task_id) {
+            if let Ok(task) = read_task(&paths.paths.json) {
+                if task.status == expected {
+                    return;
+                }
             }
         }
         assert!(
@@ -210,7 +218,7 @@ fn fetch_row(
 }
 
 fn assert_row_matches_task(row: &DbTaskRow, task: &PersistedTask, project: &Path, storage: &Path) {
-    let paths = task_paths(storage, &task.session_id, &task.task_id);
+    let paths = resolved_paths(storage, &task.session_id, &task.task_id);
     assert_eq!(row.harness, "opencode");
     assert_eq!(row.session_id, task.session_id);
     assert_eq!(row.task_id, task.task_id);
@@ -250,7 +258,7 @@ fn bash_tasks_dual_write_spawn_writes_both_json_and_db_row() {
 
     let task_id = spawn_task(&registry, storage.path(), project.path(), "echo dual-write");
     let row = wait_for_status(&conn, "opencode", SESSION, &task_id, "completed");
-    let task = read_task(&task_paths(storage.path(), SESSION, &task_id).json).unwrap();
+    let task = read_task(&resolved_paths(storage.path(), SESSION, &task_id).json).unwrap();
 
     assert_row_matches_task(&row, &task, project.path(), storage.path());
     registry.detach();
@@ -316,7 +324,9 @@ fn bash_tasks_dual_write_db_failure_does_not_break_json_write() {
     );
     wait_for_json_status(storage.path(), SESSION, &task_id, BgTaskStatus::Completed);
 
-    assert!(task_paths(storage.path(), SESSION, &task_id).json.exists());
+    assert!(resolved_paths(storage.path(), SESSION, &task_id)
+        .json
+        .exists());
     registry.detach();
 }
 
@@ -394,7 +404,7 @@ fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
         &conn,
         storage.path(),
         project.path(),
-        "bash-gc-delivered",
+        "bash-0000000000000301",
         BgTaskStatus::Completed,
         true,
     );
@@ -402,7 +412,7 @@ fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
         &conn,
         storage.path(),
         project.path(),
-        "bash-gc-active",
+        "bash-0000000000000302",
         BgTaskStatus::Running,
         false,
     );
@@ -410,18 +420,18 @@ fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
         &conn,
         storage.path(),
         project.path(),
-        "bash-gc-undelivered",
+        "bash-0000000000000303",
         BgTaskStatus::Completed,
         false,
     );
 
     assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 1);
 
-    assert!(fetch_row(&conn, "opencode", SESSION, "bash-gc-delivered").is_none());
+    assert!(fetch_row(&conn, "opencode", SESSION, "bash-0000000000000301").is_none());
     assert!(!deletable.json.exists());
-    assert!(fetch_row(&conn, "opencode", SESSION, "bash-gc-active").is_some());
+    assert!(fetch_row(&conn, "opencode", SESSION, "bash-0000000000000302").is_some());
     assert!(active.json.exists());
-    assert!(fetch_row(&conn, "opencode", SESSION, "bash-gc-undelivered").is_some());
+    assert!(fetch_row(&conn, "opencode", SESSION, "bash-0000000000000303").is_some());
     assert!(undelivered.json.exists());
 }
 

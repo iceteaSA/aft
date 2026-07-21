@@ -1,8 +1,11 @@
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+
+use super::persistence::{
+    open_task_artifact, replace_artifact_with_tail, TaskArtifact, TaskPaths, ValidatedArtifact,
+};
 
 #[cfg(test)]
 static TAIL_READS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -38,46 +41,90 @@ impl DiskTruncation {
 }
 
 #[derive(Debug, Clone)]
-pub enum BgBuffer {
+pub(crate) enum ArtifactSource {
+    Registered {
+        paths: TaskPaths,
+        artifact: TaskArtifact,
+    },
+    #[cfg(test)]
+    Exact(PathBuf),
+}
+
+impl ArtifactSource {
+    fn open(&self) -> io::Result<ValidatedArtifact> {
+        match self {
+            Self::Registered { paths, artifact } => open_task_artifact(paths, *artifact),
+            #[cfg(test)]
+            Self::Exact(path) => super::persistence::open_unregistered_artifact(path),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Registered { paths, artifact } => paths.artifact_path(*artifact),
+            #[cfg(test)]
+            Self::Exact(path) => path,
+        }
+    }
+
+    fn replace_with_tail(&self, retain_bytes: u64) -> io::Result<u64> {
+        match self {
+            Self::Registered { paths, artifact } => {
+                replace_artifact_with_tail(paths, *artifact, retain_bytes)
+            }
+            #[cfg(test)]
+            Self::Exact(path) => {
+                super::persistence::replace_unregistered_with_tail(path, retain_bytes)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum BgBuffer {
     Pipes {
-        stdout_path: PathBuf,
-        stderr_path: PathBuf,
+        stdout: ArtifactSource,
+        stderr: ArtifactSource,
     },
     Pty {
-        combined_path: PathBuf,
+        combined: ArtifactSource,
     },
 }
 
 impl BgBuffer {
-    pub fn new(stdout_path: PathBuf, stderr_path: PathBuf) -> Self {
-        Self::Pipes {
-            stdout_path,
-            stderr_path,
+    pub fn registered(paths: &TaskPaths, mode: super::persistence::BgMode) -> Self {
+        match mode {
+            super::persistence::BgMode::Pipes => Self::Pipes {
+                stdout: ArtifactSource::Registered {
+                    paths: paths.clone(),
+                    artifact: TaskArtifact::Stdout,
+                },
+                stderr: ArtifactSource::Registered {
+                    paths: paths.clone(),
+                    artifact: TaskArtifact::Stderr,
+                },
+            },
+            super::persistence::BgMode::Pty => Self::Pty {
+                combined: ArtifactSource::Registered {
+                    paths: paths.clone(),
+                    artifact: TaskArtifact::Pty,
+                },
+            },
         }
     }
 
-    pub fn pty(combined_path: PathBuf) -> Self {
-        Self::Pty { combined_path }
-    }
-
-    pub fn stdout_path(&self) -> Option<&Path> {
-        match self {
-            Self::Pipes { stdout_path, .. } => Some(stdout_path),
-            Self::Pty { .. } => None,
+    #[cfg(test)]
+    pub fn new(stdout_path: PathBuf, stderr_path: PathBuf) -> Self {
+        Self::Pipes {
+            stdout: ArtifactSource::Exact(stdout_path),
+            stderr: ArtifactSource::Exact(stderr_path),
         }
     }
 
     pub fn stderr_path(&self) -> Option<&Path> {
         match self {
-            Self::Pipes { stderr_path, .. } => Some(stderr_path),
+            Self::Pipes { stderr, .. } => Some(stderr.path()),
             Self::Pty { .. } => None,
-        }
-    }
-
-    pub fn combined_path(&self) -> Option<&Path> {
-        match self {
-            Self::Pipes { .. } => None,
-            Self::Pty { combined_path } => Some(combined_path),
         }
     }
 
@@ -85,11 +132,8 @@ impl BgBuffer {
         #[cfg(test)]
         bump_tail_read_count(self);
         match self {
-            Self::Pipes {
-                stdout_path,
-                stderr_path,
-            } => read_two_file_tails(stdout_path, stderr_path, max_bytes),
-            Self::Pty { combined_path } => match read_file_tail(combined_path, max_bytes) {
+            Self::Pipes { stdout, stderr } => read_two_file_tails(stdout, stderr, max_bytes),
+            Self::Pty { combined } => match read_source_tail(combined, max_bytes) {
                 Ok((bytes, truncated)) => (String::from_utf8_lossy(&bytes).into_owned(), truncated),
                 Err(_) => (String::new(), false),
             },
@@ -103,58 +147,33 @@ impl BgBuffer {
         tail_bytes: usize,
     ) -> BoundedRead {
         match self {
-            Self::Pipes {
-                stdout_path,
-                stderr_path,
-            } => {
-                read_two_file_head_tail(stdout_path, stderr_path, max_bytes, head_bytes, tail_bytes)
+            Self::Pipes { stdout, stderr } => {
+                read_two_file_head_tail(stdout, stderr, max_bytes, head_bytes, tail_bytes)
             }
-            Self::Pty { combined_path } => {
-                read_single_file_head_tail(combined_path, max_bytes, head_bytes, tail_bytes)
-                    .unwrap_or_else(|_| BoundedRead {
-                        text: String::new(),
-                        truncated: false,
-                        total_bytes: 0,
-                    })
+            Self::Pty { combined } => {
+                read_single_file_head_tail(combined, max_bytes, head_bytes, tail_bytes)
+                    .unwrap_or_else(|_| empty_bounded_read())
             }
         }
     }
 
     pub fn read_stream_bounded(&self, stream: StreamKind, max_bytes: usize) -> BoundedRead {
-        let path = match (self, stream) {
-            (Self::Pipes { stdout_path, .. }, StreamKind::Stdout) => Some(stdout_path),
-            (Self::Pipes { stderr_path, .. }, StreamKind::Stderr) => Some(stderr_path),
-            (Self::Pty { combined_path }, _) => Some(combined_path),
-        };
-        path.and_then(|path| read_file_bounded(path, max_bytes).ok())
-            .unwrap_or_else(|| BoundedRead {
-                text: String::new(),
-                truncated: false,
-                total_bytes: 0,
-            })
+        self.source(stream)
+            .and_then(|source| read_source_bounded(source, max_bytes).ok())
+            .unwrap_or_else(empty_bounded_read)
     }
 
     pub fn stream_len(&self, stream: StreamKind) -> u64 {
-        let path = match (self, stream) {
-            (Self::Pipes { stdout_path, .. }, StreamKind::Stdout) => Some(stdout_path),
-            (Self::Pipes { stderr_path, .. }, StreamKind::Stderr) => Some(stderr_path),
-            (Self::Pty { combined_path }, _) => Some(combined_path),
-        };
-        path.and_then(|path| path.metadata().ok())
-            .map(|metadata| metadata.len())
+        self.source(stream)
+            .and_then(|source| source.open().and_then(|file| file.len()).ok())
             .unwrap_or(0)
     }
 
     pub fn read_for_token_count(&self, max_bytes_per_stream: usize) -> TokenCountInput {
         match self {
-            Self::Pipes {
-                stdout_path,
-                stderr_path,
-            } => {
-                // Read up to `max_bytes_per_stream` bytes per stream rather than
-                // refusing to tokenize anything when the file exceeds the cap.
-                let stdout = read_file_tail(stdout_path, max_bytes_per_stream);
-                let stderr = read_file_tail(stderr_path, max_bytes_per_stream);
+            Self::Pipes { stdout, stderr } => {
+                let stdout = read_source_tail(stdout, max_bytes_per_stream);
+                let stderr = read_source_tail(stderr, max_bytes_per_stream);
                 match (stdout, stderr) {
                     (Ok((stdout, _)), Ok((stderr, _))) => TokenCountInput::Text(combine_streams(
                         String::from_utf8_lossy(&stdout).as_ref(),
@@ -171,64 +190,46 @@ impl BgBuffer {
                     (Err(_), Err(_)) => TokenCountInput::Skipped,
                 }
             }
-            // PTY output skips token accounting because the raw terminal stream
-            // can contain control sequences produced by terminal emulation rather
-            // than the original command text.
             Self::Pty { .. } => TokenCountInput::Skipped,
         }
     }
 
-    pub fn read_stream_tail(&self, stream: StreamKind, max_bytes: usize) -> (String, bool) {
-        let path = match (self, stream) {
-            (Self::Pipes { stdout_path, .. }, StreamKind::Stdout) => Some(stdout_path),
-            (Self::Pipes { stderr_path, .. }, StreamKind::Stderr) => Some(stderr_path),
-            (Self::Pty { combined_path }, _) => Some(combined_path),
-        };
-        match path.and_then(|path| read_file_tail(path, max_bytes).ok()) {
-            Some((bytes, truncated)) => (String::from_utf8_lossy(&bytes).into_owned(), truncated),
-            None => (String::new(), false),
-        }
-    }
-
-    /// Path to the primary output spill file.
     pub fn output_path(&self) -> Option<PathBuf> {
         match self {
-            Self::Pipes { stdout_path, .. } => Some(stdout_path.clone()),
-            Self::Pty { combined_path } => Some(combined_path.clone()),
+            Self::Pipes { stdout, .. } => Some(stdout.path().to_path_buf()),
+            Self::Pty { combined } => Some(combined.path().to_path_buf()),
         }
     }
 
     pub fn enforce_terminal_cap(&mut self) -> DiskTruncation {
         match self {
-            Self::Pipes {
-                stdout_path,
-                stderr_path,
-            } => DiskTruncation {
-                stdout_prefix_bytes: truncate_front(stdout_path, DISK_LIMIT_BYTES).unwrap_or(0),
-                stderr_prefix_bytes: truncate_front(stderr_path, DISK_LIMIT_BYTES).unwrap_or(0),
+            Self::Pipes { stdout, stderr } => DiskTruncation {
+                stdout_prefix_bytes: stdout.replace_with_tail(DISK_LIMIT_BYTES).unwrap_or(0),
+                stderr_prefix_bytes: stderr.replace_with_tail(DISK_LIMIT_BYTES).unwrap_or(0),
                 combined_prefix_bytes: 0,
             },
-            Self::Pty { combined_path } => DiskTruncation {
+            Self::Pty { combined } => DiskTruncation {
                 stdout_prefix_bytes: 0,
                 stderr_prefix_bytes: 0,
-                combined_prefix_bytes: truncate_front(combined_path, DISK_LIMIT_BYTES).unwrap_or(0),
+                combined_prefix_bytes: combined.replace_with_tail(DISK_LIMIT_BYTES).unwrap_or(0),
             },
         }
     }
 
-    pub fn cleanup(&self) {
-        match self {
-            Self::Pipes {
-                stdout_path,
-                stderr_path,
-            } => {
-                let _ = fs::remove_file(stdout_path);
-                let _ = fs::remove_file(stderr_path);
-            }
-            Self::Pty { combined_path } => {
-                let _ = fs::remove_file(combined_path);
-            }
+    fn source(&self, stream: StreamKind) -> Option<&ArtifactSource> {
+        match (self, stream) {
+            (Self::Pipes { stdout, .. }, StreamKind::Stdout) => Some(stdout),
+            (Self::Pipes { stderr, .. }, StreamKind::Stderr) => Some(stderr),
+            (Self::Pty { combined }, _) => Some(combined),
         }
+    }
+}
+
+fn empty_bounded_read() -> BoundedRead {
+    BoundedRead {
+        text: String::new(),
+        truncated: false,
+        total_bytes: 0,
     }
 }
 
@@ -240,8 +241,8 @@ fn tail_reads() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
 #[cfg(test)]
 fn tail_read_key(buffer: &BgBuffer) -> &Path {
     match buffer {
-        BgBuffer::Pipes { stdout_path, .. } => stdout_path,
-        BgBuffer::Pty { combined_path } => combined_path,
+        BgBuffer::Pipes { stdout, .. } => stdout.path(),
+        BgBuffer::Pty { combined } => combined.path(),
     }
 }
 
@@ -285,34 +286,25 @@ pub fn combine_streams(stdout: &str, stderr: &str) -> String {
     }
 }
 
-pub(crate) fn read_file_tail(path: &Path, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
+fn read_source_tail(source: &ArtifactSource, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut file = source.open()?;
     if max_bytes == 0 {
-        return Ok((
-            Vec::new(),
-            path.metadata()
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false),
-        ));
+        return Ok((Vec::new(), file.len()? > 0));
     }
-
-    let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
-    let read_len = len.min(max_bytes as u64);
-    if read_len > 0 {
-        file.seek(SeekFrom::End(-(read_len as i64)))?;
-    }
-    let mut bytes = Vec::with_capacity(read_len as usize);
-    file.read_to_end(&mut bytes)?;
-    let truncated = len > max_bytes as u64;
+    let (mut bytes, truncated) = file.tail(max_bytes)?;
     if truncated {
         bytes = align_start_to_utf8(bytes);
     }
     Ok((bytes, truncated))
 }
 
-fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
-    let metadata = path.metadata()?;
-    let total_bytes = metadata.len();
+#[cfg(test)]
+pub(crate) fn read_file_tail(path: &Path, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
+    read_source_tail(&ArtifactSource::Exact(path.to_path_buf()), max_bytes)
+}
+
+fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<BoundedRead> {
+    let total_bytes = source.open()?.len()?;
     if total_bytes > max_bytes as u64 {
         if max_bytes == 0 {
             return Ok(BoundedRead {
@@ -322,13 +314,13 @@ fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
             });
         }
         return read_single_file_head_tail(
-            path,
+            source,
             max_bytes,
             max_bytes / 2,
             max_bytes - max_bytes / 2,
         );
     }
-    let bytes = fs::read(path)?;
+    let bytes = source.open()?.read_all()?;
     Ok(BoundedRead {
         text: String::from_utf8_lossy(&bytes).into_owned(),
         truncated: false,
@@ -336,27 +328,31 @@ fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
     })
 }
 
+#[cfg(test)]
+fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
+    read_source_bounded(&ArtifactSource::Exact(path.to_path_buf()), max_bytes)
+}
+
 fn read_single_file_head_tail(
-    path: &Path,
+    source: &ArtifactSource,
     max_bytes: usize,
     head_bytes: usize,
     tail_bytes: usize,
 ) -> io::Result<BoundedRead> {
-    let total_bytes = path.metadata()?.len();
+    let total_bytes = source.open()?.len()?;
     if total_bytes <= max_bytes as u64 {
-        let bytes = fs::read(path)?;
+        let bytes = source.open()?.read_all()?;
         return Ok(BoundedRead {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             truncated: false,
             total_bytes,
         });
     }
-
     let head_len = head_bytes.min(max_bytes) as u64;
     let tail_len = tail_bytes.min(max_bytes.saturating_sub(head_len as usize)) as u64;
-    let head = read_file_range(path, 0, head_len)?;
+    let head = read_source_range(source, 0, head_len)?;
     let tail_start = total_bytes.saturating_sub(tail_len);
-    let tail = read_file_range(path, tail_start, tail_len)?;
+    let tail = read_source_range(source, tail_start, tail_len)?;
     Ok(BoundedRead {
         text: join_head_tail_bytes(head, tail, total_bytes.saturating_sub(head_len + tail_len)),
         truncated: true,
@@ -365,34 +361,33 @@ fn read_single_file_head_tail(
 }
 
 fn read_two_file_head_tail(
-    first: &Path,
-    second: &Path,
+    first: &ArtifactSource,
+    second: &ArtifactSource,
     max_bytes: usize,
     head_bytes: usize,
     tail_bytes: usize,
 ) -> BoundedRead {
-    let first_len = first.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let second_len = second
-        .metadata()
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let first_len = first.open().and_then(|file| file.len()).unwrap_or(0);
+    let second_len = second.open().and_then(|file| file.len()).unwrap_or(0);
     let total_bytes = first_len.saturating_add(second_len);
-
     if total_bytes <= max_bytes as u64 {
+        let first_bytes = first
+            .open()
+            .and_then(|mut file| file.read_all())
+            .unwrap_or_default();
+        let second_bytes = second
+            .open()
+            .and_then(|mut file| file.read_all())
+            .unwrap_or_default();
         let mut bytes = Vec::with_capacity(total_bytes as usize);
-        if let Ok(first_bytes) = fs::read(first) {
-            bytes.extend_from_slice(&first_bytes);
-        }
-        if let Ok(second_bytes) = fs::read(second) {
-            bytes.extend_from_slice(&second_bytes);
-        }
+        bytes.extend_from_slice(&first_bytes);
+        bytes.extend_from_slice(&second_bytes);
         return BoundedRead {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             truncated: false,
             total_bytes,
         };
     }
-
     let head_budget = head_bytes.min(max_bytes);
     let (first_head, second_head) = split_stream_budget(first_len, second_len, head_budget);
     let tail_budget = tail_bytes.min(max_bytes.saturating_sub(first_head + second_head));
@@ -400,22 +395,12 @@ fn read_two_file_head_tail(
     let second_remaining = second_len.saturating_sub(second_head as u64);
     let (first_tail, second_tail) =
         split_stream_budget(first_remaining, second_remaining, tail_budget);
-
     let first_read =
         read_single_file_head_tail(first, first_head + first_tail, first_head, first_tail)
-            .unwrap_or_else(|_| BoundedRead {
-                text: String::new(),
-                truncated: false,
-                total_bytes: first_len,
-            });
+            .unwrap_or_else(|_| empty_bounded_read());
     let second_read =
         read_single_file_head_tail(second, second_head + second_tail, second_head, second_tail)
-            .unwrap_or_else(|_| BoundedRead {
-                text: String::new(),
-                truncated: false,
-                total_bytes: second_len,
-            });
-
+            .unwrap_or_else(|_| empty_bounded_read());
     BoundedRead {
         text: combine_streams(&first_read.text, &second_read.text),
         truncated: true,
@@ -423,16 +408,23 @@ fn read_two_file_head_tail(
     }
 }
 
-fn read_two_file_tails(first: &Path, second: &Path, max_bytes: usize) -> (String, bool) {
-    let first_len = first.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let second_len = second
-        .metadata()
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+fn read_two_file_tails(
+    first: &ArtifactSource,
+    second: &ArtifactSource,
+    max_bytes: usize,
+) -> (String, bool) {
+    let first_len = first.open().and_then(|file| file.len()).unwrap_or(0);
+    let second_len = second.open().and_then(|file| file.len()).unwrap_or(0);
     let total_bytes = first_len.saturating_add(second_len);
     if total_bytes <= max_bytes as u64 {
-        let first_bytes = fs::read(first).unwrap_or_default();
-        let second_bytes = fs::read(second).unwrap_or_default();
+        let first_bytes = first
+            .open()
+            .and_then(|mut file| file.read_all())
+            .unwrap_or_default();
+        let second_bytes = second
+            .open()
+            .and_then(|mut file| file.read_all())
+            .unwrap_or_default();
         return (
             combine_streams(
                 String::from_utf8_lossy(&first_bytes).as_ref(),
@@ -441,11 +433,10 @@ fn read_two_file_tails(first: &Path, second: &Path, max_bytes: usize) -> (String
             false,
         );
     }
-
     let (first_budget, second_budget) = split_stream_budget(first_len, second_len, max_bytes);
-    let (first_bytes, first_truncated) = read_file_tail(first, first_budget)
+    let (first_bytes, first_truncated) = read_source_tail(first, first_budget)
         .unwrap_or_else(|_| (Vec::new(), first_len > first_budget as u64));
-    let (second_bytes, second_truncated) = read_file_tail(second, second_budget)
+    let (second_bytes, second_truncated) = read_source_tail(second, second_budget)
         .unwrap_or_else(|_| (Vec::new(), second_len > second_budget as u64));
     (
         combine_streams(
@@ -483,20 +474,20 @@ fn redistribute_unused_budget(len: u64, own_budget: &mut usize, other_budget: &m
     }
 }
 
-fn read_file_range(path: &Path, start: u64, len: u64) -> io::Result<Vec<u8>> {
+fn read_source_range(source: &ArtifactSource, start: u64, len: u64) -> io::Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let mut limited = file.take(len);
-    let mut bytes = Vec::with_capacity(len as usize);
-    limited.read_to_end(&mut bytes)?;
+    let mut bytes = source.open()?.read_range(start, len)?;
     if start > 0 {
         bytes = align_start_to_utf8(bytes);
     }
-    bytes = align_end_to_utf8(bytes);
-    Ok(bytes)
+    Ok(align_end_to_utf8(bytes))
+}
+
+#[cfg(test)]
+fn read_file_range(path: &Path, start: u64, len: u64) -> io::Result<Vec<u8>> {
+    read_source_range(&ArtifactSource::Exact(path.to_path_buf()), start, len)
 }
 
 fn join_head_tail_bytes(head: Vec<u8>, tail: Vec<u8>, truncated_bytes: u64) -> String {
@@ -511,31 +502,9 @@ fn join_head_tail_bytes(head: Vec<u8>, tail: Vec<u8>, truncated_bytes: u64) -> S
     output
 }
 
+#[cfg(test)]
 fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<u64> {
-    let len = match path.metadata() {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    if len <= retain_bytes {
-        return Ok(0);
-    }
-
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::End(-(retain_bytes as i64)))?;
-    let mut tail = Vec::with_capacity(retain_bytes as usize);
-    file.read_to_end(&mut tail)?;
-    let tail = align_start_to_utf8(tail);
-    let retained_bytes = tail.len() as u64;
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("out")
-    ));
-    fs::write(&tmp, tail)?;
-    fs::rename(&tmp, path)?;
-    Ok(len.saturating_sub(retained_bytes))
+    super::persistence::replace_unregistered_with_tail(path, retain_bytes)
 }
 
 fn align_start_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -585,7 +554,6 @@ fn align_end_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
     }
     bytes
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

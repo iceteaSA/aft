@@ -945,7 +945,7 @@ mod pending_response_tests {
         session_id: &str,
         task_id: &str,
     ) {
-        let paths = task_paths(storage, session_id, task_id);
+        let paths = task_paths(storage, session_id, task_id).unwrap();
         let mut metadata = PersistedTask::starting(
             task_id.to_string(),
             session_id.to_string(),
@@ -1019,12 +1019,14 @@ mod pending_response_tests {
     #[test]
     fn finalize_response_matches_inline_finalizers() {
         let session_id = "session-finalize";
-        let inline_fixture = fixture_with_completion_and_status(session_id, "task-finalize");
+        let inline_fixture =
+            fixture_with_completion_and_status(session_id, "bash-0000000000000501");
         let mut inline = Response::success("req-finalize", serde_json::json!({"value": true}));
         attach_bg_completions(&mut inline, &inline_fixture.ctx, session_id, "read");
         attach_status_bar(&mut inline, &inline_fixture.ctx, "read");
 
-        let helper_fixture = fixture_with_completion_and_status(session_id, "task-finalize");
+        let helper_fixture =
+            fixture_with_completion_and_status(session_id, "bash-0000000000000501");
         let mut helper = Response::success("req-finalize", serde_json::json!({"value": true}));
         finalize_response(&mut helper, &helper_fixture.ctx, session_id, "read");
 
@@ -1032,14 +1034,17 @@ mod pending_response_tests {
             serde_json::to_value(&helper).unwrap(),
             serde_json::to_value(&inline).unwrap()
         );
-        assert_eq!(helper.data["bg_completions"][0]["task_id"], "task-finalize");
+        assert_eq!(
+            helper.data["bg_completions"][0]["task_id"],
+            "bash-0000000000000501"
+        );
         assert_eq!(helper.data["status_bar"]["dead_code"], 3);
     }
 
     #[test]
     fn pending_registry_writes_once_after_resolution_and_finalizes() {
         let session_id = "session-registry";
-        let fixture = fixture_with_completion_and_status(session_id, "task-registry");
+        let fixture = fixture_with_completion_and_status(session_id, "bash-0000000000000502");
         let mut pending = PendingResponses::default();
         let poll_calls = Rc::new(Cell::new(0usize));
         let calls_for_poll = Rc::clone(&poll_calls);
@@ -1080,7 +1085,10 @@ mod pending_response_tests {
         let values = line_values(&writer);
         assert_eq!(values.len(), 1);
         assert_eq!(values[0]["id"], "pending-registry");
-        assert_eq!(values[0]["bg_completions"][0]["task_id"], "task-registry");
+        assert_eq!(
+            values[0]["bg_completions"][0]["task_id"],
+            "bash-0000000000000502"
+        );
         assert_eq!(values[0]["status_bar"]["dead_code"], 3);
 
         assert_eq!(

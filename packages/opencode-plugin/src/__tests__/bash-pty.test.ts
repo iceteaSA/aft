@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
@@ -20,6 +20,27 @@ afterEach(async () => {
 });
 
 type BridgeResponse = Record<string, unknown>;
+
+async function addArtifactBytes(
+  command: string,
+  params: Record<string, unknown>,
+  response: BridgeResponse,
+): Promise<BridgeResponse> {
+  if (command !== "bash_status" || response.success === false) return response;
+  const data = { ...response };
+  const path = data.output_path;
+  if (typeof path !== "string") return data;
+  const bytes = await readFile(path);
+  if (data.mode === "pty") {
+    const offset = Math.max(0, Number(params.output_offset ?? 0));
+    data.output_chunk_base64 = bytes.subarray(offset).toString("base64");
+    data.output_next_offset = bytes.length;
+    if (params.output_mode === "raw" || params.output_mode === "both") {
+      data.pty_raw = bytes.toString("utf8");
+    }
+  }
+  return data;
+}
 
 function runtime(overrides: Partial<ToolContext> = {}): ToolContext {
   return {
@@ -45,7 +66,7 @@ function ctx(
   const bridge = {
     send: async (command: string, params: Record<string, unknown> = {}) => {
       calls.push({ command, params });
-      return await send(command, params);
+      return addArtifactBytes(command, params, await send(command, params));
     },
   };
   const pluginCtx: PluginContext = {

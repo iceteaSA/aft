@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+
+use super::persistence::ValidatedArtifact;
 
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -109,14 +109,11 @@ impl WatchRegistry {
         self.watches.get(task_id).map_or(0, Vec::len)
     }
 
-    pub fn prime_file_cursor(&mut self, cursor_key: &str, path: &Path) {
+    pub fn prime_file_cursor(&mut self, cursor_key: &str, file: &ValidatedArtifact) {
         if self.scan_cursors.contains_key(cursor_key) {
             return;
         }
-        let len = File::open(path)
-            .and_then(|file| file.metadata())
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let len = file.len().unwrap_or(0);
         self.scan_cursors.insert(cursor_key.to_string(), len);
     }
 
@@ -129,21 +126,18 @@ impl WatchRegistry {
         &mut self,
         cursor_key: &str,
         task_id: &str,
-        path: &Path,
+        file: &mut ValidatedArtifact,
     ) -> Vec<PatternMatch> {
         if self.active_count(task_id) == 0 {
             return Vec::new();
         }
-        let Ok(mut file) = File::open(path) else {
-            return Vec::new();
-        };
         let cursor = self
             .scan_cursors
             .get(cursor_key)
             .copied()
             .unwrap_or_else(|| {
                 // Start at current EOF so a newly registered watch does not match old spill content.
-                file.metadata().map(|m| m.len()).unwrap_or(0)
+                file.len().unwrap_or(0)
             });
         if file.seek(SeekFrom::Start(cursor)).is_err() {
             return Vec::new();

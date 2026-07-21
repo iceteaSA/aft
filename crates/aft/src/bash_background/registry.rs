@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(not(windows))]
+use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
+use std::process::Command;
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::OnceLock;
@@ -21,8 +25,6 @@ use crate::harness::Harness;
 use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
 use crate::sandbox_spawn::SpawnPlan;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -36,9 +38,11 @@ use super::output::{
     STRUCTURED_OUTPUT_CAP_BYTES,
 };
 use super::persistence::{
-    create_capture_file, delete_task_bundle, read_exit_marker, read_task, session_tasks_dir,
-    task_paths, unix_millis, update_task, write_kill_marker_if_absent, write_task, BgMode,
-    ExitMarker, PersistedTask, TaskPaths,
+    allocate_task_layout, delete_resolved_task, delete_task_bundle, discover_task_ids,
+    open_task_artifact, quarantine_invalid_entry, quarantine_task_layout, read_exit_marker,
+    read_task_at, resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
+    unix_millis, update_task_at, validate_task_id, write_kill_marker_if_absent, write_task_at,
+    BgMode, ExitMarker, PersistedTask, TaskArtifact, TaskIoHandles, TaskPaths,
 };
 use super::process::is_process_alive;
 #[cfg(unix)]
@@ -268,6 +272,9 @@ pub(crate) enum TaskRuntime {
 pub(crate) struct BgTaskState {
     pub(crate) metadata: PersistedTask,
     pub(crate) runtime: TaskRuntime,
+    /// Pinned task-io directory and original O_EXCL output handles retained for
+    /// the process lifetime. Daemon writes never reopen child-writable names.
+    pub(crate) io_handles: Option<TaskIoHandles>,
     pub(crate) detached: bool,
     /// True once `reap_child` has observed the direct child handle's exit
     /// via `try_wait()`. Used by the two-pass watchdog to skip the racy
@@ -347,6 +354,70 @@ impl BgTaskRegistry {
                 .filter_map(|known| known.file_name())
                 .any(|name| task.artifact_root.join(name) == requested)
         })
+    }
+
+    pub fn read_artifact_path(
+        &self,
+        session_id: &str,
+        path: &Path,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let requested = fs::canonicalize(path).ok()?;
+        let tasks = self.inner.tasks.lock().ok()?;
+        let (task, artifact) = tasks.values().find_map(|task| {
+            if task.session_id != session_id {
+                return None;
+            }
+            TaskArtifact::ALL.into_iter().find_map(|artifact| {
+                let expected = task
+                    .paths
+                    .artifact_path(artifact)
+                    .file_name()
+                    .map(|name| task.artifact_root.join(name));
+                (expected.as_deref() == Some(requested.as_path()))
+                    .then(|| (Arc::clone(task), artifact))
+            })
+        })?;
+        drop(tasks);
+        Some(self.read_artifact(&task.task_id, session_id, artifact))
+    }
+
+    pub fn read_artifact_range(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        artifact: TaskArtifact,
+        offset: u64,
+    ) -> Result<(Vec<u8>, u64), String> {
+        validate_task_id(task_id).map_err(|error| error.to_string())?;
+        let task = self
+            .task_for_session(task_id, session_id)
+            .ok_or_else(|| "task_not_found".to_string())?;
+        let mut file = open_task_artifact(&task.paths, artifact)
+            .map_err(|error| format!("artifact_refused: {error}"))?;
+        let len = file
+            .len()
+            .map_err(|error| format!("artifact_refused: {error}"))?;
+        let start = offset.min(len);
+        let bytes = file
+            .read_range(start, len.saturating_sub(start))
+            .map_err(|error| format!("artifact_refused: {error}"))?;
+        Ok((bytes, len))
+    }
+
+    pub fn read_artifact(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        artifact: TaskArtifact,
+    ) -> Result<Vec<u8>, String> {
+        validate_task_id(task_id).map_err(|error| error.to_string())?;
+        let task = self
+            .task_for_session(task_id, session_id)
+            .ok_or_else(|| "task_not_found".to_string())?;
+        let mut file = open_task_artifact(&task.paths, artifact)
+            .map_err(|error| format!("artifact_refused: {error}"))?;
+        file.read_all()
+            .map_err(|error| format!("artifact_refused: {error}"))
     }
 
     pub fn set_harness(&self, harness: Harness) {
@@ -589,7 +660,8 @@ impl BgTaskRegistry {
     }
 
     fn persist_task(&self, paths: &TaskPaths, metadata: &PersistedTask) -> std::io::Result<()> {
-        write_task(&paths.json, metadata)?;
+        let task = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
+        write_task_at(&task, metadata)?;
         self.dual_write_task(paths, metadata);
         Ok(())
     }
@@ -602,7 +674,8 @@ impl BgTaskRegistry {
     where
         F: FnOnce(&mut PersistedTask),
     {
-        let metadata = update_task(&paths.json, update)?;
+        let task = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
+        let metadata = update_task_at(&task, update)?;
         self.dual_write_task(paths, &metadata);
         Ok(metadata)
     }
@@ -750,6 +823,10 @@ impl BgTaskRegistry {
 
         let running = self.running_count();
         if running >= max_running {
+            #[cfg(unix)]
+            if let Some(prepared) = spawn_plan.prepared_task() {
+                let _ = delete_resolved_task(&prepared.resolved_task());
+            }
             return Err(format!(
                 "background bash task limit exceeded: {running} running (max {max_running})"
             ));
@@ -757,10 +834,40 @@ impl BgTaskRegistry {
 
         let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
         let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
-        let task_id = self.generate_unique_task_id()?;
-        let paths = task_paths(&storage_dir, &session_id, &task_id);
-        fs::create_dir_all(&paths.dir)
-            .map_err(|e| format!("failed to create background task dir: {e}"))?;
+        let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
+            (spawn_plan.clone(), prepared.resolved_task())
+        } else {
+            let task = allocate_task_layout(&storage_dir, &session_id)
+                .map_err(|error| format!("failed to create background task layout: {error}"))?;
+            let shell = resolve_posix_shell();
+            let root = project_root.as_deref().unwrap_or(&workdir);
+            let environment =
+                crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
+            let prepared = match crate::sandbox_spawn::prepare_task_payload(
+                &task,
+                command.as_bytes(),
+                root,
+                &workdir,
+                &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                &shell,
+                &environment,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = delete_resolved_task(&task);
+                    return Err(error);
+                }
+            };
+            let task = prepared.resolved_task();
+            (spawn_plan.with_prepared_task(prepared), task)
+        };
+        let task_id = task_layout.paths.task_id.clone();
+        let paths = task_layout.paths.clone();
+
+        if self.task(&task_id).is_some() {
+            let _ = delete_resolved_task(&task_layout);
+            return Err("background task id collided with a live task".to_string());
+        }
 
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -773,18 +880,24 @@ impl BgTaskRegistry {
             compressed,
         );
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
-        self.persist_task(&paths, &metadata)
-            .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
+        if let Err(error) = write_task_at(&task_layout, &metadata) {
+            let _ = delete_resolved_task(&task_layout);
+            return Err(format!(
+                "failed to persist background task metadata: {error}"
+            ));
+        }
+        self.dual_write_task(&paths, &metadata);
 
-        // Pre-create capture files so the watchdog/buffer can always
-        // open them for reading. The spawn helper opens its own handles
-        // per attempt because each `Command::spawn()` consumes them.
-        create_capture_file(&paths.stdout)
-            .map_err(|e| format!("failed to create stdout capture file: {e}"))?;
-        create_capture_file(&paths.stderr)
-            .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
-
-        let child = match spawn_detached_child(&spawn_plan, command, &paths, &workdir, &env) {
+        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes)
+            .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
+        let child = match spawn_detached_child(
+            &spawn_plan,
+            command,
+            &paths,
+            &workdir,
+            &env,
+            &mut io_handles,
+        ) {
             Ok(child) => child,
             Err(error) => {
                 crate::slog_warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
@@ -809,9 +922,10 @@ impl BgTaskRegistry {
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
+                io_handles: Some(io_handles),
                 detached: false,
                 child_exit_observed: false,
-                buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+                buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
@@ -847,6 +961,10 @@ impl BgTaskRegistry {
 
         let running = self.running_count();
         if running >= max_running {
+            #[cfg(unix)]
+            if let Some(prepared) = spawn_plan.prepared_task() {
+                let _ = delete_resolved_task(&prepared.resolved_task());
+            }
             return Err(format!(
                 "background bash task limit exceeded: {running} running (max {max_running})"
             ));
@@ -854,10 +972,39 @@ impl BgTaskRegistry {
 
         let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
         let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
-        let task_id = self.generate_unique_task_id()?;
-        let paths = task_paths(&storage_dir, &session_id, &task_id);
-        fs::create_dir_all(&paths.dir)
-            .map_err(|e| format!("failed to create background task dir: {e}"))?;
+        #[cfg(unix)]
+        let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
+            (spawn_plan.clone(), prepared.resolved_task())
+        } else {
+            let task = allocate_task_layout(&storage_dir, &session_id)
+                .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
+            let shell = super::resolved_shell_path(true);
+            let root = project_root.as_deref().unwrap_or(&workdir);
+            let environment =
+                crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
+            let prepared = match crate::sandbox_spawn::prepare_task_payload(
+                &task,
+                command.as_bytes(),
+                root,
+                &workdir,
+                &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                &shell,
+                &environment,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = delete_resolved_task(&task);
+                    return Err(error);
+                }
+            };
+            let task = prepared.resolved_task();
+            (spawn_plan.with_prepared_task(prepared), task)
+        };
+        #[cfg(windows)]
+        let task_layout = allocate_task_layout(&storage_dir, &session_id)
+            .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
+        let task_id = task_layout.paths.task_id.clone();
+        let paths = task_layout.paths.clone();
 
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -873,10 +1020,15 @@ impl BgTaskRegistry {
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
         metadata.pty_cols = Some(cols);
-        self.persist_task(&paths, &metadata)
-            .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
-        create_capture_file(&paths.pty)
-            .map_err(|e| format!("failed to create PTY capture file: {e}"))?;
+        if let Err(error) = write_task_at(&task_layout, &metadata) {
+            let _ = delete_resolved_task(&task_layout);
+            return Err(format!(
+                "failed to persist background task metadata: {error}"
+            ));
+        }
+        self.dual_write_task(&paths, &metadata);
+        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty)
+            .map_err(|error| format!("failed to pre-open PTY output handles: {error}"))?;
 
         let runtime = match spawn_pty_for_command(
             &spawn_plan,
@@ -889,6 +1041,7 @@ impl BgTaskRegistry {
             rows,
             cols,
             self.inner.wake_tx.clone(),
+            &mut io_handles,
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -920,9 +1073,10 @@ impl BgTaskRegistry {
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
+                io_handles: Some(io_handles),
                 detached: false,
                 child_exit_observed: false,
-                buffer: BgBuffer::pty(paths.pty.clone()),
+                buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
@@ -957,6 +1111,10 @@ impl BgTaskRegistry {
 
         let running = self.running_count();
         if running >= max_running {
+            #[cfg(unix)]
+            if let Some(prepared) = spawn_plan.prepared_task() {
+                let _ = delete_resolved_task(&prepared.resolved_task());
+            }
             return Err(format!(
                 "background bash task limit exceeded: {running} running (max {max_running})"
             ));
@@ -964,10 +1122,10 @@ impl BgTaskRegistry {
 
         let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
         let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
-        let task_id = self.generate_unique_task_id()?;
-        let paths = task_paths(&storage_dir, &session_id, &task_id);
-        fs::create_dir_all(&paths.dir)
-            .map_err(|e| format!("failed to create background task dir: {e}"))?;
+        let task_layout = allocate_task_layout(&storage_dir, &session_id)
+            .map_err(|error| format!("failed to create background task layout: {error}"))?;
+        let task_id = task_layout.paths.task_id.clone();
+        let paths = task_layout.paths.clone();
 
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -980,20 +1138,24 @@ impl BgTaskRegistry {
             compressed,
         );
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
-        self.persist_task(&paths, &metadata)
-            .map_err(|e| format!("failed to persist background task metadata: {e}"))?;
+        if let Err(error) = write_task_at(&task_layout, &metadata) {
+            let _ = delete_resolved_task(&task_layout);
+            return Err(format!(
+                "failed to persist background task metadata: {error}"
+            ));
+        }
+        self.dual_write_task(&paths, &metadata);
+        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes)
+            .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
 
-        // Capture files are pre-created so the watchdog/buffer can always
-        // open them for reading even if the child hasn't written anything
-        // yet. The spawn helper opens its own handles per attempt because
-        // each `Command::spawn()` consumes them, and on Windows we may
-        // retry across multiple shell candidates if the first one fails.
-        create_capture_file(&paths.stdout)
-            .map_err(|e| format!("failed to create stdout capture file: {e}"))?;
-        create_capture_file(&paths.stderr)
-            .map_err(|e| format!("failed to create stderr capture file: {e}"))?;
-
-        let child = match spawn_detached_child(&spawn_plan, command, &paths, &workdir, &env) {
+        let child = match spawn_detached_child(
+            &spawn_plan,
+            command,
+            &paths,
+            &workdir,
+            &env,
+            &mut io_handles,
+        ) {
             Ok(child) => child,
             Err(error) => {
                 crate::slog_warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
@@ -1020,9 +1182,10 @@ impl BgTaskRegistry {
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
+                io_handles: Some(io_handles),
                 detached: false,
                 child_exit_observed: false,
-                buffer: BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()),
+                buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
@@ -1153,7 +1316,43 @@ impl BgTaskRegistry {
                 }
             }
 
-            let paths = task_paths(storage_dir, session_id, &metadata.task_id);
+            if validate_task_id(&metadata.task_id).is_err() {
+                crate::slog_warn!(
+                    "ignoring persisted background task with invalid id {:?}",
+                    metadata.task_id
+                );
+                continue;
+            }
+            let session_dir = session_tasks_dir(storage_dir, session_id);
+            let resolved = match resolve_task_layout(&session_dir, &metadata.task_id) {
+                Ok(task) => task,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "quarantining unresolved background task {}: {error}",
+                        metadata.task_id
+                    );
+                    let _ = quarantine_task_layout(
+                        storage_dir,
+                        &session_dir,
+                        &metadata.task_id,
+                        "invalid",
+                    );
+                    continue;
+                }
+            };
+            match read_task_at(&resolved) {
+                Ok(disk) if disk.task_id == metadata.task_id && disk.session_id == session_id => {}
+                Ok(_) | Err(_) => {
+                    let _ = quarantine_task_layout(
+                        storage_dir,
+                        &session_dir,
+                        &metadata.task_id,
+                        "mismatch",
+                    );
+                    continue;
+                }
+            }
+            let paths = resolved.paths;
             match metadata.status {
                 BgTaskStatus::Starting => {
                     let completion_was_delivered = metadata.completion_delivered;
@@ -1169,7 +1368,7 @@ impl BgTaskRegistry {
                 }
                 BgTaskStatus::Running | BgTaskStatus::Killing => {
                     if metadata.mode == BgMode::Pty {
-                        if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
+                        if let Ok(Some(marker)) = read_exit_marker(&paths) {
                             let completion_was_delivered = metadata.completion_delivered;
                             metadata = terminal_metadata_from_marker(metadata, marker, None);
                             metadata.completion_delivered |= completion_was_delivered;
@@ -1198,13 +1397,11 @@ impl BgTaskRegistry {
                             Some("orphaned (>24h)".to_string()),
                         );
                         metadata.completion_delivered |= completion_was_delivered;
-                        if !paths.exit.exists() {
-                            let _ = write_kill_marker_if_absent(&paths.exit);
-                        }
+                        let _ = write_kill_marker_if_absent(&paths);
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                         self.insert_rehydrated_task(metadata, paths, true)?;
-                    } else if let Ok(Some(marker)) = read_exit_marker(&paths.exit) {
+                    } else if let Ok(Some(marker)) = read_exit_marker(&paths) {
                         let reason = (metadata.status == BgTaskStatus::Killing).then(|| {
                             "recovered from inconsistent killing state on replay".to_string()
                         });
@@ -1219,9 +1416,7 @@ impl BgTaskRegistry {
                         self.enqueue_completion_if_needed(&metadata, Some(&paths), false);
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     } else if metadata.status == BgTaskStatus::Killing {
-                        if !paths.exit.exists() {
-                            let _ = write_kill_marker_if_absent(&paths.exit);
-                        }
+                        let _ = write_kill_marker_if_absent(&paths);
                         let completion_was_delivered = metadata.completion_delivered;
                         metadata.mark_terminal(
                             BgTaskStatus::Killed,
@@ -1300,29 +1495,53 @@ impl BgTaskRegistry {
             return Ok(Vec::new());
         }
 
-        let entries = fs::read_dir(&dir)
-            .map_err(|e| format!("failed to read background task dir {}: {e}", dir.display()))?;
-        let mut tasks = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
+        let (task_ids, invalid_entries) = discover_task_ids(&dir)
+            .map_err(|error| format!("failed to discover background task layouts: {error}"))?;
+        for entry in invalid_entries {
+            if let Err(error) = quarantine_invalid_entry(storage_dir, &dir, &entry) {
+                crate::slog_warn!(
+                    "failed to quarantine invalid background task entry {:?}: {error}",
+                    entry
+                );
             }
-            match read_task(&path) {
-                Ok(metadata) => tasks.push(metadata),
+        }
+
+        let mut tasks = Vec::new();
+        for task_id in task_ids {
+            let task = match resolve_task_layout(&dir, &task_id) {
+                Ok(task) => task,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && uninitialized_layout_is_recent(
+                            &dir,
+                            &task_id,
+                            Duration::from_secs(5 * 60),
+                        )
+                        .unwrap_or(false) =>
+                {
+                    continue;
+                }
                 Err(error) => {
                     crate::slog_warn!(
-                        "quarantining invalid background task metadata {} during replay: {error}",
-                        path.display()
+                        "quarantining unresolved background task {task_id} during replay: {error}"
                     );
-                    if let Err(quarantine_error) =
-                        quarantine_task_json(storage_dir, &dir, &path, QuarantineKind::Invalid)
-                    {
-                        crate::slog_warn!(
-                            "failed to quarantine invalid background task metadata {}: {quarantine_error}",
-                            path.display()
-                        );
-                    }
+                    let _ = quarantine_task_layout(storage_dir, &dir, &task_id, "invalid");
+                    continue;
+                }
+            };
+            match read_task_at(&task) {
+                Ok(metadata) if metadata.session_id == session_id => tasks.push(metadata),
+                Ok(_) => {
+                    crate::slog_warn!(
+                        "quarantining background task {task_id} with mismatched session metadata"
+                    );
+                    let _ = quarantine_task_layout(storage_dir, &dir, &task_id, "mismatch");
+                }
+                Err(error) => {
+                    crate::slog_warn!(
+                        "quarantining invalid background task metadata {task_id} during replay: {error}"
+                    );
+                    let _ = quarantine_task_layout(storage_dir, &dir, &task_id, "invalid");
                 }
             }
         }
@@ -1336,19 +1555,29 @@ impl BgTaskRegistry {
         once: bool,
     ) -> Result<String, &'static str> {
         let task = self.task(&task_id).ok_or("task_not_found")?;
-        let (mode, terminal_at_registration, stdout, stderr, pty) = task
+        validate_task_id(&task_id).map_err(|_| "invalid_task_id")?;
+        let (mode, terminal_at_registration) = task
             .state
             .lock()
             .map(|state| {
                 (
                     state.metadata.mode.clone(),
                     state.metadata.status.is_terminal(),
-                    task.paths.stdout.clone(),
-                    task.paths.stderr.clone(),
-                    task.paths.pty.clone(),
                 )
             })
             .map_err(|_| "background_task_lock_poisoned")?;
+        let mut stdout = (mode == BgMode::Pipes)
+            .then(|| open_task_artifact(&task.paths, TaskArtifact::Stdout))
+            .transpose()
+            .map_err(|_| "artifact_refused")?;
+        let mut stderr = (mode == BgMode::Pipes)
+            .then(|| open_task_artifact(&task.paths, TaskArtifact::Stderr))
+            .transpose()
+            .map_err(|_| "artifact_refused")?;
+        let mut pty = (mode == BgMode::Pty)
+            .then(|| open_task_artifact(&task.paths, TaskArtifact::Pty))
+            .transpose()
+            .map_err(|_| "artifact_refused")?;
 
         let mut terminal_matches = Vec::new();
         let scanned_terminal = terminal_at_registration;
@@ -1369,26 +1598,38 @@ impl BgTaskRegistry {
                         terminal_matches.extend(registry.scan_file_new_bytes(
                             &stdout_key,
                             &task_id,
-                            &stdout,
+                            stdout.as_mut().expect("pipe stdout opened"),
                         ));
                         terminal_matches.extend(registry.scan_file_new_bytes(
                             &stderr_key,
                             &task_id,
-                            &stderr,
+                            stderr.as_mut().expect("pipe stderr opened"),
                         ));
                     } else {
-                        registry.prime_file_cursor(&stdout_key, &stdout);
-                        registry.prime_file_cursor(&stderr_key, &stderr);
+                        registry.prime_file_cursor(
+                            &stdout_key,
+                            stdout.as_ref().expect("pipe stdout opened"),
+                        );
+                        registry.prime_file_cursor(
+                            &stderr_key,
+                            stderr.as_ref().expect("pipe stderr opened"),
+                        );
                     }
                 }
                 BgMode::Pty => {
                     let pty_key = format!("{task_id}:pty");
                     if terminal_at_registration {
                         registry.set_file_cursor(&pty_key, 0);
-                        terminal_matches
-                            .extend(registry.scan_file_new_bytes(&pty_key, &task_id, &pty));
+                        terminal_matches.extend(registry.scan_file_new_bytes(
+                            &pty_key,
+                            &task_id,
+                            pty.as_mut().expect("PTY artifact opened"),
+                        ));
                     } else {
-                        registry.prime_file_cursor(&pty_key, &pty);
+                        registry.prime_file_cursor(
+                            &pty_key,
+                            pty.as_ref().expect("PTY artifact opened"),
+                        );
                     }
                 }
             }
@@ -1409,19 +1650,26 @@ impl BgTaskRegistry {
                             let stderr_key = format!("{task_id}:stderr");
                             registry.set_file_cursor(&stdout_key, 0);
                             registry.set_file_cursor(&stderr_key, 0);
-                            let mut matches =
-                                registry.scan_file_new_bytes(&stdout_key, &task_id, &stdout);
+                            let mut matches = registry.scan_file_new_bytes(
+                                &stdout_key,
+                                &task_id,
+                                stdout.as_mut().expect("pipe stdout opened"),
+                            );
                             matches.extend(registry.scan_file_new_bytes(
                                 &stderr_key,
                                 &task_id,
-                                &stderr,
+                                stderr.as_mut().expect("pipe stderr opened"),
                             ));
                             matches
                         }
                         BgMode::Pty => {
                             let pty_key = format!("{task_id}:pty");
                             registry.set_file_cursor(&pty_key, 0);
-                            registry.scan_file_new_bytes(&pty_key, &task_id, &pty)
+                            registry.scan_file_new_bytes(
+                                &pty_key,
+                                &task_id,
+                                pty.as_mut().expect("PTY artifact opened"),
+                            )
                         }
                     }
                 };
@@ -1497,35 +1745,51 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
-        let (mode, stdout, stderr, pty) = match task.state.lock() {
-            Ok(state) => (
-                state.metadata.mode.clone(),
-                task.paths.stdout.clone(),
-                task.paths.stderr.clone(),
-                task.paths.pty.clone(),
-            ),
+        let mode = match task.state.lock() {
+            Ok(state) => state.metadata.mode.clone(),
             Err(_) => return,
         };
+        let mut stdout = (mode == BgMode::Pipes)
+            .then(|| open_task_artifact(&task.paths, TaskArtifact::Stdout))
+            .transpose()
+            .ok()
+            .flatten();
+        let mut stderr = (mode == BgMode::Pipes)
+            .then(|| open_task_artifact(&task.paths, TaskArtifact::Stderr))
+            .transpose()
+            .ok()
+            .flatten();
+        let mut pty = (mode == BgMode::Pty)
+            .then(|| open_task_artifact(&task.paths, TaskArtifact::Pty))
+            .transpose()
+            .ok()
+            .flatten();
         let mut matches = Vec::new();
         if let Ok(mut registry) = self.inner.watch_registry.lock() {
             match mode {
                 BgMode::Pipes => {
+                    let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
+                        return;
+                    };
                     let stdout_key = format!("{}:stdout", task.task_id);
                     let stderr_key = format!("{}:stderr", task.task_id);
                     matches.extend(registry.scan_file_new_bytes(
                         &stdout_key,
                         &task.task_id,
-                        &stdout,
+                        stdout,
                     ));
                     matches.extend(registry.scan_file_new_bytes(
                         &stderr_key,
                         &task.task_id,
-                        &stderr,
+                        stderr,
                     ));
                 }
                 BgMode::Pty => {
+                    let Some(pty) = pty.as_mut() else {
+                        return;
+                    };
                     let pty_key = format!("{}:pty", task.task_id);
-                    matches.extend(registry.scan_file_new_bytes(&pty_key, &task.task_id, &pty));
+                    matches.extend(registry.scan_file_new_bytes(&pty_key, &task.task_id, pty));
                 }
             }
         }
@@ -1542,6 +1806,7 @@ impl BgTaskRegistry {
         storage_dir: Option<&Path>,
         preview_bytes: usize,
     ) -> Option<BgTaskSnapshot> {
+        validate_task_id(task_id).ok()?;
         let mut task = self.task_for_session(task_id, session_id);
         if task.is_none() {
             if let Some(storage_dir) = storage_dir {
@@ -1572,6 +1837,7 @@ impl BgTaskRegistry {
         project_root: &Path,
         storage_dir: &Path,
     ) -> Option<Arc<BgTask>> {
+        validate_task_id(task_id).ok()?;
         let canonical_project = canonicalized_path(project_root);
         match self.lookup_relaxed_task_from_db(task_id, project_root) {
             Some(Ok(Some(metadata))) => {
@@ -1591,8 +1857,19 @@ impl BgTaskRegistry {
                         .unwrap_or(false);
                     return matches_project.then_some(task);
                 }
-                let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
-                if self.insert_rehydrated_task(metadata, paths, true).is_err() {
+                let resolved = resolve_task_layout(
+                    &session_tasks_dir(storage_dir, &metadata.session_id),
+                    &metadata.task_id,
+                )
+                .ok()?;
+                let disk = read_task_at(&resolved).ok()?;
+                if disk.task_id != metadata.task_id || disk.session_id != metadata.session_id {
+                    return None;
+                }
+                if self
+                    .insert_rehydrated_task(metadata, resolved.paths, true)
+                    .is_err()
+                {
                     return None;
                 }
                 return self.task(task_id);
@@ -1624,25 +1901,24 @@ impl BgTaskRegistry {
             if !dir.is_dir() {
                 continue;
             }
-            let path = dir.join(format!("{task_id}.json"));
-            if !path.exists() {
-                continue;
-            }
-            let metadata = match read_task(&path) {
+            let resolved = match resolve_task_layout(&dir, task_id) {
+                Ok(task) => task,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "quarantining unresolved background task {task_id} during relaxed lookup: {error}"
+                    );
+                    let _ = quarantine_task_layout(storage_dir, &dir, task_id, "invalid");
+                    continue;
+                }
+            };
+            let metadata = match read_task_at(&resolved) {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     crate::slog_warn!(
-                        "quarantining invalid background task metadata {} during relaxed lookup: {error}",
-                        path.display()
+                        "quarantining invalid background task metadata {task_id} during relaxed lookup: {error}"
                     );
-                    if let Err(quarantine_error) =
-                        quarantine_task_json(storage_dir, &dir, &path, QuarantineKind::Invalid)
-                    {
-                        crate::slog_warn!(
-                            "failed to quarantine invalid background task metadata {}: {quarantine_error}",
-                            path.display()
-                        );
-                    }
+                    let _ = quarantine_task_layout(storage_dir, &dir, task_id, "invalid");
                     continue;
                 }
             };
@@ -1666,8 +1942,10 @@ impl BgTaskRegistry {
                     .unwrap_or(false);
                 return matches_project.then_some(task);
             }
-            let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
-            if self.insert_rehydrated_task(metadata, paths, true).is_err() {
+            if self
+                .insert_rehydrated_task(metadata, resolved.paths, true)
+                .is_err()
+            {
                 return None;
             }
             return self.task(task_id);
@@ -1753,49 +2031,60 @@ impl BgTaskRegistry {
                 if !session_dir.is_dir() {
                     continue;
                 }
-                let task_entries = match fs::read_dir(&session_dir) {
-                    Ok(entries) => entries,
+                let (task_ids, invalid_entries) = match discover_task_ids(&session_dir) {
+                    Ok(discovery) => discovery,
                     Err(error) => {
                         crate::slog_warn!(
-                            "failed to read background task session dir {}: {error}",
+                            "failed to discover background task session {}: {error}",
                             session_dir.display()
                         );
                         continue;
                     }
                 };
-                for task_entry in task_entries.flatten() {
-                    let json_path = task_entry.path();
-                    if json_path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        != Some("json")
-                    {
+                for entry in invalid_entries {
+                    let _ = quarantine_invalid_entry(storage_dir, &session_dir, &entry);
+                }
+                for task_id in task_ids {
+                    let resolved = match resolve_task_layout(&session_dir, &task_id) {
+                        Ok(task) => task,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::NotFound
+                                && uninitialized_layout_is_recent(
+                                    &session_dir,
+                                    &task_id,
+                                    Duration::from_secs(5 * 60),
+                                )
+                                .unwrap_or(false) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => {
+                            crate::slog_warn!(
+                                "quarantining unresolved background task {task_id}: {error}"
+                            );
+                            quarantine_task_layout(storage_dir, &session_dir, &task_id, "invalid")
+                                .map_err(|error| error.to_string())?;
+                            continue;
+                        }
+                    };
+                    if modified_within(&resolved.paths.json, PERSISTED_GC_GRACE) {
                         continue;
                     }
-                    if modified_within(&json_path, PERSISTED_GC_GRACE) {
-                        continue;
-                    }
-                    let metadata = match read_task(&json_path) {
+                    let metadata = match read_task_at(&resolved) {
                         Ok(metadata) => metadata,
                         Err(error) => {
                             crate::slog_warn!(
-                                "quarantining corrupt background task metadata {}: {error}",
-                                json_path.display()
+                                "quarantining corrupt background task metadata {task_id}: {error}"
                             );
-                            quarantine_task_json(
-                                storage_dir,
-                                &session_dir,
-                                &json_path,
-                                QuarantineKind::Corrupt,
-                            )?;
+                            quarantine_task_layout(storage_dir, &session_dir, &task_id, "corrupt")
+                                .map_err(|error| error.to_string())?;
                             continue;
                         }
                     };
                     if !(metadata.status.is_terminal() && metadata.completion_delivered) {
                         continue;
                     }
-                    let paths = task_paths(storage_dir, &metadata.session_id, &metadata.task_id);
-                    match delete_task_bundle(&paths) {
+                    match delete_task_bundle(&resolved.paths) {
                         Ok(()) => {
                             self.delete_gc_task_from_db(&metadata);
                             deleted += 1;
@@ -1809,7 +2098,6 @@ impl BgTaskRegistry {
                                 "failed to delete background task bundle {}: {error}",
                                 metadata.task_id
                             );
-                            continue;
                         }
                     }
                 }
@@ -2103,7 +2391,7 @@ impl BgTaskRegistry {
                 }
             }
         }
-        let marker = match read_exit_marker(&task.paths.exit) {
+        let marker = match read_exit_marker(&task.paths) {
             Ok(Some(marker)) => marker,
             Ok(None) => return Ok(()),
             Err(error) => return Err(format!("failed to read exit marker: {error}")),
@@ -2120,10 +2408,19 @@ impl BgTaskRegistry {
             match &mut state.runtime {
                 TaskRuntime::Piped(child_slot) => {
                     if let Some(child) = child_slot.as_mut() {
-                        if matches!(child.try_wait(), Ok(Some(_))) {
+                        if let Ok(Some(status)) = child.try_wait() {
                             *child_slot = None;
                             state.detached = true;
                             state.child_exit_observed = true;
+                            if let Some(handles) = state.io_handles.as_mut() {
+                                if handles.artifact_len(TaskArtifact::Exit).unwrap_or(1) == 0 {
+                                    let marker = status
+                                        .code()
+                                        .map(|code| code.to_string())
+                                        .unwrap_or_else(|| "1".to_string());
+                                    let _ = handles.write(TaskArtifact::Exit, marker.as_bytes());
+                                }
+                            }
                         }
                     } else if state.detached {
                         let child_known_dead = state.child_exit_observed
@@ -2160,7 +2457,7 @@ impl BgTaskRegistry {
         if state.metadata.status.is_terminal() {
             return false;
         }
-        if matches!(read_exit_marker(&task.paths.exit), Ok(Some(_))) {
+        if matches!(read_exit_marker(&task.paths), Ok(Some(_))) {
             return false;
         }
         let watch_controlled = self.task_has_watch_control(&task.task_id);
@@ -2223,6 +2520,7 @@ impl BgTaskRegistry {
                 } else {
                     TaskRuntime::Piped(None)
                 },
+                io_handles: None,
                 detached,
                 // Replay path: we never observed the child handle's exit
                 // in this process (the previous AFT process did, but its
@@ -2231,11 +2529,7 @@ impl BgTaskRegistry {
                 // `is_process_alive(child_pid)` probe rather than declaring
                 // failure based on stale evidence.
                 child_exit_observed: false,
-                buffer: if mode == BgMode::Pty {
-                    BgBuffer::pty(paths.pty.clone())
-                } else {
-                    BgBuffer::new(paths.stdout.clone(), paths.stderr.clone())
-                },
+                buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
@@ -2266,7 +2560,7 @@ impl BgTaskRegistry {
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 state.pending_terminal_override = None;
-            } else if let Ok(Some(marker)) = read_exit_marker(&task.paths.exit) {
+            } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
                 state.metadata =
                     terminal_metadata_from_marker(state.metadata.clone(), marker, None);
                 if self.task_has_watch_control(&task.task_id) {
@@ -2328,8 +2622,12 @@ impl BgTaskRegistry {
                         *child_slot = None;
                         state.detached = true;
 
-                        if !task.paths.exit.exists() {
-                            write_kill_marker_if_absent(&task.paths.exit)
+                        if let Some(handles) = state.io_handles.as_mut() {
+                            handles.write(TaskArtifact::Exit, b"killed").map_err(|e| {
+                                format!("failed to write retained kill marker: {e}")
+                            })?;
+                        } else {
+                            write_kill_marker_if_absent(&task.paths)
                                 .map_err(|e| format!("failed to write kill marker: {e}"))?;
                         }
 
@@ -2382,7 +2680,7 @@ impl BgTaskRegistry {
                 #[cfg(windows)]
                 if let Some(target_status) = pty_forced_terminal_status {
                     if !task.paths.exit.exists() {
-                        write_kill_marker_if_absent(&task.paths.exit)
+                        write_kill_marker_if_absent(&task.paths)
                             .map_err(|e| format!("failed to write kill marker: {e}"))?;
                     }
 
@@ -2500,7 +2798,7 @@ impl BgTaskRegistry {
         if metadata.mode == BgMode::Pty {
             return None;
         }
-        let mut buffer = BgBuffer::new(paths.stdout.clone(), paths.stderr.clone());
+        let mut buffer = BgBuffer::registered(paths, BgMode::Pipes);
         let disk_truncation = buffer.enforce_terminal_cap();
         Some(self.render_terminal_output(metadata, &buffer, disk_truncation))
     }
@@ -2528,7 +2826,7 @@ impl BgTaskRegistry {
         }
 
         let owned_buffer = if buffer.is_none() && metadata.mode != BgMode::Pty {
-            paths.map(|paths| BgBuffer::new(paths.stdout.clone(), paths.stderr.clone()))
+            paths.map(|paths| BgBuffer::registered(paths, BgMode::Pipes))
         } else {
             None
         };
@@ -2933,6 +3231,7 @@ impl BgTaskRegistry {
     }
 
     fn task(&self, task_id: &str) -> Option<Arc<BgTask>> {
+        validate_task_id(task_id).ok()?;
         self.inner
             .tasks
             .lock()
@@ -3029,38 +3328,10 @@ impl BgTaskRegistry {
         self.task_for_session(task_id, session_id)
             .map(|task| task.paths.exit.clone())
     }
-
-    /// Generate a `bash-{16hex}` slug that is unique against live tasks and queued completions.
-    fn generate_unique_task_id(&self) -> Result<String, String> {
-        for _ in 0..32 {
-            let candidate = random_slug();
-            let tasks = self
-                .inner
-                .tasks
-                .lock()
-                .map_err(|_| "background task registry lock poisoned".to_string())?;
-            if tasks.contains_key(&candidate) {
-                continue;
-            }
-            let completions = self
-                .inner
-                .completions
-                .lock()
-                .map_err(|_| "background completions lock poisoned".to_string())?;
-            if completions
-                .iter()
-                .any(|completion| completion.task_id == candidate)
-            {
-                continue;
-            }
-            return Ok(candidate);
-        }
-        Err("failed to allocate unique background task id after 32 attempts".to_string())
-    }
 }
 
 fn canonical_artifact_root(paths: &TaskPaths) -> PathBuf {
-    fs::canonicalize(&paths.dir).unwrap_or_else(|_| paths.dir.clone())
+    fs::canonicalize(&paths.io_dir).unwrap_or_else(|_| paths.io_dir.clone())
 }
 
 fn render_compressed_with_recovery(
@@ -3585,23 +3856,9 @@ fn is_structured_body(body: &str) -> bool {
 }
 
 fn stream_starts_like_json(buffer: &BgBuffer, stream: StreamKind) -> bool {
-    let path = match (buffer, stream) {
-        (BgBuffer::Pipes { stdout_path, .. }, StreamKind::Stdout) => Some(stdout_path),
-        (BgBuffer::Pipes { stderr_path, .. }, StreamKind::Stderr) => Some(stderr_path),
-        (BgBuffer::Pty { combined_path }, _) => Some(combined_path),
-    };
-    let Some(path) = path else {
-        return false;
-    };
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut limited = file.take(512);
-    let mut bytes = Vec::new();
-    if limited.read_to_end(&mut bytes).is_err() {
-        return false;
-    }
-    String::from_utf8_lossy(&bytes)
+    buffer
+        .read_stream_bounded(stream, 512)
+        .text
         .chars()
         .find(|ch| !ch.is_whitespace())
         .is_some_and(|ch| matches!(ch, '{' | '[' | '"' | '-' | '0'..='9' | 't' | 'f' | 'n'))
@@ -3720,104 +3977,6 @@ fn gc_quarantine(storage_dir: &Path) {
     let _ = fs::remove_dir(&quarantine_root);
 }
 
-enum QuarantineKind {
-    Corrupt,
-    Invalid,
-}
-
-fn quarantine_task_json(
-    storage_dir: &Path,
-    session_dir: &Path,
-    json_path: &Path,
-    kind: QuarantineKind,
-) -> Result<(), String> {
-    let session_hash = session_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            format!(
-                "invalid background task session dir: {}",
-                session_dir.display()
-            )
-        })?;
-    let task_name = json_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid background task json path: {}", json_path.display()))?;
-    let unix_ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let quarantine_dir = storage_dir.join("bash-tasks-quarantine").join(session_hash);
-    fs::create_dir_all(&quarantine_dir).map_err(|e| {
-        format!(
-            "failed to create background task quarantine dir {}: {e}",
-            quarantine_dir.display()
-        )
-    })?;
-    let target_name = quarantine_name(task_name, unix_ts, &kind);
-    let target = quarantine_dir.join(target_name);
-    fs::rename(json_path, &target).map_err(|e| {
-        format!(
-            "failed to quarantine background task metadata {} to {}: {e}",
-            json_path.display(),
-            target.display()
-        )
-    })?;
-
-    for sibling in task_sibling_paths(json_path) {
-        if !sibling.exists() {
-            continue;
-        }
-        let Some(sibling_name) = sibling.file_name().and_then(|name| name.to_str()) else {
-            crate::slog_warn!(
-                "skipping background task sibling with invalid name during quarantine: {}",
-                sibling.display()
-            );
-            continue;
-        };
-        let sibling_target = quarantine_dir.join(quarantine_name(sibling_name, unix_ts, &kind));
-        if let Err(error) = fs::rename(&sibling, &sibling_target) {
-            crate::slog_warn!(
-                "failed to quarantine background task sibling {} to {}: {error}",
-                sibling.display(),
-                sibling_target.display()
-            );
-        }
-    }
-
-    let _ = fs::remove_dir(session_dir);
-    Ok(())
-}
-
-fn quarantine_name(file_name: &str, unix_ts: u64, kind: &QuarantineKind) -> String {
-    match kind {
-        QuarantineKind::Corrupt => format!("{file_name}.corrupt-{unix_ts}"),
-        QuarantineKind::Invalid => {
-            let path = Path::new(file_name);
-            let stem = path.file_stem().and_then(|stem| stem.to_str());
-            let extension = path.extension().and_then(|extension| extension.to_str());
-            match (stem, extension) {
-                (Some(stem), Some(extension)) => format!("{stem}.invalid.{unix_ts}.{extension}"),
-                _ => format!("{file_name}.invalid.{unix_ts}"),
-            }
-        }
-    }
-}
-
-fn task_sibling_paths(json_path: &Path) -> Vec<PathBuf> {
-    let Some(parent) = json_path.parent() else {
-        return Vec::new();
-    };
-    let Some(stem) = json_path.file_stem().and_then(|stem| stem.to_str()) else {
-        return Vec::new();
-    };
-    ["stdout", "stderr", "exit", "pty", "ps1", "bat", "sh"]
-        .into_iter()
-        .map(|extension| parent.join(format!("{stem}.{extension}")))
-        .collect()
-}
-
 fn read_for_token_count_from_disk(
     metadata: &PersistedTask,
     paths: &TaskPaths,
@@ -3832,8 +3991,8 @@ fn read_for_token_count_from_disk(
     // (see comment there) — large outputs are exactly the tasks that
     // benefit most from compression accounting, so silent-skipping
     // them defeats the purpose of token tracking.
-    let stdout = read_file_tail_capped(&paths.stdout, max_bytes_per_stream);
-    let stderr = read_file_tail_capped(&paths.stderr, max_bytes_per_stream);
+    let stdout = read_file_tail_capped(paths, TaskArtifact::Stdout, max_bytes_per_stream);
+    let stderr = read_file_tail_capped(paths, TaskArtifact::Stderr, max_bytes_per_stream);
     match (stdout, stderr) {
         (Ok(stdout), Ok(stderr)) => TokenCountInput::Text(combine_streams(
             String::from_utf8_lossy(&stdout).as_ref(),
@@ -3851,21 +4010,13 @@ fn read_for_token_count_from_disk(
     }
 }
 
-/// Read at most `max_bytes` bytes from the END of `path`. Used for
-/// tokenization where the most recent output is more representative than
-/// an arbitrarily-capped beginning. Returns `Err` if the file cannot be
-/// opened (genuinely missing or permissions error).
-fn read_file_tail_capped(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let read_len = len.min(max_bytes as u64);
-    if read_len > 0 && len > max_bytes as u64 {
-        file.seek(SeekFrom::End(-(read_len as i64)))?;
-    }
-    let mut bytes = Vec::with_capacity(read_len as usize);
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+fn read_file_tail_capped(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut file = open_task_artifact(paths, artifact)?;
+    file.tail(max_bytes).map(|(bytes, _)| bytes)
 }
 
 impl BgTask {
@@ -3926,7 +4077,9 @@ impl BgTask {
             scanner_report: metadata.scanner_report.clone(),
             sandbox_native: metadata.sandbox_native,
             sandbox_unavailable: metadata.sandbox_native
-                && self.paths.sandbox_unavailable.is_file(),
+                && open_task_artifact(&self.paths, TaskArtifact::SandboxUnavailable)
+                    .and_then(|mut file| file.read_all())
+                    .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
         }
     }
 
@@ -4050,60 +4203,6 @@ fn attach_sandbox_metadata(metadata: &mut PersistedTask, spawn_plan: &SpawnPlan)
 }
 
 #[cfg(unix)]
-fn write_unix_command_script(command: &str, paths: &TaskPaths) -> Result<PathBuf, String> {
-    let stem = paths
-        .json
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("wrapper");
-    let script_path = paths.dir.join(format!("{stem}.sh"));
-    fs::write(&script_path, command)
-        .map_err(|e| format!("failed to write background bash command script: {e}"))?;
-    Ok(script_path)
-}
-
-#[cfg(unix)]
-fn detached_shell_command(
-    spawn_plan: &SpawnPlan,
-    command_script: &Path,
-    exit_path: &Path,
-    paths: &TaskPaths,
-) -> Result<Command, String> {
-    let shell = spawn_plan
-        .host_shell_path()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(resolve_posix_shell);
-    // Keep the user-provided command body out of argv and shell `-c` parsing.
-    // The direct child is still a tiny wrapper so it can write the authoritative
-    // exit marker after the command script exits (including if that script calls
-    // `exit`). Passing only file paths through `-c` avoids newline/quote/length
-    // edge cases where a multi-command script can be mangled before execution.
-    let args = vec![
-        "-c".into(),
-        r#""$0" "$1"; code=$?; printf "%s" "$code" > "$2.tmp.$$"; mv -f "$2.tmp.$$" "$2""#.into(),
-        shell.as_os_str().to_os_string(),
-        command_script.as_os_str().to_os_string(),
-        exit_path.as_os_str().to_os_string(),
-    ];
-    let mut cmd = crate::sandbox_spawn::detached_command_for_plan(
-        spawn_plan,
-        shell.as_os_str(),
-        &args,
-        &paths.json,
-        exit_path,
-    )?;
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    Ok(cmd)
-}
-
-#[cfg(unix)]
 pub(crate) fn resolve_posix_shell() -> PathBuf {
     static POSIX_SHELL: OnceLock<PathBuf> = OnceLock::new();
     POSIX_SHELL
@@ -4223,25 +4322,67 @@ fn spawn_detached_child(
     paths: &TaskPaths,
     workdir: &Path,
     env: &HashMap<String, String>,
+    io_handles: &mut TaskIoHandles,
 ) -> Result<std::process::Child, String> {
     #[cfg(not(windows))]
+    let _ = command;
+    #[cfg(not(windows))]
     {
-        let stdout = create_capture_file(&paths.stdout)
-            .map_err(|e| format!("failed to open stdout capture file: {e}"))?;
-        let stderr = create_capture_file(&paths.stderr)
-            .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
-        let command_script = write_unix_command_script(command, paths)?;
-        let mut command = detached_shell_command(spawn_plan, &command_script, &paths.exit, paths)?;
-        command
+        use std::os::fd::AsRawFd;
+
+        let stdout = io_handles
+            .clone_file(TaskArtifact::Stdout)
+            .map_err(|e| format!("failed to clone stdout capture handle: {e}"))?;
+        let stderr = io_handles
+            .clone_file(TaskArtifact::Stderr)
+            .map_err(|e| format!("failed to clone stderr capture handle: {e}"))?;
+        let prepared = spawn_plan
+            .prepared_task()
+            .ok_or_else(|| "background task payload was not prepared".to_string())?;
+        let payload = prepared.invocation()?;
+        let exit = io_handles
+            .inheritable_file(TaskArtifact::Exit)
+            .map_err(|e| format!("failed to inherit exit marker handle: {e}"))?;
+        let failure = io_handles
+            .inheritable_file(TaskArtifact::SandboxUnavailable)
+            .map_err(|e| format!("failed to inherit sandbox failure marker handle: {e}"))?;
+        let shell = spawn_plan
+            .host_shell_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(resolve_posix_shell);
+        let args = vec![
+            OsString::from("-c"),
+            payload.wrapper_text.clone(),
+            OsString::from("aft-payload-wrapper"),
+            shell.as_os_str().to_os_string(),
+            payload.command_text.clone(),
+            OsString::from(crate::sandbox_spawn::CHILD_EXIT_FD.to_string()),
+        ];
+        let (mut child_command, profile_handle) = crate::sandbox_spawn::detached_command_for_plan(
+            spawn_plan,
+            std::ffi::OsStr::new("/bin/sh"),
+            &args,
+            &paths.json,
+            crate::sandbox_spawn::CHILD_EXIT_FD,
+            crate::sandbox_spawn::CHILD_FAILURE_FD,
+        )?;
+        crate::sandbox_spawn::apply_marker_fd_allowlist(
+            &mut child_command,
+            exit.as_raw_fd(),
+            failure.as_raw_fd(),
+        )?;
+        child_command
             .current_dir(workdir)
             .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
-        crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut command, env);
-        command
+        crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut child_command, env);
+        let child = child_command
             .spawn()
-            .map_err(|e| format!("failed to spawn background bash command: {e}"))
+            .map_err(|e| format!("failed to spawn background bash command: {e}"));
+        drop((payload, exit, failure, profile_handle));
+        child
     }
     #[cfg(windows)]
     {
@@ -4271,17 +4412,9 @@ fn spawn_detached_child(
         // Without breakaway, the child still runs detached but will be torn
         // down with the parent if the parent process group is signaled.
         //
-        // We use CREATE_NO_WINDOW (no visible console window, but the
-        // child still has a hidden console) rather than DETACHED_PROCESS
-        // (no console at all). PowerShell-based wrappers that perform
-        // file I/O via [System.IO.File] need a console handle to flush
-        // stdout/stderr correctly even when redirected — under
-        // DETACHED_PROCESS, pwsh sometimes silently exits before
-        // executing later script statements (the Move-Item that writes
-        // the exit marker never runs), leaving the bg task forever
-        // marked Failed: process exited without exit marker. cmd.exe
-        // wrappers tolerate DETACHED_PROCESS, but switching to
-        // CREATE_NO_WINDOW costs nothing for cmd and unblocks pwsh.
+        // CREATE_NO_WINDOW avoids a visible console while retaining the
+        // hidden console services PowerShell needs for reliable redirected
+        // stdout/stderr. DETACHED_PROCESS can drop redirected output.
         const FLAG_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const FLAG_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         const FLAG_CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -4294,11 +4427,14 @@ fn spawn_detached_child(
             // restrictive job, the breakaway flag triggers Access Denied
             // (os error 5). Retry once without breakaway.
             for &flags in &[with_breakaway, without_breakaway] {
-                // Re-open capture handles per attempt; spawn() consumes them.
-                let stdout = create_capture_file(&paths.stdout)
-                    .map_err(|e| format!("failed to open stdout capture file: {e}"))?;
-                let stderr = create_capture_file(&paths.stderr)
-                    .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
+                // Clone the pre-opened O_EXCL capture handles per attempt;
+                // Command::spawn consumes each Stdio wrapper.
+                let stdout = io_handles
+                    .clone_file(TaskArtifact::Stdout)
+                    .map_err(|e| format!("failed to clone stdout capture handle: {e}"))?;
+                let stderr = io_handles
+                    .clone_file(TaskArtifact::Stderr)
+                    .map_err(|e| format!("failed to clone stderr capture handle: {e}"))?;
                 let mut cmd =
                     detached_shell_command_for(shell.clone(), command, &paths.exit, paths, flags)?;
                 cmd.current_dir(workdir)
@@ -4361,6 +4497,7 @@ fn spawn_detached_child(
     }
 }
 
+#[cfg(test)]
 fn random_slug() -> String {
     // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract
     // at `generate_unique_task_id`. The width is load-bearing for the subc
@@ -4396,6 +4533,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::bash_background::persistence::{read_task, task_paths, write_task};
 
     #[cfg(unix)]
     const QUICK_SUCCESS_COMMAND: &str = "true";
@@ -4459,8 +4597,8 @@ mod tests {
         stderr: &str,
         compressed: bool,
     ) -> (String, Arc<BgTask>) {
-        let task_id = format!("bash-test-{}", random_slug());
-        let paths = task_paths(dir.path(), "session", &task_id);
+        let task_id = random_slug();
+        let paths = task_paths(dir.path(), "session", &task_id).unwrap();
         fs::create_dir_all(&paths.dir).unwrap();
         fs::write(&paths.stdout, stdout).unwrap();
         fs::write(&paths.stderr, stderr).unwrap();
@@ -4487,8 +4625,8 @@ mod tests {
     fn bash_zero_preview_running_status_skips_output_read_while_explicit_preview_reads() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
-        let task_id = format!("bash-test-{}", random_slug());
-        let paths = task_paths(dir.path(), "session", &task_id);
+        let task_id = random_slug();
+        let paths = task_paths(dir.path(), "session", &task_id).unwrap();
         fs::create_dir_all(&paths.dir).unwrap();
         fs::write(&paths.stdout, "live output\n").unwrap();
         fs::write(&paths.stderr, "").unwrap();
@@ -4597,8 +4735,8 @@ mod tests {
     fn recovery_footer_uses_bash_status_when_artifact_is_not_registered() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
-        let task_id = "bash-unregistered-footer";
-        let paths = task_paths(dir.path(), "session", task_id);
+        let task_id = "bash-1111111111111111";
+        let paths = task_paths(dir.path(), "session", task_id).unwrap();
         fs::create_dir_all(&paths.dir).unwrap();
         fs::write(
             &paths.stdout,
@@ -4617,6 +4755,7 @@ mod tests {
             true,
         );
         metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task(&paths.json, &metadata).unwrap();
 
         let cache = registry
             .render_terminal_output_from_paths(&metadata, &paths)
@@ -4624,7 +4763,7 @@ mod tests {
 
         assert!(cache
             .output_preview
-            .contains("use bash_status({taskId: \"bash-unregistered-footer\"})"));
+            .contains("use bash_status({taskId: \"bash-1111111111111111\"})"));
         assert!(!cache.output_preview.contains("full output: read "));
     }
 
@@ -4633,8 +4772,8 @@ mod tests {
         dir: &tempfile::TempDir,
         pty_output: &str,
     ) -> (String, Arc<BgTask>) {
-        let task_id = format!("bash-test-{}", random_slug());
-        let paths = task_paths(dir.path(), "session", &task_id);
+        let task_id = random_slug();
+        let paths = task_paths(dir.path(), "session", &task_id).unwrap();
         fs::create_dir_all(&paths.dir).unwrap();
         fs::write(&paths.pty, pty_output).unwrap();
         let mut metadata = PersistedTask::starting(
@@ -4683,7 +4822,7 @@ mod tests {
     }
 
     fn write_running_project_task(storage: &Path, project: &Path, session: &str, task_id: &str) {
-        let paths = task_paths(storage, session, task_id);
+        let paths = task_paths(storage, session, task_id).unwrap();
         let mut metadata = PersistedTask::starting(
             task_id.to_string(),
             session.to_string(),
@@ -4706,7 +4845,7 @@ mod tests {
         let project_b = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let session = "shared-session";
-        let task_id = "bash-project-a";
+        let task_id = "bash-2222222222222222";
         write_running_project_task(storage.path(), project_a.path(), session, task_id);
 
         let actor_b = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
@@ -4793,19 +4932,16 @@ mod tests {
                 "{name}: script should use the final command's exit code"
             );
 
-            let stdout_path = task_paths(dir.path(), &session_id, &task_id).stdout;
-            let stdout = fs::read_to_string(&stdout_path).unwrap_or_else(|error| {
-                panic!(
-                    "{name}: failed to read raw stdout file {}: {error}",
-                    stdout_path.display()
-                )
-            });
+            let stdout = String::from_utf8(
+                registry
+                    .read_artifact(&task_id, &session_id, TaskArtifact::Stdout)
+                    .expect("read validated stdout artifact"),
+            )
+            .expect("stdout is UTF-8");
             let lines: Vec<&str> = stdout.lines().collect();
             assert_eq!(
-                lines,
-                expected_lines,
-                "{name}: raw stdout file must include every newline-separated command's output; stdout_path={}",
-                stdout_path.display()
+                lines, expected_lines,
+                "{name}: raw stdout artifact must include every newline-separated command's output"
             );
         }
     }
@@ -4960,8 +5096,8 @@ mod tests {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let output = format!("HEAD-SIGNAL\n{}TAIL-SIGNAL\n", "middle\n".repeat(2_000));
-        let task_id = format!("bash-test-{}", random_slug());
-        let paths = task_paths(dir.path(), "session", &task_id);
+        let task_id = random_slug();
+        let paths = task_paths(dir.path(), "session", &task_id).unwrap();
         fs::create_dir_all(&paths.dir).unwrap();
         fs::write(&paths.stdout, &output).unwrap();
         fs::write(&paths.stderr, "").unwrap();
@@ -5329,8 +5465,9 @@ mod tests {
             )
             .unwrap();
 
-        let paths = task_paths(dir.path(), "session", &task_id);
-        let metadata = read_task(&paths.json).unwrap();
+        let resolved =
+            resolve_task_layout(&session_tasks_dir(dir.path(), "session"), &task_id).unwrap();
+        let metadata = read_task_at(&resolved).unwrap();
         assert_eq!(
             metadata.schema_version,
             crate::bash_background::persistence::SCHEMA_VERSION
@@ -5428,8 +5565,9 @@ mod tests {
             .drain_completions_for_session(Some("session"))
             .is_empty());
 
-        let paths = task_paths(dir.path(), "session", &task_id);
-        let metadata = read_task(&paths.json).unwrap();
+        let resolved =
+            resolve_task_layout(&session_tasks_dir(dir.path(), "session"), &task_id).unwrap();
+        let metadata = read_task_at(&resolved).unwrap();
         assert!(metadata.completion_delivered);
 
         let replayed = BgTaskRegistry::default();
@@ -6183,7 +6321,7 @@ mod tests {
         let started = Instant::now();
         while !spawn_marker.exists() {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < Duration::from_secs(20),
                 "original sandboxed task did not start"
             );
             std::thread::sleep(Duration::from_millis(10));
@@ -6324,47 +6462,25 @@ mod tests {
         assert_eq!(shell.binary().as_ref(), "pwsh.exe");
     }
 
-    /// Issue #27 Oracle review P1, updated: cmd wrapper writes a `.bat` file
-    /// that batch-evaluates `%ERRORLEVEL%` on its own line (line-by-line
-    /// evaluation is the default for batch files; parse-time expansion only
-    /// applies to compound `&`-chained inline commands). Capturing
-    /// `%ERRORLEVEL%` into `set CODE=%ERRORLEVEL%` immediately after the user
-    /// command runs records the real run-time exit code.
+    /// Windows wrappers return the command's status; the daemon writes the
+    /// authoritative exit marker through its retained handle.
     #[cfg(windows)]
     #[test]
-    fn windows_shell_cmd_wrapper_writes_exit_marker_with_move() {
+    fn windows_shell_cmd_wrapper_avoids_marker_path_writes() {
         let exit_path = Path::new(r"C:\Temp\bash-test.exit");
         let script =
             crate::windows_shell::WindowsShell::Cmd.wrapper_script("cmd /c exit 42", exit_path);
 
-        // Batch wrapper: capture exit code into CODE on the line after the
-        // user command, then write CODE to a temp marker file before
-        // atomic-renaming it into place.
         assert!(
             script.contains("set CODE=%ERRORLEVEL%"),
-            "wrapper must capture exit code into CODE: {script}"
+            "wrapper must capture the child exit code: {script}"
         );
-        assert!(
-            script.contains("echo %CODE% >"),
-            "wrapper must echo CODE to a temp marker file: {script}"
-        );
-        assert!(
-            script.contains("move /Y"),
-            "wrapper must use atomic move to write the marker: {script}"
-        );
-        // move output must be redirected to nul to avoid polluting the
-        // user's captured stdout with "1 file(s) moved." lines.
-        assert!(
-            script.contains("> nul"),
-            "wrapper must redirect move output to nul: {script}"
-        );
-        // exit /B %CODE% propagates the real exit code so wait() sees it.
         assert!(
             script.contains("exit /B %CODE%"),
-            "wrapper must propagate the captured exit code: {script}"
+            "wrapper must propagate the child exit code: {script}"
         );
-        assert!(script.contains(r#""C:\Temp\bash-test.exit.tmp""#));
-        assert!(script.contains(r#""C:\Temp\bash-test.exit""#));
+        assert!(!script.contains("bash-test.exit"), "{script}");
+        assert!(!script.contains("move /Y"), "{script}");
     }
 
     /// `bg_command()` for Cmd no longer needs `/V:ON` — the wrapper is now

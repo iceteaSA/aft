@@ -98,7 +98,7 @@ mod tests {
     }
 
     fn write_running_project_task(storage: &Path, project: &Path, session: &str, task_id: &str) {
-        let paths = task_paths(storage, session, task_id);
+        let paths = task_paths(storage, session, task_id).unwrap();
         let mut metadata = PersistedTask::starting(
             task_id.to_string(),
             session.to_string(),
@@ -134,7 +134,7 @@ mod tests {
         let ctx_a = actor(&app, project_a.path(), storage.path());
         let ctx_b = actor(&app, project_b.path(), storage.path());
         let session = "shared-session";
-        let task_id = "bash-project-a";
+        let task_id = "bash-2222222222222222";
         write_running_project_task(storage.path(), project_a.path(), session, task_id);
 
         let miss = serde_json::to_value(handle(&kill_request(task_id, session), &ctx_b)).unwrap();

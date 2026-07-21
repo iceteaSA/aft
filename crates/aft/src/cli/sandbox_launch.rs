@@ -91,19 +91,20 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             return Err(SandboxLaunchError::usage("missing target command after --"));
         }
 
-        let profile = match (args.profile_fd, args.profile_file.as_deref()) {
-            (Some(fd), None) => read_profile(fd)?,
-            (None, Some(path)) => read_profile_file(path)?,
-            (None, None) => {
-                return Err(SandboxLaunchError::usage(
-                    "missing required --profile-fd <fd> or --profile-file <path>",
-                ));
-            }
-            (Some(_), Some(_)) => {
-                return Err(SandboxLaunchError::usage(
-                    "--profile-fd and --profile-file are mutually exclusive",
-                ));
-            }
+        let source_count = usize::from(args.profile_fd.is_some())
+            + usize::from(args.profile_file.is_some())
+            + usize::from(args.profile_json.is_some());
+        if source_count != 1 {
+            return Err(SandboxLaunchError::usage(
+                "exactly one of --profile-fd, --profile-file, or --profile-json is required",
+            ));
+        }
+        let profile = if let Some(fd) = args.profile_fd {
+            read_profile(fd)?
+        } else if let Some(path) = args.profile_file.as_deref() {
+            read_profile_file(path)?
+        } else {
+            read_profile_json(args.profile_json.as_deref().expect("source count checked"))?
         }
         .canonicalize_for_launch()
         .map_err(|error| SandboxLaunchError::usage(error.to_string()))?;
@@ -122,6 +123,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
 struct LaunchArgs {
     profile_fd: Option<i32>,
     profile_file: Option<PathBuf>,
+    profile_json: Option<String>,
     failure_marker: Option<PathBuf>,
     command: Vec<OsString>,
     help: bool,
@@ -174,6 +176,17 @@ impl LaunchArgs {
                 parsed.profile_file = Some(PathBuf::from(value));
                 continue;
             }
+            if arg == "--profile-json" {
+                let value = args.next().ok_or_else(|| {
+                    SandboxLaunchError::usage("--profile-json requires a JSON value")
+                })?;
+                parsed.profile_json = Some(
+                    value
+                        .into_string()
+                        .map_err(|_| SandboxLaunchError::usage("--profile-json must be UTF-8"))?,
+                );
+                continue;
+            }
             if arg == "--failure-marker" {
                 let value = args.next().ok_or_else(|| {
                     SandboxLaunchError::usage("--failure-marker requires a path value")
@@ -211,6 +224,13 @@ fn parse_fd(value: &OsString) -> Result<i32, SandboxLaunchError> {
         ));
     }
     Ok(fd)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_profile_json(value: &str) -> Result<SandboxProfile, SandboxLaunchError> {
+    serde_json::from_str(value).map_err(|error| {
+        SandboxLaunchError::usage(format!("invalid sandbox profile JSON: {error}"))
+    })
 }
 
 #[cfg(unix)]
@@ -359,6 +379,7 @@ fn print_json(value: serde_json::Value) -> Result<(), SandboxLaunchError> {
 fn print_usage() {
     println!("Usage: aft sandbox-launch --profile-fd <fd> -- <command> [args...]");
     println!("       aft sandbox-launch --profile-file <path> -- <command> [args...]");
+    println!("       aft sandbox-launch --profile-json <json> -- <command> [args...]");
     println!("       aft sandbox-launch --support");
 }
 
@@ -383,6 +404,7 @@ mod tests {
         .expect("valid launcher arguments");
         assert_eq!(args.profile_fd, Some(9));
         assert_eq!(args.profile_file, None);
+        assert_eq!(args.profile_json, None);
         assert_eq!(args.failure_marker, None);
         assert_eq!(args.command, os_args(&["/bin/bash", "-c", "true"]));
     }
@@ -405,11 +427,25 @@ mod tests {
             Some(PathBuf::from("/tmp/task.sandbox-profile.json"))
         );
         assert_eq!(args.profile_fd, None);
+        assert_eq!(args.profile_json, None);
         assert_eq!(
             args.failure_marker,
             Some(PathBuf::from("/tmp/task.sandbox-unavailable"))
         );
         assert_eq!(args.command, os_args(&["/bin/sh", "-c", "true"]));
+    }
+
+    #[test]
+    fn parses_profile_json_as_a_verified_buffer() {
+        let args = LaunchArgs::parse(os_args(&[
+            "--profile-json",
+            r#"{"write_allow":[]}"#,
+            "--",
+            "/bin/true",
+        ]))
+        .unwrap();
+        assert_eq!(args.profile_json.as_deref(), Some(r#"{"write_allow":[]}"#));
+        assert_eq!(args.command, os_args(&["/bin/true"]));
     }
 
     #[test]

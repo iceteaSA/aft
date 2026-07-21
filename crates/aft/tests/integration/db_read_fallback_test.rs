@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aft::backup::{hash_session, BackupStore};
-use aft::bash_background::persistence::{task_paths, write_task, PersistedTask};
+use aft::bash_background::persistence::{
+    resolve_task_layout, session_tasks_dir, task_paths, write_task, PersistedTask, TaskPaths,
+};
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use aft::harness::Harness;
 use rusqlite::Connection;
@@ -29,6 +31,12 @@ fn fresh_registry(conn: Arc<Mutex<Connection>>) -> BgTaskRegistry {
     registry.set_harness(Harness::Opencode);
     registry.set_db_pool(conn);
     registry
+}
+
+fn resolved_paths(storage: &Path, task_id: &str) -> TaskPaths {
+    resolve_task_layout(&session_tasks_dir(storage, SESSION), task_id)
+        .unwrap()
+        .paths
 }
 
 fn spawn_task(registry: &BgTaskRegistry, storage: &Path, project: &Path, command: &str) -> String {
@@ -70,7 +78,7 @@ fn wait_for_task_status(
 }
 
 fn write_disk_task(storage: &Path, project: &Path, task_id: &str, command: &str) {
-    let paths = task_paths(storage, SESSION, task_id);
+    let paths = task_paths(storage, SESSION, task_id).unwrap();
     let mut task = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
@@ -144,7 +152,7 @@ fn latest_backup_path(storage: &Path, conn: &Arc<Mutex<Connection>>) -> PathBuf 
 }
 
 #[test]
-fn db_read_fallback_bash_lookup_prefers_db_row_when_present() {
+fn db_read_fallback_bash_lookup_refuses_corrupt_disk_despite_db_row() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let (registry, conn) = registry_with_db(storage.path());
@@ -158,13 +166,9 @@ fn db_read_fallback_bash_lookup_prefers_db_row_when_present() {
     );
     registry.detach();
 
-    fs::write(
-        &task_paths(storage.path(), SESSION, &task_id).json,
-        "not json",
-    )
-    .unwrap();
+    fs::write(&resolved_paths(storage.path(), &task_id).json, "not json").unwrap();
     let fresh = fresh_registry(conn);
-    let snapshot = fresh
+    assert!(fresh
         .status(
             &task_id,
             SESSION,
@@ -172,10 +176,7 @@ fn db_read_fallback_bash_lookup_prefers_db_row_when_present() {
             Some(storage.path()),
             1024,
         )
-        .unwrap();
-
-    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
-    assert_eq!(snapshot.info.command, "echo db-wins");
+        .is_none());
     fresh.detach();
 }
 
@@ -187,14 +188,14 @@ fn db_read_fallback_bash_lookup_falls_back_to_disk_when_db_row_absent() {
     write_disk_task(
         storage.path(),
         project.path(),
-        "disk-only",
+        "bash-0000000000000401",
         "echo disk-only",
     );
 
     let fresh = fresh_registry(conn);
     let snapshot = fresh
         .status(
-            "disk-only",
+            "bash-0000000000000401",
             SESSION,
             Some(project.path()),
             Some(storage.path()),
@@ -216,7 +217,7 @@ fn db_read_fallback_bash_lookup_returns_not_found_when_both_missing() {
 
     assert!(fresh
         .status(
-            "missing-task",
+            "bash-0000000000000499",
             SESSION,
             Some(project.path()),
             Some(storage.path()),
@@ -227,7 +228,7 @@ fn db_read_fallback_bash_lookup_returns_not_found_when_both_missing() {
 }
 
 #[test]
-fn db_read_fallback_bash_replay_session_prefers_db_when_any_rows_present() {
+fn db_read_fallback_bash_replay_refuses_db_rows_missing_strict_metadata() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let (registry, conn) = registry_with_db(storage.path());
@@ -251,12 +252,12 @@ fn db_read_fallback_bash_replay_session_prefers_db_when_any_rows_present() {
         );
     }
     registry.detach();
-    fs::remove_file(&task_paths(storage.path(), SESSION, &task_ids[0]).json).unwrap();
-    fs::remove_file(&task_paths(storage.path(), SESSION, &task_ids[1]).json).unwrap();
+    fs::remove_file(&resolved_paths(storage.path(), &task_ids[0]).json).unwrap();
+    fs::remove_file(&resolved_paths(storage.path(), &task_ids[1]).json).unwrap();
 
     let fresh = fresh_registry(conn);
     fresh.replay_session(storage.path(), SESSION).unwrap();
-    assert_eq!(fresh.list(0).len(), 3);
+    assert_eq!(fresh.list(0).len(), 1);
     fresh.detach();
 }
 
@@ -269,7 +270,7 @@ fn db_read_fallback_bash_replay_session_falls_back_to_disk_when_db_empty() {
         write_disk_task(
             storage.path(),
             project.path(),
-            &format!("disk-only-{idx}"),
+            &format!("bash-{:016x}", 0x410 + idx),
             &format!("echo disk {idx}"),
         );
     }
@@ -433,12 +434,17 @@ fn db_read_fallback_backup_op_id_query_via_db() {
 fn db_read_fallback_db_unavailable_falls_back_to_disk_for_all_ops() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    write_disk_task(storage.path(), project.path(), "no-db-task", "echo no-db");
+    write_disk_task(
+        storage.path(),
+        project.path(),
+        "bash-0000000000000420",
+        "echo no-db",
+    );
     let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
     registry.set_harness(Harness::Opencode);
     let snapshot = registry
         .status(
-            "no-db-task",
+            "bash-0000000000000420",
             SESSION,
             Some(project.path()),
             Some(storage.path()),

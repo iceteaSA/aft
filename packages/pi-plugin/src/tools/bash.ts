@@ -1,4 +1,3 @@
-import * as fs from "node:fs/promises";
 import {
   type AftProjectTransport,
   type BridgeRequestOptions,
@@ -273,6 +272,7 @@ interface BashStatusDetails {
   pty_rows?: number;
   pty_cols?: number;
   pty_screen?: string;
+  pty_raw?: string;
   waited?: BashStatusWaited;
 }
 
@@ -907,11 +907,17 @@ async function bashStatusSnapshot(
   taskId: string,
   outputMode: string | undefined,
   options?: BridgeRequestOptions,
+  cursor?: OutputCursor,
 ): Promise<Record<string, unknown>> {
   return await callBashBridge(
     bridge,
     "bash_status",
-    { task_id: taskId, output_mode: outputMode },
+    {
+      task_id: taskId,
+      output_mode: outputMode,
+      output_offset: cursor?.output,
+      stderr_offset: cursor?.stderr,
+    },
     extCtx,
     options,
   );
@@ -956,7 +962,14 @@ async function waitForBashStatus(
     while (true) {
       let data: Record<string, unknown>;
       try {
-        data = await bashStatusSnapshot(bridge, extCtx, taskId, outputMode, bridgeOptions);
+        data = await bashStatusSnapshot(
+          bridge,
+          extCtx,
+          taskId,
+          outputMode,
+          bridgeOptions,
+          waitFor ? spillCursor : undefined,
+        );
       } catch (err) {
         // A single poll's transport timeout means the bridge is *busy*, not
         // that the task failed — the bridge is kept warm (keepBridgeOnTimeout).
@@ -1060,17 +1073,15 @@ async function readNewTaskOutput(
   data: Record<string, unknown>,
   cursor: OutputCursor,
 ): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor } | undefined> {
-  const outputPath = data.output_path as string | undefined;
-  const stderrPath = data.mode === "pty" ? undefined : (data.stderr_path as string | undefined);
-  if (!outputPath && !stderrPath) return undefined;
-  const stdoutBytes = outputPath
-    ? await readFileBytesFrom(outputPath, cursor.output)
-    : Buffer.alloc(0);
-  const stderrBytes = stderrPath
-    ? await readFileBytesFrom(stderrPath, cursor.stderr)
-    : Buffer.alloc(0);
-  const bytesRead = stdoutBytes.length + stderrBytes.length;
-  if (bytesRead === 0) return undefined;
+  const stdoutBytes =
+    typeof data.output_chunk_base64 === "string"
+      ? Buffer.from(data.output_chunk_base64, "base64")
+      : Buffer.alloc(0);
+  const stderrBytes =
+    typeof data.stderr_chunk_base64 === "string"
+      ? Buffer.from(data.stderr_chunk_base64, "base64")
+      : Buffer.alloc(0);
+  if (stdoutBytes.length + stderrBytes.length === 0) return undefined;
   const chunks: OutputScanChunk[] = [];
   if (stdoutBytes.length > 0) {
     chunks.push({
@@ -1089,29 +1100,19 @@ async function readNewTaskOutput(
   return {
     chunks,
     nextCursor: {
-      output: cursor.output + stdoutBytes.length,
-      stderr: cursor.stderr + stderrBytes.length,
+      output:
+        typeof data.output_next_offset === "number"
+          ? data.output_next_offset
+          : cursor.output + stdoutBytes.length,
+      stderr:
+        typeof data.stderr_next_offset === "number"
+          ? data.stderr_next_offset
+          : cursor.stderr + stderrBytes.length,
     },
   };
 }
 
-async function readFileBytesFrom(outputPath: string, cursor: number): Promise<Buffer> {
-  const handle = await fs.open(outputPath, "r");
-  try {
-    const chunks: Buffer[] = [];
-    let offset = cursor;
-    while (true) {
-      const buffer = Buffer.allocUnsafe(64 * 1024);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
-      if (bytesRead === 0) break;
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
-      offset += bytesRead;
-    }
-    return Buffer.concat(chunks);
-  } finally {
-    await handle.close().catch(() => undefined);
-  }
-}
+
 
 function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
   if (typeof value === "string") return { kind: "substring", value };
@@ -1287,31 +1288,18 @@ async function formatPtyStatus(
   details: BashStatusDetails,
   requestedOutputMode: string | undefined,
 ): Promise<string> {
-  if (!details.output_path) return "\n[PTY output path unavailable]";
   const outputMode = requestedOutputMode ?? "screen";
-  const raw =
-    outputMode === "raw" || outputMode === "both"
-      ? await fs.readFile(details.output_path)
-      : undefined;
+  const raw = typeof details.pty_raw === "string" ? details.pty_raw : "";
   let suffix = "";
   if (outputMode === "raw") {
-    suffix =
-      raw && raw.length > 0
-        ? `
-${raw.toString("utf8")}`
-        : "";
+    suffix = raw.length > 0 ? `\n${raw}` : "";
   } else if (outputMode === "both") {
-    suffix = `
-${JSON.stringify({ screen: details.pty_screen ?? "", raw: raw?.toString("utf8") ?? "" }, null, 2)}`;
+    suffix = `\n${JSON.stringify({ screen: details.pty_screen ?? "", raw }, null, 2)}`;
   } else {
-    suffix = details.pty_screen
-      ? `
-${details.pty_screen}`
-      : "";
+    suffix = details.pty_screen ? `\n${details.pty_screen}` : "";
   }
   if (!isTerminalStatus(details.status)) {
-    suffix += `
-PTY task is still running. Use bash_status({ task_id: "${taskId}", output_mode: "screen" }) to inspect, bash_write({ task_id: "${taskId}", input: "..." }) to send keystrokes.`;
+    suffix += `\nPTY task is still running. Use bash_status({ task_id: "${taskId}", output_mode: "screen" }) to inspect, bash_write({ task_id: "${taskId}", input: "..." }) to send keystrokes.`;
   }
   return suffix;
 }

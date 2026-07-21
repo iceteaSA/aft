@@ -446,6 +446,61 @@ fn p5_secret_read_is_denied_and_other_reads_are_allowed() {
     assert_eq!(ordinary_output.stdout, b"ordinary\n");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
+    let root = tempfile::tempdir().expect("create task-store probe root");
+    let store = root.path().join("bash-tasks/session");
+    let own_control = store.join("bash-0000000000000001/control");
+    let own_io = store.join("bash-0000000000000001/io");
+    let sibling_control = store.join("bash-0000000000000002/control");
+    let temp = own_io.join("temp");
+    for path in [&own_control, &own_io, &sibling_control, &temp] {
+        fs::create_dir_all(path).expect("create task-store probe directory");
+    }
+    let own_payload_path = own_control.join("command.sh");
+    let sibling_payload_path = sibling_control.join("command.sh");
+    fs::write(&own_payload_path, b"approved-payload\n").expect("write own payload");
+    fs::write(&sibling_payload_path, b"sibling-secret\n").expect("write sibling payload");
+    let own_payload = fs::File::open(&own_payload_path).expect("open own payload before sandbox");
+    let payload_fd = own_payload.as_raw_fd();
+    set_close_on_exec(payload_fd, false);
+
+    let profile = SandboxProfile::build(
+        vec![own_io],
+        Vec::new(),
+        Vec::new(),
+        vec![store.canonicalize().expect("canonical task store")],
+        Vec::new(),
+        Vec::new(),
+        temp,
+    )
+    .expect("build task-store denial profile");
+    let mut inherited = InheritedProfile::new(&profile);
+    inherited.rewind();
+    let script = format!(
+        "cat /dev/fd/{payload_fd}; cat {}",
+        shell_path(&sibling_payload_path)
+    );
+    let output = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .output()
+        .expect("launch task-store Seatbelt probe");
+    set_close_on_exec(payload_fd, true);
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "approved-payload\n"
+    );
+    assert!(
+        !output.status.success(),
+        "sibling control read unexpectedly succeeded"
+    );
+    assert_eq!(
+        fs::read(&sibling_payload_path).expect("read sibling victim after probe"),
+        b"sibling-secret\n"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn p5_linux_records_read_deny_gap() {
