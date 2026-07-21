@@ -2486,6 +2486,20 @@ fn parse_solidity_imports(source: &str, tree: &Tree) -> ImportBlock {
     }
 }
 
+fn strip_one_matching_solidity_quote_pair(value: &str) -> &str {
+    if value.len() < 2 {
+        return value;
+    }
+
+    let bytes = value.as_bytes();
+    let quote = bytes[0];
+    if matches!(quote, b'\'' | b'"') && bytes.last() == Some(&quote) {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
 /// Parse one `import_directive`. The Solidity grammar emits a flat token
 /// sequence (verified by grammar fixture test), so the four forms are
 /// distinguished by the presence of `{` (named), `*` (namespace), a trailing
@@ -2510,7 +2524,7 @@ fn parse_solidity_import_directive(source: &str, node: &Node) -> Option<ImportSt
     let module_path = children
         .iter()
         .find(|(k, _)| k == "string")
-        .map(|(_, t)| t.trim_matches('"').to_string())?;
+        .map(|(_, text)| strip_one_matching_solidity_quote_pair(text).to_string())?;
     if module_path.is_empty() {
         return None;
     }
@@ -3507,11 +3521,40 @@ import { c } from 'charlie';
     }
 
     #[test]
+    fn solidity_string_path_strips_one_matching_quote_pair() {
+        assert_eq!(
+            strip_one_matching_solidity_quote_pair("\"./A.sol\""),
+            "./A.sol"
+        );
+        assert_eq!(
+            strip_one_matching_solidity_quote_pair("'./A.sol'"),
+            "./A.sol"
+        );
+        assert_eq!(
+            strip_one_matching_solidity_quote_pair("\"./a'b.sol\""),
+            "./a'b.sol"
+        );
+        assert_eq!(
+            strip_one_matching_solidity_quote_pair("\"\"./A.sol\"\""),
+            "\"./A.sol\""
+        );
+        assert_eq!(
+            strip_one_matching_solidity_quote_pair("'./A.sol\""),
+            "'./A.sol\""
+        );
+        assert_eq!(
+            strip_one_matching_solidity_quote_pair("\"./A.sol"),
+            "\"./A.sol"
+        );
+        assert_eq!(strip_one_matching_solidity_quote_pair("\""), "\"");
+    }
+
+    #[test]
     fn parse_solidity_all_four_forms() {
         let (_, block) = parse_solidity(
-            "import \"./A.sol\";\nimport \"./B.sol\" as B;\nimport * as C from \"./C.sol\";\nimport { Foo, Bar as Baz } from \"./D.sol\";\n",
+            "import \"./A.sol\";\nimport \"./B.sol\" as B;\nimport * as C from \"./C.sol\";\nimport { Foo, Bar as Baz } from \"./D.sol\";\nimport './E.sol';\nimport './F.sol' as F;\nimport * as G from './G.sol';\nimport { Quux, Corge as Grault } from './H.sol';\n",
         );
-        assert_eq!(block.imports.len(), 4);
+        assert_eq!(block.imports.len(), 8);
 
         // side-effect
         assert_eq!(block.imports[0].module_path, "./A.sol");
@@ -3552,6 +3595,27 @@ import { c } from 'charlie';
         assert_eq!(
             block.imports[3].names,
             vec!["Foo".to_string(), "Bar as Baz".to_string()]
+        );
+
+        assert_eq!(
+            block.imports[4..]
+                .iter()
+                .map(|import| import.module_path.as_str())
+                .collect::<Vec<_>>(),
+            ["./E.sol", "./F.sol", "./G.sol", "./H.sol"]
+        );
+        assert_eq!(block.imports[4].kind, ImportKind::SideEffect);
+        assert!(matches!(
+            &block.imports[5].form,
+            ImportForm::Solidity {
+                alias: Some(alias),
+                ..
+            } if alias == "F"
+        ));
+        assert_eq!(block.imports[6].namespace_import.as_deref(), Some("G"));
+        assert_eq!(
+            block.imports[7].names,
+            vec!["Quux".to_string(), "Corge as Grault".to_string()]
         );
     }
 

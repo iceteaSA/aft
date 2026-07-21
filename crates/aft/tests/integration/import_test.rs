@@ -252,6 +252,35 @@ fn add_import_solidity_allows_parent_relative_import() {
 }
 
 #[test]
+fn add_import_solidity_dedupes_single_quoted_path() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("SingleQuotedImport.sol");
+    let original = "pragma solidity ^0.8.0;\nimport './X.sol';\ncontract C {}\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_add_import(
+        &mut aft,
+        "imp-sol-single-quote-dedup",
+        &file.display().to_string(),
+        "./X.sol",
+        None,
+        None,
+        false,
+    );
+
+    assert_eq!(resp["success"], true, "dedup should succeed: {resp:?}");
+    assert_eq!(
+        resp["added"], false,
+        "the existing single-quoted import should satisfy the request: {resp:?}"
+    );
+    assert_eq!(resp["already_present"], true, "expected a dedup no-op");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    aft.shutdown();
+}
+
+#[test]
 fn add_import_c_rejects_absolute_modules() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
@@ -1074,6 +1103,38 @@ fn remove_import_preserves_default_when_named_removed() {
     );
 
     fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn remove_import_solidity_matches_single_quoted_path() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("RemoveSingleQuotedImport.sol");
+    fs::write(
+        &file,
+        "pragma solidity ^0.8.0;\nimport './X.sol';\ncontract C {}\n",
+    )
+    .unwrap();
+
+    let remove = send_remove_import(
+        &mut aft,
+        "remove-sol-single-quote",
+        &file.display().to_string(),
+        "./X.sol",
+        None,
+    );
+
+    assert_eq!(remove["success"], true, "remove should succeed: {remove:?}");
+    assert_eq!(
+        remove["removed"], true,
+        "the single-quoted import should be removed: {remove:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "pragma solidity ^0.8.0;\ncontract C {}\n"
+    );
+
     aft.shutdown();
 }
 
