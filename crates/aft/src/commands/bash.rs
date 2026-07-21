@@ -976,24 +976,23 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let args_log = project.path().join("launcher-args.txt");
-        let launcher = project.path().join("fake-sandbox-launcher.sh");
+        let launcher_script = project.path().join("sandbox-launch");
+        let launcher = PathBuf::from("/bin/sh");
         fs::write(
-            &launcher,
-            r#"#!/bin/sh
-printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
+            &launcher_script,
+            r#"printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
 mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
-[ "$1" = "sandbox-launch" ] || exit 91
-[ "$2" = "--profile-json" ] || exit 92
-[ -n "$3" ] || exit 93
-[ "$4" = "--" ] || exit 94
-shift 4
+[ "$1" = "--profile-json" ] || exit 92
+[ -n "$2" ] || exit 93
+[ "$3" = "--" ] || exit 94
+shift 3
 exec "$@"
 "#,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        let mut permissions = fs::metadata(&launcher_script).unwrap().permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(&launcher, permissions).unwrap();
+        fs::set_permissions(&launcher_script, permissions).unwrap();
 
         let profile = SandboxProfile::build(
             vec![project.path().to_path_buf()],
@@ -1040,12 +1039,11 @@ exec "$@"
         }
         let args = fs::read_to_string(&args_log).unwrap();
         let lines: Vec<&str> = args.lines().collect();
-        assert_eq!(lines[0], launcher.to_string_lossy());
-        assert_eq!(lines[1], "sandbox-launch");
-        assert_eq!(lines[2], "--profile-json");
-        assert!(serde_json::from_str::<serde_json::Value>(lines[3]).is_ok());
-        assert_eq!(lines[4], "--");
-        assert!(lines.len() >= 7, "wrapped argv missing target: {lines:?}");
+        assert_eq!(lines[0], "sandbox-launch");
+        assert_eq!(lines[1], "--profile-json");
+        assert!(serde_json::from_str::<serde_json::Value>(lines[2]).is_ok());
+        assert_eq!(lines[3], "--");
+        assert!(lines.len() >= 6, "wrapped argv missing target: {lines:?}");
 
         stop_spawned_test_task(&ctx, &response);
     }
@@ -1063,20 +1061,21 @@ exec "$@"
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let launcher = project.path().join("unavailable-sandbox-launcher.sh");
+        let launcher_script = project.path().join("sandbox-launch");
+        let launcher = PathBuf::from("/bin/sh");
         let launcher_spawns = project.path().join("launcher-spawns");
         let command_marker = project.path().join("command-must-not-run");
         fs::write(
-            &launcher,
+            &launcher_script,
             format!(
-                "#!/bin/sh\nprintf 'spawn\\n' >> '{}'\necho 'sandbox_unavailable: test backend failed' >&2\nexit 78\n",
+                "printf 'spawn\\n' >> '{}'\necho 'sandbox_unavailable: test backend failed' >&2\nexit 78\n",
                 launcher_spawns.display()
             ),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        let mut permissions = fs::metadata(&launcher_script).unwrap().permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(&launcher, permissions).unwrap();
+        fs::set_permissions(&launcher_script, permissions).unwrap();
 
         let profile = SandboxProfile::build(
             vec![project.path().to_path_buf()],

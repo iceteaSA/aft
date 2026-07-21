@@ -6271,15 +6271,16 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let sandbox_temp = storage.path().join("sandbox-temp");
         fs::create_dir(&sandbox_temp).unwrap();
-        let launcher = project.path().join("passthrough-launcher.sh");
+        let launcher_script = project.path().join("sandbox-launch");
+        let launcher = PathBuf::from("/bin/sh");
         fs::write(
-            &launcher,
-            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 78\n",
+            &launcher_script,
+            "while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 78\n",
         )
         .unwrap();
-        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        let mut permissions = fs::metadata(&launcher_script).unwrap().permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(&launcher, permissions).unwrap();
+        fs::set_permissions(&launcher_script, permissions).unwrap();
 
         let profile = crate::sandbox_profile::SandboxProfile::build(
             vec![project.path().to_path_buf()],
