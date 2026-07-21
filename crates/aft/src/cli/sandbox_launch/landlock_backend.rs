@@ -26,9 +26,14 @@ pub(super) struct AppliedLandlock {
 pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
     let yama_same_uid_exposed = yama_same_uid_exposed();
     close_inherited_fds()?;
+    // Git and other standard tools open /dev/null read-write; granting only
+    // file rights on this sink does not make any persistent path writable.
     apply_paths(
         profile.read_allow.iter().map(PathBuf::as_path),
-        profile.write_allow_roots(),
+        profile
+            .write_allow_roots()
+            .into_iter()
+            .chain([Path::new("/dev/null")]),
         yama_same_uid_exposed,
     )
 }
@@ -58,17 +63,12 @@ fn apply_paths<'a>(
     let mut read_paths = read_paths.into_iter().collect::<BTreeSet<_>>();
     for path in write_paths {
         let opened = open_rule_path(path)?;
-        if !opened.is_dir {
-            return Err(format!(
-                "Landlock writable root is not a directory: {}",
-                path.display()
-            ));
-        }
         let access = if read_paths.remove(path) {
             read_access | write_access
         } else {
             write_access
         };
+        let access = access_for_opened_path(access, opened.is_dir);
         ruleset = ruleset
             .add_rule(PathBeneath::new(opened.fd, access))
             .map_err(|error| {
@@ -148,8 +148,11 @@ fn validate_required_abi(effective_abi: ABI) -> Result<(), String> {
 }
 
 fn yama_same_uid_exposed() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
-        .ok()
+    yama_value_same_uid_exposed(std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok())
+}
+
+fn yama_value_same_uid_exposed(value: Option<String>) -> bool {
+    value
         .and_then(|value| value.trim().parse::<u32>().ok())
         .is_none_or(|scope| scope == 0)
 }
@@ -391,5 +394,13 @@ mod tests {
         let file = access_for_opened_path(read, false);
         assert!(file.contains(AccessFs::ReadFile));
         assert!(!file.contains(AccessFs::ReadDir));
+    }
+
+    #[test]
+    fn yama_missing_unparseable_and_zero_values_warn_conservatively() {
+        assert!(yama_value_same_uid_exposed(None));
+        assert!(yama_value_same_uid_exposed(Some("invalid".to_string())));
+        assert!(yama_value_same_uid_exposed(Some("0\n".to_string())));
+        assert!(!yama_value_same_uid_exposed(Some("1\n".to_string())));
     }
 }

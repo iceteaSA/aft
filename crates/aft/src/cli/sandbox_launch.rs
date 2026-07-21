@@ -107,7 +107,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             read_profile_json(args.profile_json.as_deref().expect("source count checked"))?
         }
         .canonicalize_for_launch()
-        .map_err(|error| SandboxLaunchError::usage(error.to_string()))?;
+        .map_err(|error| SandboxLaunchError::unavailable(error.to_string()))?;
         if let Err(error) = apply_sandbox(&profile) {
             if let Some(path) = args.failure_marker.as_deref() {
                 let _ = write_failure_marker(path);

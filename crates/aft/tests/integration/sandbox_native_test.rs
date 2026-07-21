@@ -2,6 +2,8 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -505,6 +507,190 @@ fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_mac
     );
     assert!(!hook.exists());
 
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_read_floor_splits_project_denies_and_skips_home_symlinks() {
+    let fixture = tempfile::tempdir().unwrap();
+    let project = fixture.path().join("project");
+    let private = project.join("private");
+    let storage = fixture.path().join("artifacts");
+    let home = fixture.path().join("home");
+    let ssh = home.join(".ssh");
+    let secret = ssh.join("id_test");
+    let shortcut = home.join("shortcut");
+    for directory in [&private, &storage, &ssh] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(&secret, "credential").unwrap();
+    std::fs::write(private.join("token"), "private").unwrap();
+    std::os::unix::fs::symlink(&ssh, &shortcut).unwrap();
+
+    let mut aft = AftProcess::spawn_with_env(&[("HOME", OsStr::new(&home))]);
+    let configured = configure_native_policy(
+        &mut aft,
+        &project,
+        &storage,
+        true,
+        &[],
+        std::slice::from_ref(&private),
+    );
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+
+    for (id, path) in [
+        ("home-symlink-secret", shortcut.join("id_test")),
+        ("project-read-deny", private.join("token")),
+    ] {
+        let read = foreground(&mut aft, id, &format!("cat {}", quote(&path)));
+        assert_eq!(read["status"], "failed", "denied read succeeded: {read:?}");
+    }
+
+    let written = private.join("write-still-allowed");
+    let write = foreground(
+        &mut aft,
+        "project-read-deny-write",
+        &format!("printf allowed > {}", quote(&written)),
+    );
+    assert_eq!(
+        write["status"], "completed",
+        "write should remain allowed: {write:?}"
+    );
+    assert_eq!(std::fs::read_to_string(written).unwrap(), "allowed");
+
+    let etc = foreground(&mut aft, "system-read", "cat /etc/hostname");
+    assert_eq!(etc["status"], "completed", "system read failed: {etc:?}");
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linked_worktree_reads_shared_git_metadata_but_not_hooks() {
+    let fixture = tempfile::tempdir().unwrap();
+    let main = fixture.path().join("main");
+    let worktree = fixture.path().join("worktree");
+    let storage = fixture.path().join("artifacts");
+    let home = fixture.path().join("home");
+    for directory in [&main, &storage, &home] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&main)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(main.join("tracked"), "tracked").unwrap();
+    assert!(Command::new("git")
+        .args(["add", "tracked"])
+        .current_dir(&main)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "-c",
+            "user.name=AFT Test",
+            "-c",
+            "user.email=aft@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ])
+        .current_dir(&main)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["worktree", "add", "-q"])
+        .arg(&worktree)
+        .arg("HEAD")
+        .current_dir(&main)
+        .status()
+        .unwrap()
+        .success());
+    let hook = main.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "shared-hook-secret").unwrap();
+
+    let mut aft = AftProcess::spawn_with_env(&[("HOME", OsStr::new(&home))]);
+    let configured = configure_native(&mut aft, &worktree, &storage, true);
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+    let status = foreground(&mut aft, "linked-git-status", "git status --porcelain");
+    assert_eq!(
+        status["status"], "completed",
+        "linked git status failed: {status:?}"
+    );
+
+    let config = foreground(
+        &mut aft,
+        "linked-git-config-read",
+        &format!("cat {}", quote(&main.join(".git/config"))),
+    );
+    assert_eq!(
+        config["status"], "completed",
+        "shared Git config read failed: {config:?}"
+    );
+    let hook_read = foreground(
+        &mut aft,
+        "linked-hook-read",
+        &format!("cat {}", quote(&hook)),
+    );
+    assert_eq!(
+        hook_read["status"], "failed",
+        "shared hook read succeeded: {hook_read:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_secret_floor_refuses_home_write_allow_and_home_project_root() {
+    let fixture = tempfile::tempdir().unwrap();
+    let project = fixture.path().join("project");
+    let storage = fixture.path().join("artifacts");
+    let home = fixture.path().join("home");
+    for directory in [&project, &storage, &home.join(".ssh")] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+
+    let mut aft = AftProcess::spawn_with_env(&[("HOME", OsStr::new(&home))]);
+    let configured = configure_native_policy(
+        &mut aft,
+        &project,
+        &storage,
+        true,
+        std::slice::from_ref(&home),
+        &[],
+    );
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+    let write_allow = foreground(&mut aft, "home-write-allow-refusal", "true");
+    assert_eq!(write_allow["code"], "sandbox_unavailable");
+    assert!(write_allow["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("overlaps mandatory secret floor")));
+    assert!(aft.shutdown().success());
+
+    let mut aft = AftProcess::spawn_with_env(&[("HOME", OsStr::new(&home))]);
+    let configured = configure_native(&mut aft, &home, &storage, true);
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+    let project_root = foreground(&mut aft, "home-project-refusal", "true");
+    assert_eq!(project_root["code"], "sandbox_unavailable");
+    assert!(project_root["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("overlaps mandatory secret floor")));
     assert!(aft.shutdown().success());
 }
 

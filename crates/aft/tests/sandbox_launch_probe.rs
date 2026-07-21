@@ -3,9 +3,7 @@
 use aft::sandbox_profile::SandboxProfile;
 use portable_pty::{CommandBuilder, PtySize};
 use std::fs;
-#[cfg(target_os = "macos")]
-use std::io::{BufRead, BufReader};
-use std::io::{Read, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -22,6 +20,7 @@ struct ProbeFixture {
     secret: PathBuf,
     arbitrary_file: PathBuf,
     docker_socket: PathBuf,
+    #[cfg(target_os = "macos")]
     agent_socket: PathBuf,
     profile: InheritedProfile,
 }
@@ -54,17 +53,31 @@ impl ProbeFixture {
         ] {
             fs::create_dir_all(directory).expect("create probe directory");
         }
-        fs::create_dir_all(project.join(".git")).expect("create .git fixture");
+        fs::create_dir_all(project.join(".git/hooks")).expect("create .git fixture");
         fs::create_dir_all(project.join(".cortexkit")).expect("create .cortexkit fixture");
         fs::write(project.join(".git/config"), b"original\n").expect("write git config fixture");
         fs::write(secret.join("id_probe"), b"probe-secret\n").expect("write secret fixture");
         fs::write(&arbitrary_file, b"ordinary\n").expect("write ordinary fixture");
 
+        let read_allow = vec![
+            project.clone(),
+            artifacts.clone(),
+            task_temp.clone(),
+            cargo_cache.clone(),
+            npm_cache.clone(),
+            arbitrary_file.clone(),
+        ];
+        #[cfg(target_os = "linux")]
+        let read_allow = {
+            let mut read_allow = read_allow;
+            read_allow.extend(linux_system_read_allow());
+            read_allow
+        };
         let profile = SandboxProfile::build(
             vec![project.clone(), artifacts],
             Vec::new(),
             vec![project.join(".git"), project.join(".cortexkit")],
-            Vec::new(),
+            read_allow,
             vec![secret.clone()],
             vec![docker_socket.clone(), agent_socket.clone()],
             vec![cargo_cache, npm_cache],
@@ -79,6 +92,7 @@ impl ProbeFixture {
             secret,
             arbitrary_file,
             docker_socket,
+            #[cfg(target_os = "macos")]
             agent_socket,
             profile: InheritedProfile::new(&profile),
         }
@@ -157,6 +171,33 @@ fn shell_path(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+#[cfg(target_os = "linux")]
+fn linux_system_read_allow() -> Vec<PathBuf> {
+    [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/etc",
+        "/proc",
+        "/sys/devices/system/cpu",
+        "/sys/fs/cgroup",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+        "/dev/ptmx",
+        "/dev/pts",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .filter(|path| path.exists())
+    .collect()
+}
+
 fn assert_denied(output: &Output, context: &str) {
     assert!(
         !output.status.success(),
@@ -179,8 +220,7 @@ fn assert_linux_unenforced_warning(output: &Output) {
         "expected one structured warning: {stderr}"
     );
     assert!(
-        warnings[0]
-            .starts_with("sandbox-launch: unenforced=[nested_write_deny,read_deny,socket_deny]"),
+        warnings[0].starts_with("sandbox-launch: unenforced=[nested_write_deny,socket_deny]"),
         "unexpected structured warning: {}",
         warnings[0]
     );
@@ -241,6 +281,40 @@ fn closed_profile_fd_returns_an_error_instead_of_aborting() {
 }
 
 #[test]
+fn v1_profile_is_a_structured_sandbox_unavailable_failure() {
+    let root = tempfile::tempdir().expect("create profile root");
+    let root = root.path().canonicalize().expect("canonical profile root");
+    let mut profile = NamedTempFile::new().expect("create v1 profile");
+    serde_json::to_writer(
+        profile.as_file_mut(),
+        &serde_json::json!({
+            "v": 1,
+            "writable_roots": [root],
+            "write_deny": [],
+            "write_deny_nested": [],
+            "read_deny": [],
+            "socket_deny": [],
+            "cache_roots": [],
+            "temp_dir": root,
+        }),
+    )
+    .expect("serialize v1 profile");
+    profile.as_file_mut().flush().expect("flush v1 profile");
+    profile.as_file_mut().rewind().expect("rewind v1 profile");
+    let fd = profile.as_file().as_raw_fd();
+    set_close_on_exec(fd, false);
+
+    let output = launcher_command(fd, &["/usr/bin/true"])
+        .output()
+        .expect("launch with v1 profile");
+    set_close_on_exec(fd, true);
+    assert_eq!(output.status.code(), Some(78));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sandbox_unavailable:"));
+    assert!(stderr.contains("unsupported sandbox profile version 1; expected 2"));
+}
+
+#[test]
 fn target_arguments_are_not_interpreted_as_global_aft_flags() {
     let mut fixture = ProbeFixture::new();
     fixture.profile.rewind();
@@ -294,11 +368,8 @@ fn p3_nested_children_inherit_confinement() {
     assert!(!destination.exists());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "Landlock grants are additive and cannot subtract nested write rights"
-)]
 fn p4_nested_project_write_denies_are_enforced() {
     let mut fixture = ProbeFixture::new();
     let git_config = fixture.project.join(".git/config");
@@ -475,29 +546,92 @@ fn read_deny_created_after_sandbox_start_remains_denied() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn home_directory_created_after_launch_remains_read_denied() {
+    let root = tempfile::tempdir().expect("create probe root");
+    let root = root.path().canonicalize().expect("canonical probe root");
+    let home = root.join("home");
+    let existing = home.join("existing");
+    let project = root.join("project");
+    let task_temp = root.join("task-temp");
+    for directory in [&existing, &project, &task_temp] {
+        fs::create_dir_all(directory).expect("create probe directory");
+    }
+    let mut read_allow = linux_system_read_allow();
+    read_allow.extend([existing, project.clone(), task_temp.clone()]);
+    let profile = SandboxProfile::build(
+        vec![project.clone()],
+        Vec::new(),
+        Vec::new(),
+        read_allow,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        task_temp,
+    )
+    .expect("build late-HOME profile");
+    let mut inherited = InheritedProfile::new(&profile);
+    inherited.rewind();
+    let release = project.join("release");
+    let late_dir = home.join("late-directory");
+    let late_file = late_dir.join("value");
+    let script = format!(
+        "printf 'ready\\n'; while [ ! -e {} ]; do sleep 0.01; done; cat {}",
+        shell_path(&release),
+        shell_path(&late_file)
+    );
+    let mut child = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("launch late HOME probe");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).expect("read readiness line");
+    assert_eq!(ready, "ready\n");
+
+    fs::create_dir(&late_dir).expect("create late HOME directory");
+    fs::write(&late_file, b"late-value\n").expect("write late HOME file");
+    fs::write(&release, b"go").expect("release child");
+    let status = child.wait().expect("wait for late HOME probe");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+    assert!(!status.success(), "late HOME read succeeded: {stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn p4_linux_records_nested_project_deny_gap() {
     let mut fixture = ProbeFixture::new();
-    let destination = fixture.project.join(".cortexkit/linux-gap");
-    let output = fixture.launch_bash(&format!("touch {}", shell_path(&destination)));
+    let cortex_destination = fixture.project.join(".cortexkit/linux-gap");
+    let hook_destination = fixture.project.join(".git/hooks/linux-gap");
+    let output = fixture.launch_bash(&format!(
+        "touch {} {}",
+        shell_path(&cortex_destination),
+        shell_path(&hook_destination)
+    ));
     assert!(
         output.status.success(),
         "unexpected result changed: {output:?}"
     );
-    assert!(destination.exists());
+    assert!(cortex_destination.exists());
+    assert!(hook_destination.exists());
     assert_linux_unenforced_warning(&output);
     eprintln!("P4 Linux observed ALLOWED with nested_write_deny warning");
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "Linux intentionally leaves broad reads unenforced"
-)]
 fn p5_secret_read_is_denied_and_other_reads_are_allowed() {
     let mut fixture = ProbeFixture::new();
     let secret_file = fixture.secret.join("id_probe");
     let secret_output = fixture.launch_bash(&format!("cat {}", shell_path(&secret_file)));
     assert_denied(&secret_output, "secret read");
+    #[cfg(target_os = "linux")]
+    assert_linux_unenforced_warning(&secret_output);
 
     let arbitrary_file = fixture.arbitrary_file.clone();
     let ordinary_output = fixture.launch_bash(&format!("cat {}", shell_path(&arbitrary_file)));
@@ -533,6 +667,7 @@ fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
         vec![own_io],
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         vec![store.canonicalize().expect("canonical task store")],
         Vec::new(),
         Vec::new(),
@@ -563,22 +698,6 @@ fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
         b"sibling-secret\n"
     );
 }
-
-#[cfg(target_os = "linux")]
-#[test]
-fn p5_linux_records_read_deny_gap() {
-    let mut fixture = ProbeFixture::new();
-    let secret_file = fixture.secret.join("id_probe");
-    let output = fixture.launch_bash(&format!("cat {}", shell_path(&secret_file)));
-    assert!(
-        output.status.success(),
-        "unexpected result changed: {output:?}"
-    );
-    assert_eq!(output.stdout, b"probe-secret\n");
-    assert_linux_unenforced_warning(&output);
-    eprintln!("P5 Linux observed ALLOWED with read_deny warning");
-}
-
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_secret_floor_write_is_denied_under_enclosing_write_root() {
@@ -667,7 +786,7 @@ fn p6_symlink_escape_is_denied_at_access_time() {
 }
 
 #[test]
-fn p7_hardlink_write_verdict_is_recorded() {
+fn p7_preexisting_hardlink_alias_is_asserted_writable_gap() {
     let mut fixture = ProbeFixture::new();
     let outside_file = fixture.outside_home.join("hardlink-target");
     let inside_link = fixture.project.join("hardlink-inside");
@@ -675,28 +794,60 @@ fn p7_hardlink_write_verdict_is_recorded() {
     fs::hard_link(&outside_file, &inside_link).expect("create pre-existing hardlink");
 
     let output = fixture.launch_bash(&format!("printf after > {}", shell_path(&inside_link)));
-    let verdict = if output.status.success() {
-        "ALLOWED"
-    } else {
-        "DENIED"
-    };
-    let contents = fs::read(&outside_file).expect("read hardlink target");
-    eprintln!(
-        "P7 hardlink verdict={verdict}; outside_contents={}",
-        String::from_utf8_lossy(&contents)
-    );
     assert!(
-        (output.status.success() && contents == b"after")
-            || (!output.status.success() && contents == b"before\n"),
-        "hardlink probe produced an inconsistent result"
+        output.status.success(),
+        "pre-existing hard-link alias should expose the trusted project path: {output:?}"
+    );
+    assert_eq!(
+        fs::read(&outside_file).expect("read hardlink target"),
+        b"after"
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "Landlock cannot filter pathname Unix socket connects"
-)]
+fn linux_refer_denies_laundering_secret_with_a_new_hard_link() {
+    let mut fixture = ProbeFixture::new();
+    let source = fixture.secret.join("id_probe");
+    let destination = fixture.project.join("laundered-secret");
+    let output = fixture.launch_bash(&format!(
+        "ln {} {}",
+        shell_path(&source),
+        shell_path(&destination)
+    ));
+
+    assert_denied(&output, "hard-link secret laundering");
+    assert!(!destination.exists());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert!(
+        stderr.contains("cross-device link") || stderr.contains("permission denied"),
+        "hard-link denial should report EXDEV or EACCES: {stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_refer_allows_rename_inside_writable_project() {
+    let mut fixture = ProbeFixture::new();
+    let source = fixture.project.join("rename-source");
+    let destination = fixture.project.join("rename-destination");
+    fs::write(&source, b"rename-me").expect("create rename source");
+    let output = fixture.launch_bash(&format!(
+        "mv {} {}",
+        shell_path(&source),
+        shell_path(&destination)
+    ));
+
+    assert!(
+        output.status.success(),
+        "in-project rename failed: {output:?}"
+    );
+    assert!(!source.exists());
+    assert_eq!(fs::read(&destination).expect("renamed file"), b"rename-me");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn p8_docker_and_agent_socket_connects_are_denied() {
     let mut fixture = ProbeFixture::new();
     let docker_socket = fixture.docker_socket.clone();
@@ -746,6 +897,106 @@ fn p8_linux_records_socket_connect_gap() {
     );
     assert_linux_unenforced_warning(&output);
     eprintln!("P8 Linux observed ALLOWED with socket_deny warning");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_proc_root_and_cwd_aliases_cannot_escape_the_read_floor() {
+    let mut fixture = ProbeFixture::new();
+    let secret = fixture.secret.join("id_probe");
+    let root_alias = PathBuf::from("/proc/self/root").join(
+        secret
+            .strip_prefix("/")
+            .expect("secret fixture is absolute"),
+    );
+    let root_output = fixture.launch_bash(&format!("cat {}", shell_path(&root_alias)));
+    assert_denied(&root_output, "/proc/self/root secret alias");
+    assert!(!root_output
+        .stdout
+        .windows(b"probe-secret".len())
+        .any(|bytes| bytes == b"probe-secret"));
+
+    fixture.profile.rewind();
+    let cwd_output = launcher_command(
+        fixture.profile.fd(),
+        &[
+            "/bin/bash",
+            "-c",
+            "cat /proc/self/cwd/../outside-home/.ssh-like/id_probe",
+        ],
+    )
+    .current_dir(&fixture.project)
+    .output()
+    .expect("launch /proc/self/cwd alias probe");
+    assert_denied(&cwd_output, "/proc/self/cwd secret alias");
+    assert!(!cwd_output
+        .stdout
+        .windows(b"probe-secret".len())
+        .any(|bytes| bytes == b"probe-secret"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_close_range_blocks_proc_and_dev_fd_secret_aliases() {
+    let mut fixture = ProbeFixture::new();
+    let secret = std::fs::File::open(fixture.secret.join("id_probe")).expect("open secret fd");
+    let secret_fd = secret.as_raw_fd();
+    set_close_on_exec(secret_fd, false);
+
+    for alias in [
+        format!("/proc/self/fd/{secret_fd}"),
+        format!("/dev/fd/{secret_fd}"),
+    ] {
+        let output = fixture.launch_bash(&format!("cat {}", shell_path(Path::new(&alias))));
+        assert_denied(&output, "inherited secret descriptor alias");
+        assert!(!output
+            .stdout
+            .windows(b"probe-secret".len())
+            .any(|bytes| bytes == b"probe-secret"));
+    }
+    set_close_on_exec(secret_fd, true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_dev_kmsg_is_not_readable() {
+    let mut fixture = ProbeFixture::new();
+    let output = fixture.launch_bash("head -c 1 /dev/kmsg");
+    assert_denied(&output, "/dev/kmsg read");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_bind_mount_alias_is_readable_only_when_the_host_can_create_it() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("bind-mount alias probe skipped: test process is not root");
+        return;
+    }
+    let mut fixture = ProbeFixture::new();
+    let alias = fixture.project.join("bind-secret");
+    fs::create_dir(&alias).expect("bind alias mountpoint");
+    let status = Command::new("mount")
+        .args(["--bind"])
+        .arg(&fixture.secret)
+        .arg(&alias)
+        .status()
+        .expect("invoke mount");
+    if !status.success() {
+        eprintln!("bind-mount alias probe skipped: mount capability unavailable");
+        return;
+    }
+
+    let output = fixture.launch_bash(&format!("cat {}", shell_path(&alias.join("id_probe"))));
+    let unmount = Command::new("umount")
+        .arg(&alias)
+        .status()
+        .expect("invoke umount");
+    assert!(unmount.success(), "failed to unmount bind alias");
+    assert!(
+        output.status.success(),
+        "pre-existing bind alias is a documented readable gap: {output:?}"
+    );
+    assert_eq!(output.stdout, b"probe-secret\n");
 }
 
 #[test]

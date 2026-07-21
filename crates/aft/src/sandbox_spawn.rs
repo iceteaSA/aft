@@ -3714,4 +3714,33 @@ mod read_allow_tests {
         #[cfg(target_os = "linux")]
         assert!(policy.read_roots.contains(&common));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_hooks_path_is_resolved_to_its_effective_location() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let project = fixture.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .status()
+            .expect("git init")
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "core.hooksPath", "custom-hooks"])
+            .current_dir(&project)
+            .status()
+            .expect("git config")
+            .success());
+
+        let policy = resolve_git_policy(&project).expect("resolve configured hooks path");
+        assert_eq!(
+            policy.hooks,
+            vec![project
+                .canonicalize()
+                .expect("canonical project")
+                .join("custom-hooks")]
+        );
+    }
 }
