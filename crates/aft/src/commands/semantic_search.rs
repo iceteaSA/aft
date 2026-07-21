@@ -291,17 +291,21 @@ fn handle_external_search(
             (index, borrow_metadata)
         }
         ReadOnlyArtifact::Absent => {
-            return external_index_error(
-                    &req.id,
-                    "not_indexed",
-                    format!(
-                        "No AFT search index found for {}. Start an AFT session in that project to build the index before searching it from another root.",
-                        external_root.display()
-                    ),
-                    &external_root,
-                    serde_json::Map::new(),
-                    &ExternalBorrowMetadata::default(),
-                );
+            // No index exists for this foreign root. Rather than dead-ending
+            // with a not_indexed error (which reads to an agent as "this tool
+            // can't help here" and pushes it to shell out to grep/bash), do a
+            // bounded, best-effort lexical scan of the root — exactly what the
+            // `grep` tool already does for an unindexed external root — and
+            // disclose that it is lexical-only. Removing the error branch
+            // removes the escape hatch.
+            return handle_external_unindexed_fallback(
+                req,
+                ctx,
+                &params,
+                top_k,
+                &shape,
+                &external_root,
+            );
         }
         ReadOnlyArtifact::Stale(stale) => {
             let mut borrow_metadata = ExternalBorrowMetadata::from_search_index(&stale.index);
@@ -345,6 +349,111 @@ fn handle_external_search(
             borrow_metadata,
         ),
     }
+}
+
+/// Bounded lexical scan of a foreign git root that has no borrowable AFT
+/// index. Mirrors the `grep` tool's unindexed-external behavior (fallback
+/// filesystem walk via the shared `grep_executor`) so `aft_search` degrades to
+/// real results with a disclosure instead of a hard `not_indexed` error.
+/// Semantic/hybrid intent cannot run without embeddings, so every mode degrades
+/// to a lexical substring/regex scan here.
+fn handle_external_unindexed_fallback(
+    req: &RawRequest,
+    ctx: &AppContext,
+    params: &SemanticSearchParams,
+    top_k: usize,
+    shape: &QueryShape,
+    external_root: &Path,
+) -> Response {
+    let borrow_metadata = ExternalBorrowMetadata::default();
+    let regex_explicit = params.hint == SearchHint::Regex;
+    let literal = !regex_explicit;
+    let compiled = match pattern_compile::compile(
+        &params.query,
+        CompileOpts {
+            literal,
+            ..CompileOpts::default()
+        },
+    ) {
+        CompileResult::Ok(compiled) => compiled,
+        CompileResult::InvalidPattern { message, .. } => {
+            return Response::error_with_data(
+                &req.id,
+                "invalid_pattern",
+                message,
+                external_response_extras(external_root, &borrow_metadata),
+            );
+        }
+        CompileResult::UnsupportedSyntax { feature, .. } => {
+            return Response::error_with_data(
+                &req.id,
+                "unsupported_pattern",
+                format!(
+                    "Pattern uses regex syntax not supported by AFT's engine: {feature}. Use hint:'literal' or rewrite without {feature}."
+                ),
+                external_response_extras(external_root, &borrow_metadata),
+            );
+        }
+    };
+
+    let path_value = serde_json::Value::String(external_root.to_string_lossy().into_owned());
+    let scope = match grep_executor::resolve_grep_scope(ctx, Some(&path_value), top_k, &req.id) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    let grep_params = grep_executor::GrepParams {
+        include: Vec::new(),
+        exclude: Vec::new(),
+        max_results: top_k,
+        path_exclusion: grep_path_exclusion(params.include_tests),
+    };
+    let result = grep_executor::execute(ctx, &compiled, &scope, &grep_params);
+
+    let result_source = if literal { "literal" } else { "regex" };
+    let interpreted_as = if literal { "literal" } else { "regex" };
+    let result_values = result
+        .matches
+        .iter()
+        .map(|grep_match| grep_match_to_json(grep_match, result_source))
+        .collect::<Vec<_>>();
+    let display_root = absolute_display_root(external_root);
+    let text = format_grep_search_text(&result, &display_root, interpreted_as);
+
+    let mut warnings = Vec::new();
+    warnings.push(format!(
+        "No AFT index exists for {} — returning a bounded lexical scan (no semantic ranking). Open a session in that project for full indexed search.",
+        external_root.display()
+    ));
+    if result.walk_truncated {
+        warnings.push(
+            "Lexical scan stopped early (file-count or time budget reached); results may be incomplete.".to_string(),
+        );
+    }
+
+    let extras = external_response_extras(external_root, &borrow_metadata)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    search_response(
+        req,
+        SearchResponseParts {
+            query: &params.query,
+            interpreted_as,
+            query_kind: query_kind_label(shape.kind),
+            semantic_status: "external_unindexed",
+            status: "ready",
+            complete: !result.walk_truncated,
+            text,
+            results: result_values,
+            more_available: result.walk_truncated
+                || result.truncated
+                || result.total_matches > result.matches.len(),
+            engine_capped: result.engine_capped,
+            fully_degraded: true,
+            warnings,
+            extras,
+        },
+    )
 }
 
 fn handle_external_grep_search(
@@ -738,24 +847,6 @@ fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex)
         .fingerprint()
         .map(|fingerprint| fingerprint.as_string() == expected.as_string())
         .unwrap_or(false)
-}
-
-fn external_index_error(
-    request_id: &str,
-    code: &str,
-    message: String,
-    external_root: &Path,
-    mut extras: serde_json::Map<String, serde_json::Value>,
-    borrow_metadata: &ExternalBorrowMetadata,
-) -> Response {
-    for (key, value) in external_response_extras(external_root, borrow_metadata)
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
-    {
-        extras.insert(key, value);
-    }
-    Response::error_with_data(request_id, code, message, serde_json::Value::Object(extras))
 }
 
 fn external_response_extras(

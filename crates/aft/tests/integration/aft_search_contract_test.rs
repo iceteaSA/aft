@@ -736,9 +736,9 @@ fn external_missing_path_returns_path_not_found() {
 }
 
 #[test]
-fn external_absent_cache_returns_not_indexed() {
+fn external_absent_cache_degrades_to_lexical_fallback_scan() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    let (external_project, _external_source, _source) = git_project_with_needle();
+    let (external_project, external_source, _source) = git_project_with_needle();
     let session_project = tempfile::tempdir().expect("session project");
     let storage = tempfile::tempdir().expect("storage");
     let ctx = test_context_with_storage(session_project.path(), storage.path());
@@ -748,13 +748,34 @@ fn external_absent_cache_returns_not_indexed() {
         &ctx,
     ));
 
-    assert_eq!(response["success"], false);
-    assert_eq!(response["code"], "not_indexed");
+    // An unindexed foreign root must degrade to a bounded lexical scan with a
+    // disclosure — not dead-end with a not_indexed error (which pushes agents
+    // to shell out to grep/bash instead of staying on aft_search).
+    assert_eq!(response["success"], true, "expected success: {response:?}");
+    assert_eq!(response["fully_degraded"], true);
+    assert_eq!(response["semantic_status"], "external_unindexed");
+    assert_eq!(response["borrowed"], true);
+    let results = response["results"].as_array().expect("results array");
     assert!(
-        response["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("No AFT search index found")),
-        "expected unchanged not_indexed message: {response:?}"
+        results.iter().any(|result| {
+            result["file"]
+                .as_str()
+                .is_some_and(|file| external_source.display().to_string().contains(file))
+                || result["file"].as_str().is_some_and(|file| {
+                    Path::new(file).file_name() == external_source.file_name()
+                })
+        }),
+        "expected the lexical fallback to actually find needle_symbol in the \
+         external repo: {response:?}"
+    );
+    let warnings = response["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|text| text.contains("bounded lexical scan"))
+        }),
+        "expected the no-index disclosure warning: {response:?}"
     );
 }
 
