@@ -105,8 +105,7 @@ command=$2
 exit_fd=$3
 "$shell" -c "$command"
 code=$?
-# POSIX sh (dash) rejects `>&"$var"`; eval expands the fd to a literal first.
-eval "printf '%s' \"\$code\" >&$exit_fd"
+printf "%s" "$code" >&"$exit_fd"
 exit "$code"
 "#;
 #[cfg(unix)]
@@ -2650,9 +2649,9 @@ shift 4
 "$launcher" sandbox-launch --profile-json "$profile_json" -- "$@"
 code=$?
 if [ "$code" -eq 78 ]; then
-  eval "printf '%s' sandbox_unavailable >&$failure_fd"
+  printf "%s" sandbox_unavailable >&"$failure_fd"
   if [ ! -s "/dev/fd/$exit_fd" ]; then
-    eval "printf '%s' \"\$code\" >&$exit_fd"
+    printf "%s" "$code" >&"$exit_fd"
   fi
 fi
 exit "$code""#,
@@ -3279,18 +3278,35 @@ mod policy_tests {
             .open(&exit_path)
             .unwrap();
         crate::bash_background::persistence::set_close_on_exec(exit.as_raw_fd(), false).unwrap();
-        let exit_fd = exit.as_raw_fd().to_string();
-        let status = Command::new("/bin/sh")
-            .args([
-                OsStr::new("-c"),
-                payload.wrapper_text.as_os_str(),
-                OsStr::new("aft-payload-wrapper"),
-                OsStr::new("/bin/sh"),
-                payload.command_text.as_os_str(),
-                OsStr::new(&exit_fd),
-            ])
-            .status()
-            .unwrap();
+        // Mirror production (apply_marker_fd_allowlist): the real marker fd is
+        // dup2'd onto the low, single-digit CHILD_EXIT_FD before exec, and the
+        // wrapper is handed that literal. POSIX sh (dash) only parses a
+        // single-digit `>&N` redirect target, so passing a raw multi-digit fd
+        // here would diverge from production and fail under dash with
+        // "Bad fd number" (production never hits this: it always remaps to 3).
+        let raw_exit_fd = exit.as_raw_fd();
+        let exit_fd = CHILD_EXIT_FD.to_string();
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            OsStr::new("-c"),
+            payload.wrapper_text.as_os_str(),
+            OsStr::new("aft-payload-wrapper"),
+            OsStr::new("/bin/sh"),
+            payload.command_text.as_os_str(),
+            OsStr::new(&exit_fd),
+        ]);
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                command.pre_exec(move || {
+                    if raw_exit_fd != CHILD_EXIT_FD && libc::dup2(raw_exit_fd, CHILD_EXIT_FD) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let status = command.status().unwrap();
         assert!(status.success());
         assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
     }
