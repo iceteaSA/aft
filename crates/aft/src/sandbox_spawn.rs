@@ -28,13 +28,13 @@ use std::ffi::{OsStr, OsString};
 use std::fs::DirBuilder;
 use std::fs::File;
 #[cfg(unix)]
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
-use std::os::fd::RawFd;
 #[cfg(not(unix))]
 type RawFd = i32;
 #[cfg(unix)]
@@ -300,12 +300,31 @@ impl SpawnPlan {
     #[cfg(unix)]
     pub(crate) fn with_prepared_task(self, task: PreparedTask) -> Self {
         if matches!(self, Self::Refused { .. }) {
-            self
-        } else {
-            Self::Prepared {
-                plan: Box::new(self),
-                task,
+            return self;
+        }
+
+        #[cfg(target_os = "linux")]
+        let mut plan = self;
+        #[cfg(not(target_os = "linux"))]
+        let plan = self;
+
+        #[cfg(target_os = "linux")]
+        if let Self::Launcher { profile, .. } = &mut plan {
+            let payload_grants = task.payload_read_grants();
+            if let Err(error) = add_linux_payload_read_grants(profile, &payload_grants) {
+                return Self::Refused {
+                    code: "sandbox_unavailable",
+                    message: format!(
+                        "native sandbox payload read grants violate the read floor: {error}"
+                    ),
+                    mismatch_class: None,
+                };
             }
+        }
+
+        Self::Prepared {
+            plan: Box::new(plan),
+            task,
         }
     }
 
@@ -1769,6 +1788,43 @@ fn build_linux_read_allow(
 }
 
 #[cfg(target_os = "linux")]
+fn add_linux_payload_read_grants(
+    profile: &mut SandboxProfile,
+    payload_grants: &[PathBuf],
+) -> Result<(), String> {
+    let intended = payload_grants
+        .iter()
+        .map(|path| {
+            let path = path.canonicalize().map_err(|error| {
+                format!(
+                    "mandatory payload read path is unavailable: {}: {error}",
+                    path.display()
+                )
+            })?;
+            Ok(IntendedReadGrant {
+                path,
+                force_children: false,
+                mandatory: true,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut lister = SecureReadDirectoryLister;
+    let payload_grants = split_read_grants(&intended, &profile.read_deny, &mut lister)?;
+
+    let mut final_read_allow = profile.read_allow.clone();
+    final_read_allow.extend(payload_grants);
+    final_read_allow.sort_unstable();
+    final_read_allow.dedup();
+    validate_final_read_rules(&final_read_allow, &profile.read_deny)?;
+    assert!(
+        validate_final_read_rules(&final_read_allow, &profile.read_deny).is_ok(),
+        "final Landlock read grants overlap a denied path after adding payload files"
+    );
+    profile.read_allow = final_read_allow;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn canonicalize_existing_static(path: &Path) -> Result<Option<PathBuf>, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => match path.canonicalize() {
@@ -1871,7 +1927,7 @@ fn validate_mandatory_floor_overlap<'a>(
                     secret.display()
                 ));
             }
-            }
+        }
     }
     Ok(())
 }
@@ -3343,6 +3399,7 @@ mod policy_tests {
             vec![project.path().to_path_buf()],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             vec![task.paths().control_dir.clone()],
             Vec::new(),
             Vec::new(),
@@ -3356,6 +3413,52 @@ mod policy_tests {
             path.parent() == Some(task.paths().control_dir.as_path())
                 && path != &task.paths().manifest
         }));
+
+        #[cfg(target_os = "linux")]
+        {
+            let refused = SpawnPlan::launcher_for_test(b2_profile, PathBuf::from("/usr/bin/false"))
+                .with_prepared_task(task.clone());
+            assert_eq!(refused.refusal_code(), Some("sandbox_unavailable"));
+            assert!(refused
+                .refusal_message()
+                .is_some_and(|message| message.contains("mandatory read root")));
+
+            let allowed_temp = storage.path().join("allowed-sandbox-temp");
+            std::fs::create_dir_all(&allowed_temp).unwrap();
+            let allowed_profile = SandboxProfile::build(
+                vec![project.path().to_path_buf()],
+                Vec::new(),
+                Vec::new(),
+                vec![project.path().to_path_buf()],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                allowed_temp,
+            )
+            .unwrap();
+            let prepared =
+                SpawnPlan::launcher_for_test(allowed_profile, PathBuf::from("/usr/bin/true"))
+                    .with_prepared_task(task.clone());
+            let profile = match prepared {
+                SpawnPlan::Prepared { plan, .. } => match *plan {
+                    SpawnPlan::Launcher { profile, .. } => profile,
+                    other => panic!("expected launcher plan, got {other:?}"),
+                },
+                other => panic!("expected prepared plan, got {other:?}"),
+            };
+            let canonical_payloads = grants
+                .iter()
+                .map(|path| path.canonicalize().unwrap())
+                .collect::<Vec<_>>();
+            assert!(canonical_payloads
+                .iter()
+                .all(|path| profile.read_allow.contains(path)));
+            assert!(profile.read_allow.iter().all(|path| {
+                !path.starts_with(&task.paths().control_dir) || canonical_payloads.contains(path)
+            }));
+            validate_final_read_rules(&profile.read_allow, &profile.read_deny).unwrap();
+        }
+
         assert_eq!(task.environment(), &environment);
     }
 
@@ -3371,6 +3474,7 @@ mod policy_tests {
             }
             SandboxProfile::build(
                 vec![project, write_root],
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
