@@ -194,14 +194,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.47.3";
+const ANNOUNCEMENT_VERSION = "0.48.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Fixed: aft_search could return zero results when a match existed — hidden test files consumed the result cap before source files were reached.",
-  "Fixed: aft_import removing one name from a comma-separated PHP use (use A, B) deleted the sibling; Java static-member removal is fixed the same way.",
-  "Fixed: aft_safety restore now preserves Unix permission bits (including the executable bit); aft_conflicts keeps conflicts with non-ASCII filenames.",
-  "Fixed: aft_inspect no longer counts TODO markers inside strings and now reports self-import cycles; trace_data no longer reports a flow after the variable is overwritten.",
-  "Long-running daemon sessions fully reclaim idle projects (lower memory), and daemon restarts no longer trigger a re-embedding storm.",
-  "Faster indexed search, tool dispatch, call trees, and duplicate scans across the board.",
+  "New (beta, off by default): an optional native sandbox for hoisted bash. Confines commands to your project and blocks reads of your credentials (~/.ssh, ~/.aws, cloud configs). Enable with sandbox.enabled in aft.jsonc — macOS and Linux; see docs/config.md for the platform matrix.",
+  "Fixed: Windows background bash tasks could report failed with no exit code after a detach/rebind — completion is now recorded reliably.",
+  "Fixed: search no longer rebuilds its index unnecessarily for repositories with grafted history.",
 ];
 
 /**
