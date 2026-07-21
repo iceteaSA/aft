@@ -481,6 +481,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn repeated_borrowed_opens_cache_one_load_per_artifact_generation() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -628,6 +629,7 @@ mod tests {
         assert!(result.engine_capped);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn search_opener_skips_full_corpus_strict_census() {
         let _git_env = crate::test_env::hermetic_git_env_guard();

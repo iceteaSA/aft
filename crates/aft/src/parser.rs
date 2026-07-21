@@ -9597,6 +9597,7 @@ pub(crate) mod outer {
         (dir, file, mtime, size, hash)
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_unchanged_metadata_skips_hashing() {
         let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
@@ -9606,6 +9607,7 @@ pub(crate) mod outer {
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_mtime_with_identical_content_hashes_fresh() {
         let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
@@ -9616,6 +9618,7 @@ pub(crate) mod outer {
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_mtime_and_same_size_content_hashes_stale() {
         let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn one() {}\n");
@@ -9628,6 +9631,7 @@ pub(crate) mod outer {
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_size_skips_hashing() {
         let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");

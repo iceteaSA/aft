@@ -5279,6 +5279,7 @@ mod tests {
         assert_rank_matches_reference(&index, &duplicate_query, None, 40);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn lexical_rank_reads_each_distinct_query_posting_list_once() {
         let (_dir, index) = lexical_rank_mixed_storage_fixture();
