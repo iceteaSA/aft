@@ -122,6 +122,7 @@ mod tests {
             writable_roots: vec![project],
             write_deny: Vec::new(),
             write_deny_nested: vec![nested_deny],
+            read_allow: Vec::new(),
             read_deny: Vec::new(),
             socket_deny: Vec::new(),
             cache_roots: Vec::new(),
@@ -146,6 +147,7 @@ mod tests {
         let profile = SandboxProfile::build(
             vec![home],
             vec![secret_floor.clone()],
+            Vec::new(),
             Vec::new(),
             vec![secret_floor],
             Vec::new(),
@@ -186,6 +188,7 @@ mod tests {
             vec![project],
             Vec::new(),
             vec![missing_git.clone()],
+            Vec::new(),
             vec![missing_secret.clone()],
             vec![missing_socket.clone()],
             Vec::new(),

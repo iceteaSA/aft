@@ -1253,6 +1253,7 @@ fn build_native_profile(
             writable_roots,
             write_deny,
             write_deny_nested,
+            Vec::new(),
             read_deny,
             socket_deny,
             cache_roots,
@@ -1811,6 +1812,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             temp,
         )
         .unwrap();
@@ -1904,6 +1906,7 @@ mod tests {
         std::fs::create_dir_all(&temp).unwrap();
         let profile = SandboxProfile::build(
             vec![project],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

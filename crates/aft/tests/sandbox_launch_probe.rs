@@ -64,6 +64,7 @@ impl ProbeFixture {
             vec![project.clone(), artifacts],
             Vec::new(),
             vec![project.join(".git"), project.join(".cortexkit")],
+            Vec::new(),
             vec![secret.clone()],
             vec![docker_socket.clone(), agent_socket.clone()],
             vec![cargo_cache, npm_cache],
@@ -334,6 +335,7 @@ fn missing_project_metadata_remains_write_denied() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         task_temp,
     )
     .expect("build profile with absent metadata deny");
@@ -367,6 +369,7 @@ fn read_deny_created_after_sandbox_start_remains_denied() {
     let release = root.join("release");
     let profile = SandboxProfile::build(
         vec![project],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         vec![secret_dir.clone()],
@@ -534,6 +537,7 @@ fn macos_secret_floor_write_is_denied_under_enclosing_write_root() {
     let profile = SandboxProfile::build(
         vec![home.clone(), work],
         vec![secret_floor.clone()],
+        Vec::new(),
         Vec::new(),
         vec![secret_floor],
         Vec::new(),

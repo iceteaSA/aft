@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-pub const SANDBOX_PROFILE_VERSION: u32 = 1;
+pub const SANDBOX_PROFILE_VERSION: u32 = 2;
 
 /// Versioned policy transferred to `aft sandbox-launch` by descriptor or private task file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +14,9 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub write_deny: Vec<PathBuf>,
     pub write_deny_nested: Vec<PathBuf>,
+    /// Existing paths that Landlock may grant read access beneath.
+    #[serde(default)]
+    pub read_allow: Vec<PathBuf>,
     pub read_deny: Vec<PathBuf>,
     pub socket_deny: Vec<PathBuf>,
     pub cache_roots: Vec<PathBuf>,
@@ -23,13 +26,14 @@ pub struct SandboxProfile {
 impl SandboxProfile {
     /// Build a profile whose existing paths are canonical before serialization.
     ///
-    /// Writable roots, cache roots, and the task temp directory must already
+    /// Writable roots, read grants, cache roots, and the task temp directory must already
     /// exist. Missing deny targets are normalized through their nearest
     /// existing ancestor so resources created after launch remain enforceable.
     pub fn build(
         writable_roots: Vec<PathBuf>,
         write_deny: Vec<PathBuf>,
         write_deny_nested: Vec<PathBuf>,
+        read_allow: Vec<PathBuf>,
         read_deny: Vec<PathBuf>,
         socket_deny: Vec<PathBuf>,
         cache_roots: Vec<PathBuf>,
@@ -40,6 +44,7 @@ impl SandboxProfile {
             writable_roots: canonicalize_required_dirs(writable_roots, "writable_roots")?,
             write_deny: canonicalize_optional_paths(write_deny, "write_deny")?,
             write_deny_nested: canonicalize_optional_paths(write_deny_nested, "write_deny_nested")?,
+            read_allow: canonicalize_required_paths(read_allow, "read_allow")?,
             read_deny: canonicalize_optional_paths(read_deny, "read_deny")?,
             socket_deny: canonicalize_optional_paths(socket_deny, "socket_deny")?,
             cache_roots: canonicalize_required_dirs(cache_roots, "cache_roots")?,
@@ -67,6 +72,7 @@ impl SandboxProfile {
                 self.write_deny_nested,
                 "write_deny_nested",
             )?,
+            read_allow: canonicalize_required_paths(self.read_allow, "read_allow")?,
             read_deny: canonicalize_optional_paths(self.read_deny, "read_deny")?,
             socket_deny: canonicalize_optional_paths(self.socket_deny, "socket_deny")?,
             cache_roots: canonicalize_required_dirs(self.cache_roots, "cache_roots")?,
@@ -133,6 +139,25 @@ fn canonicalize_required_dir(path: PathBuf, field: &str) -> Result<PathBuf, Sand
             path.display()
         )));
     }
+    Ok(canonical)
+}
+
+fn canonicalize_required_paths(
+    paths: Vec<PathBuf>,
+    field: &str,
+) -> Result<Vec<PathBuf>, SandboxProfileError> {
+    let mut canonical = Vec::with_capacity(paths.len());
+    for path in paths {
+        validate_absolute(&path, field)?;
+        canonical.push(path.canonicalize().map_err(|error| {
+            SandboxProfileError::new(format!(
+                "{field} path does not exist: {}: {error}",
+                path.display()
+            ))
+        })?);
+    }
+    canonical.sort_unstable();
+    canonical.dedup();
     Ok(canonical)
 }
 
@@ -237,6 +262,7 @@ mod tests {
         std::fs::create_dir_all(&project).expect("project");
         std::fs::create_dir_all(&cache).expect("cache");
         std::fs::create_dir_all(&temp).expect("temp");
+        std::fs::write(project.join("readable.txt"), b"readable").expect("readable file");
         let missing = root.path().join("missing-secret");
         let canonical_missing = root
             .path()
@@ -248,6 +274,7 @@ mod tests {
             vec![project.clone()],
             Vec::new(),
             Vec::new(),
+            vec![project.join("readable.txt")],
             vec![missing.clone()],
             Vec::new(),
             vec![cache.clone()],
@@ -259,9 +286,68 @@ mod tests {
             profile.writable_roots,
             vec![project.canonicalize().unwrap()]
         );
+        assert_eq!(
+            profile.read_allow,
+            vec![project.join("readable.txt").canonicalize().unwrap()]
+        );
         assert_eq!(profile.cache_roots, vec![cache.canonicalize().unwrap()]);
         assert_eq!(profile.temp_dir, temp.canonicalize().unwrap());
         assert_eq!(profile.read_deny, vec![canonical_missing]);
+    }
+
+    #[test]
+    fn mixed_profile_versions_fail_closed() {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyProfile {
+            v: u32,
+            writable_roots: Vec<PathBuf>,
+            #[serde(default)]
+            write_deny: Vec<PathBuf>,
+            write_deny_nested: Vec<PathBuf>,
+            read_deny: Vec<PathBuf>,
+            socket_deny: Vec<PathBuf>,
+            cache_roots: Vec<PathBuf>,
+            temp_dir: PathBuf,
+        }
+
+        let root = tempfile::tempdir().expect("temp root");
+        let root = root.path().canonicalize().expect("canonical root");
+        let legacy_json = serde_json::json!({
+            "v": 1,
+            "writable_roots": [root],
+            "write_deny": [],
+            "write_deny_nested": [],
+            "read_deny": [],
+            "socket_deny": [],
+            "cache_roots": [],
+            "temp_dir": root,
+        });
+        let legacy: SandboxProfile =
+            serde_json::from_value(legacy_json).expect("v1 shape remains parseable");
+        let error = legacy
+            .canonicalize_for_launch()
+            .expect_err("new launcher must reject a v1 profile");
+        assert!(error
+            .to_string()
+            .contains("unsupported sandbox profile version 1; expected 2"));
+
+        let current = SandboxProfile::build(
+            vec![root.clone()],
+            Vec::new(),
+            Vec::new(),
+            vec![root.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            root,
+        )
+        .expect("current profile");
+        let error = serde_json::from_value::<LegacyProfile>(
+            serde_json::to_value(current).expect("serialize current profile"),
+        )
+        .expect_err("v1 launcher shape must reject read_allow");
+        assert!(error.to_string().contains("unknown field `read_allow`"));
     }
 
     #[test]
@@ -273,6 +359,7 @@ mod tests {
             writable_roots: vec![root.clone()],
             write_deny: vec![root.join("missing-write-deny")],
             write_deny_nested: vec![root.join("missing-nested")],
+            read_allow: vec![root.clone()],
             read_deny: vec![root.join("missing-secret")],
             socket_deny: vec![root.join("missing.sock")],
             cache_roots: Vec::new(),
