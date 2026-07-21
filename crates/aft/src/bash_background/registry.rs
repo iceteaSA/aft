@@ -6476,7 +6476,7 @@ mod tests {
     /// authoritative exit marker through its retained handle.
     #[cfg(windows)]
     #[test]
-    fn windows_shell_cmd_wrapper_avoids_marker_path_writes() {
+    fn windows_shell_cmd_wrapper_writes_marker_via_temp_rename() {
         let exit_path = Path::new(r"C:\Temp\bash-test.exit");
         let script =
             crate::windows_shell::WindowsShell::Cmd.wrapper_script("cmd /c exit 42", exit_path);
@@ -6489,8 +6489,18 @@ mod tests {
             script.contains("exit /B %CODE%"),
             "wrapper must propagate the child exit code: {script}"
         );
-        assert!(!script.contains("bash-test.exit"), "{script}");
-        assert!(!script.contains("move /Y"), "{script}");
+        // The child records its own exit marker into io/ via temp-file +
+        // rename so detached tasks whose spawning daemon is gone still report
+        // exit. In-place writes are blocked by the daemon's retained io/exit
+        // handle; the rename succeeds (FILE_SHARE_DELETE) and swaps atomically.
+        assert!(
+            script.contains("bash-test.exit"),
+            "wrapper must target the exit marker path: {script}"
+        );
+        assert!(
+            script.contains("move /Y"),
+            "wrapper must write the marker atomically via temp-file + rename: {script}"
+        );
     }
 
     /// `bg_command()` for Cmd no longer needs `/V:ON` — the wrapper is now
