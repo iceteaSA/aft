@@ -1233,11 +1233,16 @@ fn build_native_profile(
         // The credential floor denies both read and write. Linux rejects any
         // writable overlap because Landlock cannot subtract write rights.
         let write_deny = secret_floor.clone();
+        #[cfg(target_os = "macos")]
+        let mut write_deny = write_deny;
         let mut write_deny_nested = Vec::new();
         let mut read_deny = secret_floor;
         for (root, git_policy) in project_roots.iter().zip(&git_policies) {
+            #[cfg(target_os = "linux")]
             write_deny_nested.push(root.join(".git"));
             write_deny_nested.push(root.join(".cortexkit"));
+            #[cfg(target_os = "macos")]
+            write_deny.extend(git_policy.hooks.iter().cloned());
             read_deny.extend(git_policy.hooks.iter().cloned());
         }
         #[cfg(target_os = "linux")]

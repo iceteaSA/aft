@@ -420,7 +420,7 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn native_sandbox_denies_credentials_and_nested_git_writes_on_macos() {
+fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_macos() {
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
@@ -484,10 +484,26 @@ fn native_sandbox_denies_credentials_and_nested_git_writes_on_macos() {
         &format!("printf corrupted > {}", quote(&git_config)),
     );
     assert_eq!(
-        git_write["status"], "failed",
-        "nested git write should fail: {git_write:?}"
+        git_write["status"], "completed",
+        "ordinary Git metadata write should pass: {git_write:?}"
     );
-    assert_eq!(std::fs::read_to_string(&git_config).unwrap(), "safe");
+    assert_eq!(std::fs::read_to_string(&git_config).unwrap(), "corrupted");
+
+    let hook = git.join("hooks/pre-commit");
+    let hook_write = foreground(
+        &mut aft,
+        "native-hook-write",
+        &format!(
+            "mkdir -p {} && printf pwned > {}",
+            quote(hook.parent().unwrap()),
+            quote(&hook)
+        ),
+    );
+    assert_eq!(
+        hook_write["status"], "failed",
+        "Git hook write should fail: {hook_write:?}"
+    );
+    assert!(!hook.exists());
 
     assert!(aft.shutdown().success());
 }

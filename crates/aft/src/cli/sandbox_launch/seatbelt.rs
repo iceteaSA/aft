@@ -44,7 +44,9 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<(), String> {
 }
 
 fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
-    let mut source = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+    let mut source = String::from(
+        "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
+    );
 
     for root in profile.write_allow_roots() {
         source.push_str(&format!(
@@ -134,6 +136,40 @@ mod tests {
             .rfind("(deny file-write*")
             .expect("nested write deny");
         assert!(deny > allow, "nested deny must be the last matching rule");
+    }
+
+    #[test]
+    fn hooks_denies_follow_project_allow_for_git_friendly_ordering() {
+        let root = tempfile::tempdir().expect("temp root");
+        let project = root.path().join("project");
+        let hooks = project.join(".git/hooks");
+        let task_temp = root.path().join("task");
+        std::fs::create_dir_all(&hooks).expect("hooks directory");
+        std::fs::create_dir_all(&task_temp).expect("task temp directory");
+        let profile = SandboxProfile::build(
+            vec![project],
+            vec![hooks.clone()],
+            Vec::new(),
+            Vec::new(),
+            vec![hooks],
+            Vec::new(),
+            Vec::new(),
+            task_temp,
+        )
+        .expect("build profile");
+
+        let source = render_profile(&profile).expect("render profile");
+        let allow = source
+            .find("(allow file-write*")
+            .expect("project write allow");
+        let hook_write_deny = source
+            .find("(deny file-write* (subpath")
+            .expect("hooks write deny");
+        let hook_read_deny = source
+            .find("(deny file-read* (subpath")
+            .expect("hooks read deny");
+        assert!(hook_write_deny > allow);
+        assert!(hook_read_deny > hook_write_deny);
     }
 
     #[test]

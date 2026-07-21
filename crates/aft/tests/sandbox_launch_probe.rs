@@ -357,6 +357,66 @@ fn missing_project_metadata_remains_write_denied() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_git_init_add_and_commit_pass_but_hooks_write_fails() {
+    let root = tempfile::tempdir().expect("create probe root");
+    let root = root.path().canonicalize().expect("canonical probe root");
+    let project = root.join("project");
+    let task_temp = root.join("task-temp");
+    fs::create_dir_all(&project).expect("create project");
+    fs::create_dir_all(&task_temp).expect("create task temp");
+    let hooks = project.join(".git/hooks");
+    let profile = SandboxProfile::build(
+        vec![project.clone()],
+        vec![hooks.clone()],
+        Vec::new(),
+        Vec::new(),
+        vec![hooks.clone()],
+        Vec::new(),
+        Vec::new(),
+        task_temp,
+    )
+    .expect("build git-friendly profile");
+    let mut inherited = InheritedProfile::new(&profile);
+    inherited.rewind();
+
+    let output = launcher_command(
+        inherited.fd(),
+        &[
+            "/bin/bash",
+            "-c",
+            "git init -q --template= && printf tracked > tracked && git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm initial",
+        ],
+    )
+    .current_dir(&project)
+    .output()
+    .expect("launch git regression probe");
+    assert!(
+        output.status.success(),
+        "git init/add/commit failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.join(".git/index").is_file());
+
+    inherited.rewind();
+    let hook = hooks.join("pre-commit");
+    let output = launcher_command(
+        inherited.fd(),
+        &[
+            "/bin/bash",
+            "-c",
+            &format!("printf pwned > {}", shell_path(&hook)),
+        ],
+    )
+    .current_dir(&project)
+    .output()
+    .expect("launch hook-write probe");
+    assert_denied(&output, "hooks write");
+    assert!(!hook.exists(), "sandbox created a denied hook");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn read_deny_created_after_sandbox_start_remains_denied() {
     let root = tempfile::tempdir().expect("create probe root");
     let root = root.path().canonicalize().expect("canonical probe root");
