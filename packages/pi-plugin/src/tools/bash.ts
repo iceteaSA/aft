@@ -1112,8 +1112,6 @@ async function readNewTaskOutput(
   };
 }
 
-
-
 function parseWaitPattern(value: unknown): BashWaitPattern | undefined {
   if (typeof value === "string") return { kind: "substring", value };
   if (isRegexWaitObject(value)) return { kind: "regex", source: value.regex };

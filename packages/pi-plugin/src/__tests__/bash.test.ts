@@ -53,7 +53,13 @@ async function addArtifactBytes(
     }
   };
   if (data.mode === "pty") {
-    await attach("output_path", "output_offset", "output_chunk_base64", "output_next_offset", "pty_raw");
+    await attach(
+      "output_path",
+      "output_offset",
+      "output_chunk_base64",
+      "output_next_offset",
+      "pty_raw",
+    );
   } else {
     await attach("output_path", "output_offset", "output_chunk_base64", "output_next_offset");
     await attach("stderr_path", "stderr_offset", "stderr_chunk_base64", "stderr_next_offset");
