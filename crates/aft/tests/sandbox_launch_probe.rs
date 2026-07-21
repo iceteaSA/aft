@@ -198,6 +198,27 @@ fn linux_system_read_allow() -> Vec<PathBuf> {
     .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn landlock_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new(AFT_BIN)
+            .args(["sandbox-launch", "--support"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
+}
+
+macro_rules! skip_if_landlock_absent {
+    () => {
+        #[cfg(target_os = "linux")]
+        if !landlock_available() {
+            eprintln!("Landlock probe skipped: mandatory ABI is unavailable");
+            return;
+        }
+    };
+}
+
 fn assert_denied(output: &Output, context: &str) {
     assert!(
         !output.status.success(),
@@ -238,6 +259,7 @@ fn connect_unix_socket(fixture: &mut ProbeFixture, path: &Path) -> Output {
 
 #[test]
 fn launcher_support_reports_first_party_backend() {
+    skip_if_landlock_absent!();
     let output = Command::new(AFT_BIN)
         .args(["sandbox-launch", "--support"])
         .output()
@@ -316,6 +338,7 @@ fn v1_profile_is_a_structured_sandbox_unavailable_failure() {
 
 #[test]
 fn target_arguments_are_not_interpreted_as_global_aft_flags() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     fixture.profile.rewind();
     let output = launcher_command(
@@ -330,6 +353,7 @@ fn target_arguments_are_not_interpreted_as_global_aft_flags() {
 
 #[test]
 fn p1_write_inside_project_is_allowed() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let destination = fixture.project.join("p1-created");
     let output = fixture.launch_bash(&format!("touch {}", shell_path(&destination)));
@@ -343,6 +367,7 @@ fn p1_write_inside_project_is_allowed() {
 
 #[test]
 fn p2_recursive_delete_outside_allowlist_is_denied() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let sentinel = fixture.outside_home.join("keep/sentinel");
     fs::create_dir_all(sentinel.parent().expect("sentinel parent")).expect("create sentinel dir");
@@ -359,6 +384,7 @@ fn p2_recursive_delete_outside_allowlist_is_denied() {
 
 #[test]
 fn p3_nested_children_inherit_confinement() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let destination = fixture.outside_home.join("nested-child-write");
     let inner = format!("touch {}", shell_path(&destination));
@@ -547,6 +573,7 @@ fn read_deny_created_after_sandbox_start_remains_denied() {
 #[cfg(target_os = "linux")]
 #[test]
 fn home_directory_created_after_launch_remains_read_denied() {
+    skip_if_landlock_absent!();
     let root = tempfile::tempdir().expect("create probe root");
     let root = root.path().canonicalize().expect("canonical probe root");
     let home = root.join("home");
@@ -606,6 +633,7 @@ fn home_directory_created_after_launch_remains_read_denied() {
 #[cfg(target_os = "linux")]
 #[test]
 fn p4_linux_records_nested_project_deny_gap() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let cortex_destination = fixture.project.join(".cortexkit/linux-gap");
     let hook_destination = fixture.project.join(".git/hooks/linux-gap");
@@ -626,6 +654,7 @@ fn p4_linux_records_nested_project_deny_gap() {
 
 #[test]
 fn p5_secret_read_is_denied_and_other_reads_are_allowed() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let secret_file = fixture.secret.join("id_probe");
     let secret_output = fixture.launch_bash(&format!("cat {}", shell_path(&secret_file)));
@@ -770,6 +799,7 @@ fn macos_secret_floor_write_is_denied_under_enclosing_write_root() {
 
 #[test]
 fn p6_symlink_escape_is_denied_at_access_time() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let outside_target = fixture.outside_home.join("symlink-target");
     fs::create_dir(&outside_target).expect("create symlink target");
@@ -787,6 +817,7 @@ fn p6_symlink_escape_is_denied_at_access_time() {
 
 #[test]
 fn p7_preexisting_hardlink_alias_is_asserted_writable_gap() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let outside_file = fixture.outside_home.join("hardlink-target");
     let inside_link = fixture.project.join("hardlink-inside");
@@ -807,6 +838,7 @@ fn p7_preexisting_hardlink_alias_is_asserted_writable_gap() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_refer_denies_laundering_secret_with_a_new_hard_link() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let source = fixture.secret.join("id_probe");
     let destination = fixture.project.join("laundered-secret");
@@ -828,6 +860,7 @@ fn linux_refer_denies_laundering_secret_with_a_new_hard_link() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_refer_allows_rename_inside_writable_project() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let source = fixture.project.join("rename-source");
     let destination = fixture.project.join("rename-destination");
@@ -880,6 +913,7 @@ fn p8_docker_and_agent_socket_connects_are_denied() {
 #[cfg(target_os = "linux")]
 #[test]
 fn p8_linux_records_socket_connect_gap() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let socket_path = fixture.docker_socket.clone();
     let listener = UnixListener::bind(&socket_path).expect("bind fake docker socket");
@@ -902,6 +936,7 @@ fn p8_linux_records_socket_connect_gap() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_proc_root_and_cwd_aliases_cannot_escape_the_read_floor() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let secret = fixture.secret.join("id_probe");
     let root_alias = PathBuf::from("/proc/self/root").join(
@@ -938,6 +973,7 @@ fn linux_proc_root_and_cwd_aliases_cannot_escape_the_read_floor() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_close_range_blocks_proc_and_dev_fd_secret_aliases() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let secret = std::fs::File::open(fixture.secret.join("id_probe")).expect("open secret fd");
     let secret_fd = secret.as_raw_fd();
@@ -960,6 +996,7 @@ fn linux_close_range_blocks_proc_and_dev_fd_secret_aliases() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_dev_kmsg_is_not_readable() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let output = fixture.launch_bash("head -c 1 /dev/kmsg");
     assert_denied(&output, "/dev/kmsg read");
@@ -968,6 +1005,7 @@ fn linux_dev_kmsg_is_not_readable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_bind_mount_alias_is_readable_only_when_the_host_can_create_it() {
+    skip_if_landlock_absent!();
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("bind-mount alias probe skipped: test process is not root");
         return;
@@ -1001,6 +1039,7 @@ fn linux_bind_mount_alias_is_readable_only_when_the_host_can_create_it() {
 
 #[test]
 fn p9_pty_child_and_nested_child_remain_confined() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     let destination = fixture.outside_home.join("pty-nested-write");
     let inner = format!("touch {}", shell_path(&destination));
@@ -1057,6 +1096,7 @@ fn p9_pty_child_and_nested_child_remain_confined() {
 
 #[test]
 fn p10_launcher_latency_delta_is_measured_over_twenty_iterations() {
+    skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     const ITERATIONS: u32 = 20;
 

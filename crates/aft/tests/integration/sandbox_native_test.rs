@@ -14,6 +14,27 @@ fn quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
+#[cfg(target_os = "linux")]
+fn landlock_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new(env!("CARGO_BIN_EXE_aft"))
+            .args(["sandbox-launch", "--support"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
+}
+
+macro_rules! skip_if_landlock_absent {
+    () => {
+        #[cfg(target_os = "linux")]
+        if !landlock_available() {
+            eprintln!("Landlock integration skipped: mandatory ABI is unavailable");
+            return;
+        }
+    };
+}
+
 fn configure_native_policy(
     aft: &mut AftProcess,
     project: &Path,
@@ -119,6 +140,7 @@ fn wait_for_terminal(aft: &mut AftProcess, task_id: &str, output_mode: Option<&s
 
 #[test]
 fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
+    skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
@@ -266,6 +288,7 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
 
 #[test]
 fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
+    skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
@@ -513,6 +536,7 @@ fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_mac
 #[cfg(target_os = "linux")]
 #[test]
 fn native_read_floor_splits_project_denies_and_skips_home_symlinks() {
+    skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
     let private = project.join("private");
@@ -570,6 +594,7 @@ fn native_read_floor_splits_project_denies_and_skips_home_symlinks() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linked_worktree_reads_shared_git_metadata_but_not_hooks() {
+    skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();
     let main = fixture.path().join("main");
     let worktree = fixture.path().join("worktree");
@@ -652,6 +677,7 @@ fn linked_worktree_reads_shared_git_metadata_but_not_hooks() {
 #[cfg(target_os = "linux")]
 #[test]
 fn native_secret_floor_refuses_home_write_allow_and_home_project_root() {
+    skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
@@ -696,6 +722,7 @@ fn native_secret_floor_refuses_home_write_allow_and_home_project_root() {
 
 #[test]
 fn native_sandbox_pty_denies_outside_write_and_renders_screen() {
+    skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("artifacts");
