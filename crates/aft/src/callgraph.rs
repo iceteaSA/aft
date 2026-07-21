@@ -14,7 +14,10 @@ use serde::Serialize;
 use serde_json::Value;
 use tree_sitter::{Node, Parser};
 
-use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
+use crate::calls::extract_calls_full;
+#[cfg(test)]
+use crate::calls::{call_node_kinds, extract_callee_name, extract_full_callee};
+#[cfg(test)]
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
@@ -116,7 +119,7 @@ pub(crate) fn resolve_symbol_query_in_data(
 }
 
 /// A single call site within a function body.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
     /// The short callee name (last segment, e.g. "foo" for `utils.foo()`).
     pub callee_name: String,
@@ -867,6 +870,132 @@ pub(crate) fn build_file_data_from_source(
     build_file_data_from_source_with_lang(path, source, lang)
 }
 
+#[derive(Debug)]
+struct SymbolCallRange {
+    symbol_index: usize,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+struct SourceLineIndex {
+    bounds: Vec<(usize, usize)>,
+    source_len: usize,
+}
+
+impl SourceLineIndex {
+    fn new(source: &str) -> Self {
+        let bytes = source.as_bytes();
+        let mut bounds = Vec::new();
+        let mut line_start = 0usize;
+        let mut index = 0usize;
+
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\r' => {
+                    bounds.push((line_start, index));
+                    index += if bytes.get(index + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    line_start = index;
+                }
+                b'\n' => {
+                    bounds.push((line_start, index));
+                    index += 1;
+                    line_start = index;
+                }
+                _ => index += 1,
+            }
+        }
+        bounds.push((line_start, bytes.len()));
+
+        Self {
+            bounds,
+            source_len: bytes.len(),
+        }
+    }
+
+    fn byte_offset(&self, line: u32, column: u32) -> usize {
+        let Some(&(line_start, line_end)) = self.bounds.get(line as usize) else {
+            return self.source_len;
+        };
+        line_start + (column as usize).min(line_end.saturating_sub(line_start))
+    }
+}
+
+fn collect_calls_by_symbol(
+    source: &str,
+    root: Node<'_>,
+    lang: LangId,
+    symbols: &[Symbol],
+) -> HashMap<String, Vec<CallSite>> {
+    let line_index = SourceLineIndex::new(source);
+    let mut ranges = symbols
+        .iter()
+        .enumerate()
+        .map(|(symbol_index, symbol)| SymbolCallRange {
+            symbol_index,
+            byte_start: line_index.byte_offset(symbol.range.start_line, symbol.range.start_col),
+            byte_end: line_index.byte_offset(symbol.range.end_line, symbol.range.end_col),
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by(|left, right| {
+        left.byte_start
+            .cmp(&right.byte_start)
+            .then_with(|| left.symbol_index.cmp(&right.symbol_index))
+    });
+
+    let mut sites_by_symbol = vec![Vec::new(); symbols.len()];
+    let mut top_level_sites = Vec::new();
+    let mut active_ranges = Vec::<usize>::new();
+    let mut next_range = 0usize;
+
+    for (full, short, line, byte_start, byte_end) in
+        extract_calls_full(source, root, 0, source.len(), lang)
+    {
+        // AST preorder gives nondecreasing call starts. Expire by start only:
+        // an outer call can end past a range that still contains a nested call.
+        active_ranges.retain(|range_index| ranges[*range_index].byte_end > byte_start);
+        while next_range < ranges.len() && ranges[next_range].byte_start <= byte_start {
+            if ranges[next_range].byte_end > byte_start {
+                active_ranges.push(next_range);
+            }
+            next_range += 1;
+        }
+
+        let site = CallSite {
+            callee_name: short,
+            full_callee: full,
+            line,
+            byte_start,
+            byte_end,
+        };
+        let mut attributed = false;
+        for range_index in &active_ranges {
+            let range = &ranges[*range_index];
+            if byte_end <= range.byte_end {
+                sites_by_symbol[range.symbol_index].push(site.clone());
+                attributed = true;
+            }
+        }
+        if !attributed {
+            top_level_sites.push(site);
+        }
+    }
+
+    let mut calls_by_symbol = HashMap::new();
+    for (symbol, sites) in symbols.iter().zip(sites_by_symbol) {
+        if !sites.is_empty() {
+            calls_by_symbol.insert(symbol_identity(symbol), sites);
+        }
+    }
+    if !top_level_sites.is_empty() {
+        calls_by_symbol.insert(TOP_LEVEL_SYMBOL.to_string(), top_level_sites);
+    }
+    calls_by_symbol
+}
+
 fn build_file_data_from_source_with_lang(
     path: &Path,
     source: &str,
@@ -892,64 +1021,8 @@ fn build_file_data_from_source_with_lang(
     // Get symbols (for call site extraction and export detection)
     let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
 
-    // Build calls_by_symbol
-    let mut calls_by_symbol: HashMap<String, Vec<CallSite>> = HashMap::new();
     let root = tree.root_node();
-
-    for sym in &symbols {
-        let byte_start = line_col_to_byte(&source, sym.range.start_line, sym.range.start_col);
-        let byte_end = line_col_to_byte(&source, sym.range.end_line, sym.range.end_col);
-
-        let raw_calls = extract_calls_full(&source, root, byte_start, byte_end, lang);
-
-        let sites: Vec<CallSite> = raw_calls
-            .into_iter()
-            .map(
-                |(full, short, line, call_byte_start, call_byte_end)| CallSite {
-                    callee_name: short,
-                    full_callee: full,
-                    line,
-                    byte_start: call_byte_start,
-                    byte_end: call_byte_end,
-                },
-            )
-            .collect();
-
-        if !sites.is_empty() {
-            calls_by_symbol.insert(symbol_identity(sym), sites);
-        }
-    }
-
-    let symbol_ranges: Vec<(usize, usize)> = symbols
-        .iter()
-        .map(|sym| {
-            (
-                line_col_to_byte(&source, sym.range.start_line, sym.range.start_col),
-                line_col_to_byte(&source, sym.range.end_line, sym.range.end_col),
-            )
-        })
-        .collect();
-
-    let top_level_sites: Vec<CallSite> =
-        collect_calls_full_with_ranges(root, &source, 0, source.len(), lang)
-            .into_iter()
-            .filter(|site| {
-                !symbol_ranges
-                    .iter()
-                    .any(|(start, end)| site.byte_start >= *start && site.byte_end <= *end)
-            })
-            .map(|site| CallSite {
-                callee_name: site.short,
-                full_callee: site.full,
-                line: site.line,
-                byte_start: site.byte_start,
-                byte_end: site.byte_end,
-            })
-            .collect();
-
-    if !top_level_sites.is_empty() {
-        calls_by_symbol.insert(TOP_LEVEL_SYMBOL.to_string(), top_level_sites);
-    }
+    let mut calls_by_symbol = collect_calls_by_symbol(&source, root, lang, &symbols);
 
     let default_export = find_default_export(&source, root, path, lang);
 
@@ -1222,6 +1295,7 @@ fn find_child_by_kind<'a>(
     None
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct CallSiteWithRange {
     full: String,
@@ -1231,6 +1305,7 @@ struct CallSiteWithRange {
     byte_end: usize,
 }
 
+#[cfg(test)]
 fn collect_calls_full_with_ranges(
     root: tree_sitter::Node,
     source: &str,
@@ -1251,6 +1326,7 @@ fn collect_calls_full_with_ranges(
     results
 }
 
+#[cfg(test)]
 fn collect_calls_full_with_ranges_inner(
     node: tree_sitter::Node,
     source: &str,
@@ -2676,6 +2752,200 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn collect_calls_by_symbol_reference(
+        source: &str,
+        root: Node<'_>,
+        lang: LangId,
+        symbols: &[Symbol],
+    ) -> HashMap<String, Vec<CallSite>> {
+        let mut calls_by_symbol = HashMap::new();
+        for symbol in symbols {
+            let byte_start =
+                line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col);
+            let byte_end = line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col);
+            let sites = extract_calls_full(source, root, byte_start, byte_end, lang)
+                .into_iter()
+                .map(
+                    |(full, short, line, call_byte_start, call_byte_end)| CallSite {
+                        callee_name: short,
+                        full_callee: full,
+                        line,
+                        byte_start: call_byte_start,
+                        byte_end: call_byte_end,
+                    },
+                )
+                .collect::<Vec<_>>();
+            if !sites.is_empty() {
+                calls_by_symbol.insert(symbol_identity(symbol), sites);
+            }
+        }
+
+        let symbol_ranges = symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col),
+                    line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col),
+                )
+            })
+            .collect::<Vec<_>>();
+        let top_level_sites = collect_calls_full_with_ranges(root, source, 0, source.len(), lang)
+            .into_iter()
+            .filter(|site| {
+                !symbol_ranges
+                    .iter()
+                    .any(|(start, end)| site.byte_start >= *start && site.byte_end <= *end)
+            })
+            .map(|site| CallSite {
+                callee_name: site.short,
+                full_callee: site.full,
+                line: site.line,
+                byte_start: site.byte_start,
+                byte_end: site.byte_end,
+            })
+            .collect::<Vec<_>>();
+        if !top_level_sites.is_empty() {
+            calls_by_symbol.insert(TOP_LEVEL_SYMBOL.to_string(), top_level_sites);
+        }
+        calls_by_symbol
+    }
+
+    fn parse_symbols(source: &str, lang: LangId) -> (tree_sitter::Tree, Vec<Symbol>) {
+        let mut parser = Parser::new();
+        parser.set_language(&grammar_for(lang)).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let symbols = crate::parser::extract_symbols_from_tree(source, &tree, lang).unwrap();
+        (tree, symbols)
+    }
+
+    fn test_symbol(name: &str, start_col: u32, end_col: u32) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            range: Range {
+                start_line: 0,
+                start_col,
+                end_line: 0,
+                end_col,
+            },
+            signature: None,
+            scope_chain: Vec::new(),
+            exported: false,
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn source_line_index_matches_shared_line_column_conversion() {
+        let source = "a\r\nbb\rc\n";
+        let index = SourceLineIndex::new(source);
+        for line in 0..=5 {
+            for column in 0..=5 {
+                assert_eq!(
+                    index.byte_offset(line, column),
+                    line_col_to_byte(source, line, column),
+                    "line={line}, column={column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_pass_call_attribution_matches_per_symbol_reference() {
+        let corpora = [
+            (
+                "typescript",
+                LangId::TypeScript,
+                r#"bootstrap();
+class Worker {
+    run() {
+        before();
+        function nested() { nestedCall(); }
+        nested();
+    }
+    next() { adjacentCall(); }
+}
+function left() { leftCall(); }
+function right() { rightCall(); }
+"#,
+            ),
+            (
+                "python",
+                LangId::Python,
+                r#"bootstrap()
+class Worker:
+    def run(self):
+        before()
+        def nested():
+            nested_call()
+        nested()
+
+    def next(self):
+        adjacent_call()
+
+def left():
+    left_call()
+
+def right():
+    right_call()
+"#,
+            ),
+        ];
+
+        for (name, lang, source) in corpora {
+            let (tree, symbols) = parse_symbols(source, lang);
+            let reference =
+                collect_calls_by_symbol_reference(source, tree.root_node(), lang, &symbols);
+            let actual = collect_calls_by_symbol(source, tree.root_node(), lang, &symbols);
+            assert_eq!(actual, reference, "call attribution changed for {name}");
+
+            let class_sites = actual.get("Worker").expect("class receives method calls");
+            let method_sites = actual
+                .get("Worker::run")
+                .expect("method receives its own calls");
+            assert!(class_sites.iter().any(|site| site.callee_name == "before"));
+            assert!(method_sites.iter().any(|site| site.callee_name == "before"));
+            let nested_sites = actual
+                .iter()
+                .find(|(symbol, _)| symbol.rsplit("::").next() == Some("nested"))
+                .map(|(_, sites)| sites)
+                .expect("nested function receives its own calls");
+            assert!(nested_sites.iter().any(|site| {
+                site.callee_name == "nested_call" || site.callee_name == "nestedCall"
+            }));
+            assert_eq!(actual[TOP_LEVEL_SYMBOL][0].callee_name, "bootstrap");
+        }
+
+        let source = "first();second();third();";
+        let (tree, _) = parse_symbols(source, LangId::TypeScript);
+        let symbols = vec![
+            test_symbol("outer", 0, 17),
+            test_symbol("left", 0, 8),
+            test_symbol("right", 8, 17),
+            test_symbol("empty", 24, 24),
+        ];
+        let reference = collect_calls_by_symbol_reference(
+            source,
+            tree.root_node(),
+            LangId::TypeScript,
+            &symbols,
+        );
+        let actual =
+            collect_calls_by_symbol(source, tree.root_node(), LangId::TypeScript, &symbols);
+        assert_eq!(actual, reference, "overlapping and adjacent ranges changed");
+        assert_eq!(
+            actual["outer"]
+                .iter()
+                .map(|site| site.callee_name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(actual["left"][0].callee_name, "first");
+        assert_eq!(actual["right"][0].callee_name, "second");
+        assert_eq!(actual[TOP_LEVEL_SYMBOL][0].callee_name, "third");
+        assert!(!actual.contains_key("empty"));
+    }
 
     #[test]
     fn symbol_metadata_for_recovers_scoped_method_by_bare_name() {
