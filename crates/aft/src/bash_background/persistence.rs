@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
@@ -753,7 +753,7 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> io::Re
 
 pub fn allocate_task_layout(storage_dir: &Path, session_id: &str) -> io::Result<ResolvedTask> {
     let session_dir = session_tasks_dir(storage_dir, session_id);
-    fs::create_dir_all(&session_dir)?;
+    create_private_task_store(&session_dir)?;
     let session = Arc::new(PinnedDir::open(&session_dir)?);
     for _ in 0..32 {
         let task_id = random_task_id()?;
@@ -776,8 +776,24 @@ pub fn create_task_layout(
 ) -> io::Result<ResolvedTask> {
     validate_task_id(task_id)?;
     let session_dir = session_tasks_dir(storage_dir, session_id);
-    fs::create_dir_all(&session_dir)?;
+    create_private_task_store(&session_dir)?;
     create_task_layout_from_session(Arc::new(PinnedDir::open(&session_dir)?), task_id)
+}
+
+fn create_private_task_store(session_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(session_dir)?;
+    #[cfg(unix)]
+    {
+        let parent = session_dir.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session task directory has no bash-tasks parent",
+            )
+        })?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(session_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn create_task_layout_from_session(
@@ -1866,6 +1882,32 @@ mod tests {
             Some(task.paths.io_dir.as_path())
         );
         assert_ne!(task.paths.control_dir, task.paths.io_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_layout_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let storage = tempfile::tempdir().unwrap();
+        let task = create_task_layout(storage.path(), "session", &valid_id(5)).unwrap();
+        for path in [
+            &task.paths.session_dir,
+            &task.paths.dir,
+            &task.paths.control_dir,
+            &task.paths.io_dir,
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "unexpected permissions for {}", path.display());
+        }
+        let bash_tasks = task.paths.session_dir.parent().unwrap();
+        let mode = fs::metadata(bash_tasks).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "unexpected permissions for {}",
+            bash_tasks.display()
+        );
     }
 
     #[test]
