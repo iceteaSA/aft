@@ -213,6 +213,9 @@ macro_rules! skip_if_landlock_absent {
     () => {
         #[cfg(target_os = "linux")]
         if !landlock_available() {
+            if std::env::var("AFT_REQUIRE_LANDLOCK").as_deref() == Ok("1") {
+                panic!("AFT_REQUIRE_LANDLOCK=1 but Landlock ABI is unavailable");
+            }
             eprintln!("Landlock probe skipped: mandatory ABI is unavailable");
             return;
         }
