@@ -308,11 +308,21 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
 
 #[cfg(target_os = "linux")]
 fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::AppliedLandlock) {
+    let write_roots = profile.write_allow_roots();
     let mut unenforced = Vec::new();
-    if !profile.write_deny_nested.is_empty() {
+    if profile
+        .write_deny_nested
+        .iter()
+        .any(|deny| write_roots.iter().any(|root| paths_overlap(deny, root)))
+    {
         unenforced.push("nested_write_deny");
     }
-    if !profile.read_deny.is_empty() {
+    if profile.read_deny.iter().any(|deny| {
+        profile
+            .read_allow
+            .iter()
+            .any(|grant| paths_overlap(deny, grant))
+    }) {
         unenforced.push("read_deny");
     }
     if !profile.socket_deny.is_empty() {
@@ -320,14 +330,22 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     }
 
     eprint!("sandbox-launch: unenforced=[{}]", unenforced.join(","));
-    if applied.effective_abi < landlock_backend::REQUIRED_WRITE_ABI || applied.partially_enforced {
+    if applied.partially_enforced {
         eprint!(
             " landlock_abi={} landlock_required={}",
             landlock_backend::abi_label(applied.effective_abi),
             landlock_backend::abi_label(landlock_backend::REQUIRED_WRITE_ABI)
         );
     }
+    if applied.yama_same_uid_exposed {
+        eprint!(" proc_same_uid_exposure=[environ,maps,mem] yama_ptrace_scope=zero_or_unknown");
+    }
     eprintln!();
+}
+
+#[cfg(target_os = "linux")]
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 #[cfg(unix)]
@@ -359,6 +377,7 @@ fn print_support() -> Result<(), SandboxLaunchError> {
         "backend": "landlock",
         "landlock_abi": landlock_backend::abi_label(applied.effective_abi),
         "target_abi": landlock_backend::abi_label(landlock_backend::TARGET_ABI),
+        "required_refer_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_REFER_ABI),
         "required_write_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_WRITE_ABI),
         "partially_enforced": applied.partially_enforced
     }))

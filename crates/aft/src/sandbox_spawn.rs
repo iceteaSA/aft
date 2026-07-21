@@ -1771,12 +1771,14 @@ fn build_linux_read_allow(
 #[cfg(target_os = "linux")]
 fn canonicalize_existing_static(path: &Path) -> Result<Option<PathBuf>, String> {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => path.canonicalize().map(Some).map_err(|error| {
-            format!(
+        Ok(_) => match path.canonicalize() {
+            Ok(path) => Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
                 "failed to canonicalize static read root {}: {error}",
                 path.display()
-            )
-        }),
+            )),
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!(
             "failed to inspect static read root {}: {error}",
@@ -1902,7 +1904,14 @@ struct SecureReadDirectoryLister;
 impl ReadDirectoryLister for SecureReadDirectoryLister {
     fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String> {
         let parent_fd = open_absolute_no_symlinks(parent, true)?;
-        let duplicate = unsafe { libc::dup(parent_fd.as_raw_fd()) };
+        let readable_fd =
+            open_directory_for_enumeration(parent_fd.as_raw_fd()).map_err(|error| {
+                format!(
+                    "failed to open directory for enumeration {}: {error}",
+                    parent.display()
+                )
+            })?;
+        let duplicate = unsafe { libc::dup(readable_fd.as_raw_fd()) };
         if duplicate < 0 {
             return Err(format!(
                 "failed to duplicate directory fd for {}: {}",
@@ -2076,6 +2085,44 @@ fn open_absolute_no_symlinks(path: &Path, directory: bool) -> Result<OwnedFd, St
         current = opened;
     }
     Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_for_enumeration(parent_fd: i32) -> Result<OwnedFd, std::io::Error> {
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    let opened = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            parent_fd,
+            c".".as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        ) as libc::c_int
+    };
+    if opened >= 0 {
+        return Ok(unsafe { OwnedFd::from_raw_fd(opened) });
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(error);
+    }
+
+    let opened = unsafe {
+        libc::openat(
+            parent_fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if opened < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(opened) })
+    }
 }
 
 #[cfg(target_os = "linux")]
