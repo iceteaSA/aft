@@ -2428,3 +2428,106 @@ fn add_import_merges_into_existing_same_module_named_import() {
 
     aft.shutdown();
 }
+
+fn send_scala_add_import(
+    aft: &mut AftProcess,
+    id: &str,
+    file: &std::path::Path,
+    module: &str,
+    names: &[&str],
+    modifiers: &[&str],
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "id": id,
+        "command": "add_import",
+        "file": file,
+        "module": module,
+    });
+    if !names.is_empty() {
+        params["names"] = serde_json::json!(names);
+    }
+    if !modifiers.is_empty() {
+        params["modifiers"] = serde_json::json!(modifiers);
+    }
+    aft.send(&serde_json::to_string(&params).unwrap())
+}
+
+fn assert_scala2_add_is_noop(input: &str, module: &str, names: &[&str], modifiers: &[&str]) {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("dedup.scala");
+    fs::write(&file, input).unwrap();
+
+    let response = send_scala_add_import(&mut aft, "scala2-dedup", &file, module, names, modifiers);
+
+    assert_eq!(response["success"], true, "add failed: {response:?}");
+    assert_eq!(
+        response["added"], false,
+        "add was not deduped: {response:?}"
+    );
+    assert_eq!(
+        response["already_present"], true,
+        "missing dedup result: {response:?}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), input.as_bytes());
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_scala2_dedupes_ordinary_import() {
+    assert_scala2_add_is_noop(
+        "import a.b._\nimport c.d.C\n\nobject Main {}\n",
+        "c.d.C",
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn add_import_scala2_dedupes_wildcard_import() {
+    assert_scala2_add_is_noop(
+        "import a.b._\nimport cats.syntax.all._\n\nobject Main {}\n",
+        "cats.syntax.all",
+        &[],
+        &["wildcard"],
+    );
+}
+
+#[test]
+fn add_import_scala2_dedupes_renamed_import() {
+    assert_scala2_add_is_noop(
+        "import a.b._\nimport scala.concurrent.{ExecutionContext => EC}\n\nobject Main {}\n",
+        "scala.concurrent",
+        &["ExecutionContext as EC"],
+        &[],
+    );
+}
+
+#[test]
+fn add_import_scala2_new_wildcard_uses_existing_dialect() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("new.scala");
+    let input = "import a.b._\n\nobject Main {}\n";
+    fs::write(&file, input).unwrap();
+
+    let response = send_scala_add_import(
+        &mut aft,
+        "scala2-new",
+        &file,
+        "cats.syntax.all",
+        &[],
+        &["wildcard"],
+    );
+
+    assert_eq!(response["success"], true, "add failed: {response:?}");
+    assert_eq!(
+        response["added"], true,
+        "new import was not added: {response:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "import a.b._\nimport cats.syntax.all._\n\nobject Main {}\n"
+    );
+    aft.shutdown();
+}

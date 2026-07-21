@@ -1020,7 +1020,12 @@ fn scala_request_dedup_key(req: &ImportRequest<'_>) -> ImportDedupKey {
         .iter()
         .map(|name| normalize_scala_selector_for_dedup(name))
         .collect();
-    let mut modifiers = req.modifiers.to_vec();
+    let mut identity_modifiers: Vec<String> = req
+        .modifiers
+        .iter()
+        .filter(|modifier| modifier.as_str() != "scala2")
+        .cloned()
+        .collect();
     let mut import_kind = req.import_kind.map(str::to_string);
 
     if req.default_import == Some("given") || module_path.ends_with(".given") {
@@ -1035,8 +1040,11 @@ fn scala_request_dedup_key(req: &ImportRequest<'_>) -> ImportDedupKey {
         || module_path.ends_with(".*")
         || module_path.ends_with("._")
     {
-        if !modifiers.iter().any(|modifier| modifier == "wildcard") {
-            modifiers.push("wildcard".to_string());
+        if !identity_modifiers
+            .iter()
+            .any(|modifier| modifier == "wildcard")
+        {
+            identity_modifiers.push("wildcard".to_string());
         }
         module_path = module_path
             .strip_suffix(".*")
@@ -1060,7 +1068,7 @@ fn scala_request_dedup_key(req: &ImportRequest<'_>) -> ImportDedupKey {
         &names,
         None,
         None,
-        &modifiers,
+        &identity_modifiers,
         import_kind.as_deref(),
     )
 }
