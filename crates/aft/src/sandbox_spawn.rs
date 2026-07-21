@@ -1265,7 +1265,11 @@ fn build_native_profile(
             read_deny.extend(git_policy.hooks.iter().cloned());
         }
         #[cfg(target_os = "linux")]
-        read_deny.push(PathBuf::from("/run/user"));
+        read_deny.extend([
+            PathBuf::from("/run/user"),
+            PathBuf::from("/run/credentials"),
+            PathBuf::from("/run/secrets"),
+        ]);
         read_deny.extend(
             ctx.config()
                 .sandbox
@@ -3856,16 +3860,31 @@ mod read_allow_tests {
     }
 
     #[test]
-    fn run_user_is_removed_by_canonical_deny_chain() {
-        let mut lister = FakeLister::default().directory("/run", &[("lock", true), ("user", true)]);
+    fn run_sensitive_directories_are_removed_by_canonical_deny_chain() {
+        let mut lister = FakeLister::default().directory(
+            "/run",
+            &[
+                ("lock", true),
+                ("user", true),
+                ("credentials", true),
+                ("secrets", true),
+            ],
+        );
         let emitted = split_read_grants(
             &[grant("/run", false, true)],
-            &[PathBuf::from("/run/user")],
+            &[
+                PathBuf::from("/run/user"),
+                PathBuf::from("/run/credentials"),
+                PathBuf::from("/run/secrets"),
+            ],
             &mut lister,
         )
         .expect("split /run");
 
         assert_eq!(emitted, vec![PathBuf::from("/run/lock")]);
+        assert!(!emitted.iter().any(|path| {
+            path == Path::new("/run/credentials") || path == Path::new("/run/secrets")
+        }));
     }
 
     #[test]
