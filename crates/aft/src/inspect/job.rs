@@ -344,6 +344,12 @@ impl InspectJob {
             symbol_cache: Arc::clone(&self.symbol_cache),
         }
     }
+
+    /// Tier-1 jobs retain their scope hash, and `project` identifies the
+    /// complete project file set rather than a user-selected subset.
+    pub fn is_full_project_scope(&self) -> bool {
+        self.key.scope_hash.as_deref() == Some("project")
+    }
 }
 
 pub(crate) fn is_js_ts_language(language: LangId) -> bool {

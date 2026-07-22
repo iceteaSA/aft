@@ -56,12 +56,20 @@ static METRICS_MEMO: OnceLock<Tier1FileMemo<CachedFileMetric>> = OnceLock::new()
 static FILE_READS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
 
 pub fn run_metrics_scan(job: &crate::inspect::InspectJob) -> crate::inspect::InspectResult {
+    run_metrics_scan_with_memo(job, metrics_memo())
+}
+
+fn run_metrics_scan_with_memo(
+    job: &crate::inspect::InspectJob,
+    memo: &Tier1FileMemo<CachedFileMetric>,
+) -> crate::inspect::InspectResult {
     let started = Instant::now();
+    memo.reserve_for_scan(job.scope_files.len());
     let per_file = job
         .scope_files
         .par_iter()
         .map(|path| {
-            let cached = metrics_memo().get_or_insert_with(path, scan_file);
+            let cached = memo.get_or_insert_with(path, scan_file);
             FileMetric {
                 path: cached.path,
                 language: cached.language,
@@ -70,6 +78,9 @@ pub fn run_metrics_scan(job: &crate::inspect::InspectJob) -> crate::inspect::Ins
             }
         })
         .collect::<Vec<_>>();
+    if job.is_full_project_scope() {
+        memo.prune_to_scope(&job.project_root, &job.scope_files);
+    }
     let aggregate = aggregate_metrics(&job.project_root, &per_file);
     let success = crate::inspect::InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
@@ -256,4 +267,64 @@ pub fn file_read_count_for_debug(project_root: &Path) -> usize {
                 .sum()
         })
         .unwrap_or_default()
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use std::fs;
+    use std::sync::{Arc, RwLock};
+
+    use super::*;
+    use crate::config::Config;
+    use crate::inspect::{InspectCategory, InspectJob, JobKey, JobScope};
+    use crate::parser::SymbolCache;
+
+    const OVER_DEFAULT_MEMO_CAPACITY: usize = 4_097;
+
+    fn metrics_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
+        let scope = JobScope::for_project(root.to_path_buf());
+        InspectJob {
+            job_id: 1,
+            key: JobKey::for_category_scope(InspectCategory::Metrics, &scope),
+            category: InspectCategory::Metrics,
+            scope_files,
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn full_scope_larger_than_default_capacity_stays_warm() {
+        let project = tempfile::tempdir().expect("project");
+        let mut files = Vec::with_capacity(OVER_DEFAULT_MEMO_CAPACITY);
+        for index in 0..OVER_DEFAULT_MEMO_CAPACITY {
+            let path = project.path().join(format!("file-{index:04}.rs"));
+            fs::write(
+                &path,
+                format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
+            )
+            .expect("write fixture");
+            files.push(path);
+        }
+        let job = metrics_job(project.path(), files);
+        let memo = Tier1FileMemo::default();
+
+        assert!(run_metrics_scan_with_memo(&job, &memo).outcome.is_ok());
+        reset_file_read_count_for_debug(project.path());
+        assert!(run_metrics_scan_with_memo(&job, &memo).outcome.is_ok());
+
+        assert_eq!(
+            file_read_count_for_debug(project.path()),
+            0,
+            "an unchanged full scan must retain every live file above the default memo capacity"
+        );
+    }
 }

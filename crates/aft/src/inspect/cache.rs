@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -186,6 +186,7 @@ struct Tier1MemoState<T> {
     entries: HashMap<PathBuf, Tier1MemoEntry<T>>,
     lru: VecDeque<LruNode>,
     next_generation: u64,
+    capacity: usize,
 }
 
 impl<T> Default for Tier1MemoState<T> {
@@ -194,6 +195,7 @@ impl<T> Default for Tier1MemoState<T> {
             entries: HashMap::new(),
             lru: VecDeque::new(),
             next_generation: 0,
+            capacity: TIER1_FILE_MEMO_MAX_ENTRIES,
         }
     }
 }
@@ -239,9 +241,7 @@ impl<T> Tier1MemoState<T> {
     }
 
     fn compact_lru_if_needed(&mut self) {
-        let max_lru_nodes = TIER1_FILE_MEMO_MAX_ENTRIES
-            .saturating_mul(2)
-            .max(self.entries.len());
+        let max_lru_nodes = self.capacity.saturating_mul(2).max(self.entries.len());
         if self.lru.len() > max_lru_nodes {
             self.rebuild_lru();
         }
@@ -266,8 +266,17 @@ impl<T> Tier1MemoState<T> {
         self.next_generation = self.lru.len() as u64;
     }
 
+    fn retain_live_lru_nodes(&mut self) {
+        let entries = &self.entries;
+        self.lru.retain(|node| {
+            entries
+                .get(&node.path)
+                .is_some_and(|entry| entry.generation == node.generation)
+        });
+    }
+
     fn evict_lru(&mut self) {
-        while self.entries.len() > TIER1_FILE_MEMO_MAX_ENTRIES {
+        while self.entries.len() > self.capacity {
             let Some(node) = self.lru.pop_front() else {
                 break;
             };
@@ -292,6 +301,36 @@ impl<T> Default for Tier1FileMemo<T> {
     fn default() -> Self {
         Self {
             state: Mutex::new(Tier1MemoState::default()),
+        }
+    }
+}
+
+impl<T> Tier1FileMemo<T> {
+    /// Prevent a full-scope scan from evicting entries that the same scan will
+    /// need again on its next run. Capacity only grows here; a completed full
+    /// scan shrinks it back to that scan's live file set in [`Self::prune_to_scope`].
+    pub(crate) fn reserve_for_scan(&self, file_count: usize) {
+        let required_capacity = file_count.max(TIER1_FILE_MEMO_MAX_ENTRIES);
+        if let Ok(mut state) = self.state.lock() {
+            state.capacity = state.capacity.max(required_capacity);
+        }
+    }
+
+    /// Drop entries outside a completed full-project scan and right-size the
+    /// memo to the live project. Scoped scans must not call this because their
+    /// path list intentionally omits valid entries elsewhere in the project.
+    pub(crate) fn prune_to_scope(&self, project_root: &Path, live_paths: &[PathBuf]) {
+        let live_paths = live_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<HashSet<_>>();
+        if let Ok(mut state) = self.state.lock() {
+            state.entries.retain(|path, _| {
+                !path.starts_with(project_root) || live_paths.contains(path.as_path())
+            });
+            state.capacity = live_paths.len().max(TIER1_FILE_MEMO_MAX_ENTRIES);
+            state.retain_live_lru_nodes();
+            state.evict_lru();
         }
     }
 }
@@ -2190,6 +2229,38 @@ mod tests {
             panic!("recently used entry should survive eviction")
         });
         assert_eq!(recent_value, 0);
+    }
+
+    #[test]
+    fn tier1_file_memo_full_scope_prunes_paths_no_longer_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let retained_path = temp.path().join("retained.txt");
+        let removed_path = temp.path().join("removed.txt");
+        fs::write(&retained_path, "retained").unwrap();
+        fs::write(&removed_path, "removed").unwrap();
+        let memo = Tier1FileMemo::<usize>::default();
+
+        memo.reserve_for_scan(2);
+        memo.get_or_insert_with(&retained_path, |path| (Some(collect_freshness(path)), 1));
+        memo.get_or_insert_with(&removed_path, |path| (Some(collect_freshness(path)), 2));
+        memo.prune_to_scope(temp.path(), std::slice::from_ref(&retained_path));
+
+        let state = memo.state.lock().unwrap();
+        assert!(state.entries.contains_key(&retained_path));
+        assert!(!state.entries.contains_key(&removed_path));
+        assert_eq!(state.capacity, TIER1_FILE_MEMO_MAX_ENTRIES);
+        drop(state);
+
+        let rescanned = Cell::new(false);
+        let value = memo.get_or_insert_with(&removed_path, |path| {
+            rescanned.set(true);
+            (Some(collect_freshness(path)), 3)
+        });
+        assert!(
+            rescanned.get(),
+            "a path outside the latest full scope must be evicted"
+        );
+        assert_eq!(value, 3);
     }
 
     #[test]

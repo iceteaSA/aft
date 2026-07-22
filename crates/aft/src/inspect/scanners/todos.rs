@@ -44,14 +44,20 @@ struct FileScan {
 }
 
 pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
+    run_todos_scan_with_memo(job, todos_memo())
+}
+
+fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) -> InspectResult {
     let started = Instant::now();
+    memo.reserve_for_scan(job.scope_files.len());
     let per_file: Vec<FileScan> = job
         .scope_files
         .par_iter()
-        .map(|path| {
-            todos_memo().get_or_insert_with(path, |path| scan_file(path, &job.project_root))
-        })
+        .map(|path| memo.get_or_insert_with(path, |path| scan_file(path, &job.project_root)))
         .collect();
+    if job.is_full_project_scope() {
+        memo.prune_to_scope(&job.project_root, &job.scope_files);
+    }
 
     let mut scanned_files = Vec::new();
     let mut all_items = Vec::new();
@@ -655,4 +661,64 @@ pub fn file_read_count_for_debug(project_root: &Path) -> usize {
                 .sum()
         })
         .unwrap_or_default()
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use std::fs;
+    use std::sync::{Arc, RwLock};
+
+    use super::*;
+    use crate::config::Config;
+    use crate::inspect::{InspectCategory, JobKey, JobScope};
+    use crate::parser::SymbolCache;
+
+    const OVER_DEFAULT_MEMO_CAPACITY: usize = 4_097;
+
+    fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
+        let scope = JobScope::for_project(root.to_path_buf());
+        InspectJob {
+            job_id: 1,
+            key: JobKey::for_category_scope(InspectCategory::Todos, &scope),
+            category: InspectCategory::Todos,
+            scope_files,
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn full_scope_larger_than_default_capacity_stays_warm() {
+        let project = tempfile::tempdir().expect("project");
+        let mut files = Vec::with_capacity(OVER_DEFAULT_MEMO_CAPACITY);
+        for index in 0..OVER_DEFAULT_MEMO_CAPACITY {
+            let path = project.path().join(format!("file-{index:04}.rs"));
+            fs::write(
+                &path,
+                format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
+            )
+            .expect("write fixture");
+            files.push(path);
+        }
+        let job = todos_job(project.path(), files);
+        let memo = Tier1FileMemo::default();
+
+        assert!(run_todos_scan_with_memo(&job, &memo).outcome.is_ok());
+        reset_file_read_count_for_debug(project.path());
+        assert!(run_todos_scan_with_memo(&job, &memo).outcome.is_ok());
+
+        assert_eq!(
+            file_read_count_for_debug(project.path()),
+            0,
+            "an unchanged full scan must retain every live file above the default memo capacity"
+        );
+    }
 }
