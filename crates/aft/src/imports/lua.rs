@@ -151,22 +151,17 @@ fn extract_single_require_call<'tree>(
     assignment: &Node<'tree>,
 ) -> Option<Node<'tree>> {
     let expression_list = find_direct_child(assignment, "expression_list")?;
-    let mut require_calls = Vec::new();
     let mut cursor = expression_list.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            if child.kind() == "function_call" && parse_lua_require_call(source, &child).is_some() {
-                require_calls.push(child);
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
+    let mut expressions = expression_list.named_children(&mut cursor);
+    let require_call = expressions.next()?;
+    if expressions.next().is_some() {
+        return None;
     }
 
-    if require_calls.len() == 1 {
-        require_calls.into_iter().next()
+    if require_call.kind() == "function_call"
+        && parse_lua_require_call(source, &require_call).is_some()
+    {
+        Some(require_call)
     } else {
         None
     }
@@ -454,6 +449,24 @@ mod tests {
             ),
             "require \"boot\""
         );
+    }
+
+    #[test]
+    fn parse_lua_requires_one_local_binding_and_one_rhs_expression() {
+        let (_, block) = parse_lua(
+            "local pure = require(\"pure\")\n\
+             local mixed = require(\"mixed\"), keep()\n\
+             local two_requires = require(\"first\"), require(\"second\")\n\
+             local first, second = require(\"first\"), require(\"second\")\n\
+             plain = require(\"plain\")\n",
+        );
+
+        let modules: Vec<&str> = block
+            .imports
+            .iter()
+            .map(|import| import.module_path.as_str())
+            .collect();
+        assert_eq!(modules, vec!["pure"]);
     }
 
     #[test]

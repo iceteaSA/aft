@@ -281,6 +281,56 @@ fn add_import_solidity_dedupes_single_quoted_path() {
 }
 
 #[test]
+fn add_import_lua_dedup_only_recognizes_pure_require_declarations() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+
+    let pure_file = dir.path().join("pure.lua");
+    let pure_original = "local pure = require(\"module\")\n";
+    fs::write(&pure_file, pure_original).unwrap();
+    let pure = send_add_import(
+        &mut aft,
+        "add-lua-pure-dedup",
+        &pure_file.display().to_string(),
+        "module",
+        None,
+        Some("pure"),
+        false,
+    );
+    assert_eq!(pure["success"], true, "pure add should succeed: {pure:?}");
+    assert_eq!(pure["added"], false, "pure require should dedup: {pure:?}");
+    assert_eq!(pure["already_present"], true);
+    assert_eq!(fs::read_to_string(&pure_file).unwrap(), pure_original);
+
+    let mixed_file = dir.path().join("mixed.lua");
+    let mixed_original = "local mixed = require(\"module\"), keep()\n";
+    fs::write(&mixed_file, mixed_original).unwrap();
+    let mixed = send_add_import(
+        &mut aft,
+        "add-lua-mixed-not-dedup",
+        &mixed_file.display().to_string(),
+        "module",
+        None,
+        Some("mixed"),
+        false,
+    );
+    assert_eq!(
+        mixed["success"], true,
+        "mixed-RHS add should succeed: {mixed:?}"
+    );
+    assert_eq!(
+        mixed["added"], true,
+        "mixed-RHS declaration must not satisfy dedup: {mixed:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&mixed_file).unwrap(),
+        format!("local mixed = require(\"module\")\n\n{mixed_original}")
+    );
+
+    aft.shutdown();
+}
+
+#[test]
 fn add_import_c_rejects_absolute_modules() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
@@ -1133,6 +1183,56 @@ fn remove_import_solidity_matches_single_quoted_path() {
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         "pragma solidity ^0.8.0;\ncontract C {}\n"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn remove_import_lua_ignores_mixed_rhs_but_removes_pure_require() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+
+    let mixed_file = dir.path().join("mixed.lua");
+    let mixed_original = "local victim = require(\"victim\"), keep()\nprint(\"after\")\n";
+    fs::write(&mixed_file, mixed_original).unwrap();
+    let mixed = send_remove_import(
+        &mut aft,
+        "remove-lua-mixed-rhs",
+        &mixed_file.display().to_string(),
+        "victim",
+        None,
+    );
+    assert_eq!(
+        mixed["success"], true,
+        "mixed-RHS remove should return a no-op: {mixed:?}"
+    );
+    assert_eq!(mixed["removed"], false);
+    assert_eq!(mixed["reason"], "module_not_found");
+    assert_eq!(mixed["no_op"], true);
+    assert_eq!(fs::read_to_string(&mixed_file).unwrap(), mixed_original);
+
+    let pure_file = dir.path().join("pure.lua");
+    let pure_original = "local pure = require(\"pure\")\nprint(\"after\")\n";
+    fs::write(&pure_file, pure_original).unwrap();
+    let pure = send_remove_import(
+        &mut aft,
+        "remove-lua-pure",
+        &pure_file.display().to_string(),
+        "pure",
+        None,
+    );
+    assert_eq!(
+        pure["success"], true,
+        "pure remove should succeed: {pure:?}"
+    );
+    assert_eq!(
+        pure["removed"], true,
+        "pure require should be removed: {pure:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&pure_file).unwrap(),
+        "print(\"after\")\n"
     );
 
     aft.shutdown();
