@@ -283,40 +283,39 @@ fn handle_external_search(
     external_root: PathBuf,
 ) -> Response {
     let storage_dir = ctx.config().storage_dir.clone();
-    let (search_index, borrow_metadata) = match ctx
-        .open_borrowed_search_index(&external_root, storage_dir.as_deref())
-    {
-        ReadOnlyArtifact::Fresh(index) => {
-            let borrow_metadata = ExternalBorrowMetadata::from_search_index(&index);
-            (index, borrow_metadata)
-        }
-        ReadOnlyArtifact::Absent => {
-            // No index exists for this foreign root. Rather than dead-ending
-            // with a not_indexed error (which reads to an agent as "this tool
-            // can't help here" and pushes it to shell out to grep/bash), do a
-            // bounded, best-effort lexical scan of the root — exactly what the
-            // `grep` tool already does for an unindexed external root — and
-            // disclose that it is lexical-only. Removing the error branch
-            // removes the escape hatch.
-            return handle_external_unindexed_fallback(
-                req,
-                ctx,
-                &params,
-                top_k,
-                &shape,
-                &external_root,
-            );
-        }
-        ReadOnlyArtifact::Stale(stale) => {
-            let mut borrow_metadata = ExternalBorrowMetadata::from_search_index(&stale.index);
-            borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-            crate::slog_warn!(
-                "{}",
-                borrowed_drift_log_message("search", &external_root, stale.drift_count)
-            );
-            (stale.index, borrow_metadata)
-        }
-    };
+    let (search_index, borrow_metadata) =
+        match ctx.open_borrowed_search_index(&external_root, storage_dir.as_deref()) {
+            ReadOnlyArtifact::Fresh(index) => {
+                let borrow_metadata = ExternalBorrowMetadata::from_search_index(&index);
+                (index, borrow_metadata)
+            }
+            ReadOnlyArtifact::Absent => {
+                // No index exists for this foreign root. Rather than dead-ending
+                // with a not_indexed error (which reads to an agent as "this tool
+                // can't help here" and pushes it to shell out to grep/bash), do a
+                // bounded, best-effort lexical scan of the root — exactly what the
+                // `grep` tool already does for an unindexed external root — and
+                // disclose that it is lexical-only. Removing the error branch
+                // removes the escape hatch.
+                return handle_external_unindexed_fallback(
+                    req,
+                    ctx,
+                    &params,
+                    top_k,
+                    &shape,
+                    &external_root,
+                );
+            }
+            ReadOnlyArtifact::Stale(stale) => {
+                let mut borrow_metadata = ExternalBorrowMetadata::from_search_index(&stale.index);
+                borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
+                crate::slog_warn!(
+                    "{}",
+                    borrowed_drift_log_message("search", &external_root, stale.drift_count)
+                );
+                (stale.index, borrow_metadata)
+            }
+        };
 
     let mut warnings = Vec::new();
     let regex_explicit = params.hint == SearchHint::Regex;

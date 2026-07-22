@@ -761,9 +761,9 @@ fn external_absent_cache_degrades_to_lexical_fallback_scan() {
             result["file"]
                 .as_str()
                 .is_some_and(|file| external_source.display().to_string().contains(file))
-                || result["file"].as_str().is_some_and(|file| {
-                    Path::new(file).file_name() == external_source.file_name()
-                })
+                || result["file"]
+                    .as_str()
+                    .is_some_and(|file| Path::new(file).file_name() == external_source.file_name())
         }),
         "expected the lexical fallback to actually find needle_symbol in the \
          external repo: {response:?}"
