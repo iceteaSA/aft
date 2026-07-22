@@ -158,7 +158,12 @@ fn yama_value_same_uid_exposed(value: Option<String>) -> bool {
 }
 
 fn close_inherited_fds() -> Result<(), String> {
-    let result = unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) };
+    // Keep stdio (0-2) and the daemon-controlled markers (3-4) alive. The
+    // parent deliberately remaps the exit and failure markers to 3 and 4 in
+    // apply_marker_fd_allowlist; descriptors >= 5 already carry FD_CLOEXEC
+    // there, so closing from 5 is defense-in-depth for a non-CLOEXEC leak,
+    // not the primary descriptor-hygiene mechanism.
+    let result = unsafe { libc::syscall(libc::SYS_close_range, 5_u32, u32::MAX, 0_u32) };
     if result == 0 {
         Ok(())
     } else {

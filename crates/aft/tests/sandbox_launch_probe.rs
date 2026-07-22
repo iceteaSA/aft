@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[cfg(target_os = "linux")]
+use aft::bash_background::persistence::resolve_task;
 use aft::sandbox_profile::SandboxProfile;
 use portable_pty::{CommandBuilder, PtySize};
 use std::fs;
@@ -10,6 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 use tempfile::{NamedTempFile, TempDir};
+
+#[cfg(target_os = "linux")]
+#[path = "helpers/mod.rs"]
+mod test_helpers;
+
+#[cfg(target_os = "linux")]
+use test_helpers::{user_config, AftProcess};
 
 const AFT_BIN: &str = env!("CARGO_BIN_EXE_aft");
 
@@ -258,6 +267,107 @@ fn connect_unix_socket(fixture: &mut ProbeFixture, path: &Path) -> Output {
         shell_path(path)
     );
     fixture.launch_bash(&script)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_background_exit_marker_survives_landlock_launcher() {
+    skip_if_landlock_absent!();
+    let fixture = tempfile::tempdir().expect("create marker fixture");
+    let project = fixture.path().join("project");
+    let storage = fixture.path().join("artifacts");
+    let home = fixture.path().join("home");
+    for directory in [&project, &storage, &home] {
+        fs::create_dir_all(directory).expect("create marker fixture directory");
+    }
+
+    let mut aft = AftProcess::spawn_with_env(&[("HOME", std::ffi::OsStr::new(&home))]);
+    let configured = aft.send(
+        &serde_json::json!({
+            "id": "cfg-marker",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.clone(),
+            "storage_dir": storage.clone(),
+            "bash_permissions": true,
+            "config": user_config(serde_json::json!({
+                "bash": { "background": true, "rewrite": true },
+                "sandbox": { "enabled": true },
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+
+    let session = "landlock-marker-session";
+    // Use the production background request so SpawnPlan::Launcher wires the
+    // exit and failure markers through apply_marker_fd_allowlist onto fds 3/4
+    // before the real sandbox-launch process applies Landlock.
+    let launch = aft.send(
+        &serde_json::json!({
+            "id": "launch-marker",
+            "method": "bash",
+            "session_id": session,
+            "params": {
+                "command": "exit 37",
+                "background": true,
+                "permissions_requested": true,
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        launch["success"], true,
+        "background launch failed: {launch:?}"
+    );
+    let task_id = launch["task_id"].as_str().expect("background task id");
+
+    let started = Instant::now();
+    let terminal = loop {
+        let status = aft.send(
+            &serde_json::json!({
+                "id": "status-marker",
+                "method": "bash_status",
+                "session_id": session,
+                "params": { "task_id": task_id },
+            })
+            .to_string(),
+        );
+        assert_eq!(status["success"], true, "status failed: {status:?}");
+        if matches!(
+            status["status"].as_str(),
+            Some("completed" | "failed" | "killed" | "timed_out")
+        ) {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "sandboxed task never recorded an exit marker: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        terminal["status"], "failed",
+        "unexpected terminal state: {terminal:?}"
+    );
+    assert_eq!(
+        terminal["exit_code"], 37,
+        "exit marker was not consumed: {terminal:?}"
+    );
+
+    let paths = resolve_task(&storage, session, task_id)
+        .expect("resolve background task layout")
+        .paths;
+    assert_eq!(
+        fs::read_to_string(&paths.exit).expect("read exit marker"),
+        "37",
+        "production marker wire did not record the command exit code"
+    );
+    assert!(aft.shutdown().success());
 }
 
 #[test]
