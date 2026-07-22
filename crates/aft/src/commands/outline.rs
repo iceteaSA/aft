@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -221,7 +222,7 @@ fn resolve_file_or_url(
 /// Build a nested outline tree from a flat symbol list.
 ///
 /// Strategy: two passes.
-/// 1. Convert every symbol to an `OutlineEntry` and index by name.
+/// 1. Convert every top-level symbol to an `OutlineEntry` and index sibling names.
 /// 2. Walk children (parent.is_some()) and attach them under their parent.
 ///    For multi-level nesting (e.g. OuterClass.InnerClass.inner_method),
 ///    we use the `scope_chain` to walk the full parent path.
@@ -229,77 +230,120 @@ fn resolve_file_or_url(
 /// Symbols whose parent can't be found in the list are promoted to top level
 /// (defensive — shouldn't happen with well-formed parser output).
 pub(crate) fn build_outline_tree(symbols: &[Symbol]) -> Vec<OutlineEntry> {
-    // Separate top-level and child symbols
-    let mut top_level: Vec<OutlineEntry> = Vec::new();
-    let mut children: Vec<&Symbol> = Vec::new();
+    let mut top_level = Vec::new();
+    let mut scope_index = OutlineScopeIndex::default();
+    let mut children = Vec::new();
 
     for sym in symbols {
         if sym.parent.is_none() {
-            top_level.push(symbol_to_entry(sym));
+            push_indexed_entry(&mut top_level, &mut scope_index, symbol_to_entry(sym));
         } else {
             children.push(sym);
         }
     }
 
-    // Build a name→index map for top-level entries
-    // For multi-level nesting, we need to find entries recursively
-    for child in &children {
+    for child in children {
         let entry = symbol_to_entry(child);
         let scope = &child.scope_chain;
 
         if scope.is_empty() {
-            // Shouldn't happen if parent.is_some(), but be defensive
-            top_level.push(entry);
+            push_indexed_entry(&mut top_level, &mut scope_index, entry);
             continue;
         }
 
-        // Walk the scope chain to find the correct parent container
-        if !insert_at_scope(&mut top_level, scope, entry.clone()) {
-            // Some languages expose association through `parent` even when the
-            // display scope is more specific than the container name (for
-            // example Rust `impl Trait for Type` methods). Fall back to the
-            // direct parent before treating the child as an orphan.
-            let parent_scope = child.parent.as_ref().map(std::slice::from_ref);
-            if !parent_scope
-                .is_some_and(|scope| insert_at_scope(&mut top_level, scope, entry.clone()))
-            {
-                // Parent not found — promote to top level
-                top_level.push(entry);
-            }
-        }
+        // Preserve the established lookup ladder: try the full display scope,
+        // then the direct parent used by languages such as Rust, then promote.
+        let entry = match insert_at_scope_indexed(&mut top_level, &mut scope_index, scope, entry) {
+            Ok(()) => continue,
+            Err(entry) => entry,
+        };
+        let entry = match child.parent.as_ref() {
+            Some(parent) => match insert_at_scope_indexed(
+                &mut top_level,
+                &mut scope_index,
+                std::slice::from_ref(parent),
+                entry,
+            ) {
+                Ok(()) => continue,
+                Err(entry) => entry,
+            },
+            None => entry,
+        };
+        push_indexed_entry(&mut top_level, &mut scope_index, entry);
     }
 
     top_level
 }
 
-/// Recursively walk scope_chain to insert an entry under the correct parent.
-///
-/// scope_chain = ["OuterClass", "InnerClass"] means:
-///   find "OuterClass" at this level → find "InnerClass" in its members → insert there
-fn insert_at_scope(
-    entries: &mut Vec<OutlineEntry>,
-    scope_chain: &[String],
-    entry: OutlineEntry,
-) -> bool {
-    if scope_chain.is_empty() {
-        return false;
+// Small sibling lists are cheaper to scan than to allocate a map for. Once a
+// level reaches this bound, every later lookup is indexed and the scan cost is
+// capped independently of the file's symbol count.
+const OUTLINE_SCOPE_INDEX_THRESHOLD: usize = 8;
+
+#[derive(Default)]
+struct OutlineScopeIndex {
+    first_by_name: Option<HashMap<String, usize>>,
+    children: Vec<OutlineScopeIndex>,
+}
+
+impl OutlineScopeIndex {
+    fn first_match(&self, entries: &[OutlineEntry], name: &str) -> Option<usize> {
+        if let Some(first_by_name) = &self.first_by_name {
+            return first_by_name.get(name).copied();
+        }
+        entries.iter().position(|entry| entry.name == name)
     }
 
-    let target_name = &scope_chain[0];
-    for existing in entries.iter_mut() {
-        if existing.name == *target_name {
-            if scope_chain.len() == 1 {
-                // This is the direct parent — insert here
-                existing.members.push(entry);
-                return true;
-            } else {
-                // Recurse deeper
-                return insert_at_scope(&mut existing.members, &scope_chain[1..], entry);
+    fn note_pushed(&mut self, entries: &[OutlineEntry]) {
+        debug_assert_eq!(self.children.len() + 1, entries.len());
+        self.children.push(Self::default());
+
+        if let Some(first_by_name) = &mut self.first_by_name {
+            let index = entries.len() - 1;
+            let name = &entries[index].name;
+            if !first_by_name.contains_key(name) {
+                first_by_name.insert(name.clone(), index);
             }
+        } else if entries.len() == OUTLINE_SCOPE_INDEX_THRESHOLD {
+            let mut first_by_name = HashMap::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                first_by_name.entry(entry.name.clone()).or_insert(index);
+            }
+            self.first_by_name = Some(first_by_name);
         }
     }
+}
 
-    false
+fn push_indexed_entry(
+    entries: &mut Vec<OutlineEntry>,
+    scope_index: &mut OutlineScopeIndex,
+    entry: OutlineEntry,
+) {
+    entries.push(entry);
+    scope_index.note_pushed(entries);
+}
+
+fn insert_at_scope_indexed(
+    entries: &mut Vec<OutlineEntry>,
+    scope_index: &mut OutlineScopeIndex,
+    scope_chain: &[String],
+    entry: OutlineEntry,
+) -> Result<(), OutlineEntry> {
+    let Some(target_name) = scope_chain.first() else {
+        return Err(entry);
+    };
+    let Some(target_index) = scope_index.first_match(entries, target_name) else {
+        return Err(entry);
+    };
+
+    let existing = &mut entries[target_index];
+    let child_index = &mut scope_index.children[target_index];
+    if scope_chain.len() == 1 {
+        push_indexed_entry(&mut existing.members, child_index, entry);
+        Ok(())
+    } else {
+        insert_at_scope_indexed(&mut existing.members, child_index, &scope_chain[1..], entry)
+    }
 }
 
 // ── Tree text formatting ──────────────────────────────────────────────
@@ -1129,6 +1173,272 @@ mod tests {
             exported,
             parent: parent.map(String::from),
         }
+    }
+
+    fn build_outline_tree_reference(symbols: &[Symbol]) -> Vec<OutlineEntry> {
+        let mut top_level = Vec::new();
+        let mut children = Vec::new();
+
+        for sym in symbols {
+            if sym.parent.is_none() {
+                top_level.push(symbol_to_entry(sym));
+            } else {
+                children.push(sym);
+            }
+        }
+
+        for child in children {
+            let entry = symbol_to_entry(child);
+            let scope = &child.scope_chain;
+            if scope.is_empty() {
+                top_level.push(entry);
+                continue;
+            }
+            if !insert_at_scope_reference(&mut top_level, scope, entry.clone()) {
+                let parent_scope = child.parent.as_ref().map(std::slice::from_ref);
+                if !parent_scope.is_some_and(|scope| {
+                    insert_at_scope_reference(&mut top_level, scope, entry.clone())
+                }) {
+                    top_level.push(entry);
+                }
+            }
+        }
+
+        top_level
+    }
+
+    // Frozen pre-index implementation used as the differential oracle.
+    fn insert_at_scope_reference(
+        entries: &mut Vec<OutlineEntry>,
+        scope_chain: &[String],
+        entry: OutlineEntry,
+    ) -> bool {
+        if scope_chain.is_empty() {
+            return false;
+        }
+
+        let target_name = &scope_chain[0];
+        for existing in entries {
+            if existing.name == *target_name {
+                if scope_chain.len() == 1 {
+                    existing.members.push(entry);
+                    return true;
+                }
+                return insert_at_scope_reference(&mut existing.members, &scope_chain[1..], entry);
+            }
+        }
+        false
+    }
+
+    fn assert_indexed_matches_reference(case: &str, symbols: &[Symbol]) -> Vec<OutlineEntry> {
+        let actual = build_outline_tree(symbols);
+        let expected = build_outline_tree_reference(symbols);
+        assert_eq!(
+            serde_json::to_vec(&actual).expect("serialize indexed outline"),
+            serde_json::to_vec(&expected).expect("serialize reference outline"),
+            "indexed outline diverged for {case}"
+        );
+        actual
+    }
+
+    fn parsed_symbols(extension: &str, source: &str) -> Vec<Symbol> {
+        use crate::parser::FileParser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("fixture.{extension}"));
+        std::fs::write(&path, source).expect("write parser fixture");
+        FileParser::new()
+            .extract_symbols(&path)
+            .expect("extract fixture symbols")
+    }
+
+    #[test]
+    fn indexed_outline_matches_reference_for_first_match_and_insertion_order() {
+        let mut symbols = vec![make_symbol(
+            "Duplicate",
+            SymbolKind::Class,
+            None,
+            vec![],
+            false,
+        )];
+        for index in 0..OUTLINE_SCOPE_INDEX_THRESHOLD {
+            symbols.push(make_symbol(
+                &format!("Filler{index}"),
+                SymbolKind::Class,
+                None,
+                vec![],
+                false,
+            ));
+        }
+        symbols.extend([
+            make_symbol("Duplicate", SymbolKind::Class, None, vec![], true),
+            make_symbol(
+                "firstChild",
+                SymbolKind::Method,
+                Some("Duplicate"),
+                vec!["Duplicate"],
+                false,
+            ),
+            make_symbol(
+                "secondChild",
+                SymbolKind::Method,
+                Some("Duplicate"),
+                vec!["Duplicate"],
+                false,
+            ),
+        ]);
+
+        let tree = assert_indexed_matches_reference("duplicate siblings", &symbols);
+        let duplicates = tree
+            .iter()
+            .filter(|entry| entry.name == "Duplicate")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            duplicates[0]
+                .members
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["firstChild", "secondChild"]
+        );
+        assert!(
+            duplicates[1].members.is_empty(),
+            "second duplicate stays unused"
+        );
+    }
+
+    #[test]
+    fn indexed_outline_matches_reference_for_dynamic_deep_parents() {
+        let symbols = vec![
+            make_symbol("Outer", SymbolKind::Class, None, vec![], false),
+            // The parent does not exist yet, so established ordering semantics
+            // promote this entry and never reparent it later.
+            make_symbol(
+                "earlyLeaf",
+                SymbolKind::Method,
+                Some("Inner"),
+                vec!["Outer", "Inner"],
+                false,
+            ),
+            make_symbol(
+                "Inner",
+                SymbolKind::Class,
+                Some("Outer"),
+                vec!["Outer"],
+                false,
+            ),
+            make_symbol(
+                "lateLeaf",
+                SymbolKind::Method,
+                Some("Inner"),
+                vec!["Outer", "Inner"],
+                false,
+            ),
+            make_symbol(
+                "Deep",
+                SymbolKind::Class,
+                Some("Inner"),
+                vec!["Outer", "Inner"],
+                false,
+            ),
+            make_symbol(
+                "deepLeaf",
+                SymbolKind::Method,
+                Some("Deep"),
+                vec!["Outer", "Inner", "Deep"],
+                false,
+            ),
+        ];
+
+        let tree = assert_indexed_matches_reference("deep dynamic parents", &symbols);
+        assert_eq!(tree[1].name, "earlyLeaf");
+        let inner = &tree[0].members[0];
+        assert_eq!(inner.name, "Inner");
+        assert_eq!(inner.members[0].name, "lateLeaf");
+        assert_eq!(inner.members[1].members[0].name, "deepLeaf");
+    }
+
+    #[test]
+    fn indexed_outline_matches_reference_for_fallbacks_and_orphans() {
+        let symbols = vec![
+            make_symbol("Widget", SymbolKind::Struct, None, vec![], true),
+            make_symbol(
+                "fmt",
+                SymbolKind::Method,
+                Some("Widget"),
+                vec!["Display for Widget"],
+                true,
+            ),
+            make_symbol(
+                "Orphan",
+                SymbolKind::Class,
+                Some("Missing"),
+                vec!["Missing"],
+                false,
+            ),
+            make_symbol(
+                "adoptedLater",
+                SymbolKind::Method,
+                Some("Orphan"),
+                vec!["Orphan"],
+                false,
+            ),
+        ];
+
+        let tree = assert_indexed_matches_reference("fallback and orphan ladder", &symbols);
+        assert_eq!(tree[0].members[0].name, "fmt");
+        assert_eq!(tree[1].name, "Orphan");
+        assert_eq!(tree[1].members[0].name, "adoptedLater");
+    }
+
+    #[test]
+    fn indexed_outline_matches_reference_at_scale() {
+        const PARENTS: usize = 2_048;
+        let mut symbols = Vec::with_capacity(PARENTS * 2);
+        for index in 0..PARENTS {
+            symbols.push(make_symbol(
+                &format!("Container{index:04}"),
+                SymbolKind::Class,
+                None,
+                vec![],
+                true,
+            ));
+        }
+        for index in 0..PARENTS {
+            let parent = format!("Container{index:04}");
+            symbols.push(make_symbol(
+                &format!("method{index:04}"),
+                SymbolKind::Method,
+                Some(&parent),
+                vec![&parent],
+                false,
+            ));
+        }
+
+        assert_indexed_matches_reference("one child per parent at scale", &symbols);
+    }
+
+    #[test]
+    fn indexed_outline_matches_reference_for_typescript_and_python() {
+        let typescript = parsed_symbols(
+            "ts",
+            "class Outer {\n  method(): void {}\n  classField = 1;\n}\n",
+        );
+        assert!(
+            typescript.iter().any(|symbol| symbol.parent.is_some()),
+            "TypeScript fixture must exercise child insertion"
+        );
+        assert_indexed_matches_reference("TypeScript parser output", &typescript);
+
+        let python = parsed_symbols(
+            "py",
+            "class Outer:\n    class Inner:\n        def leaf(self):\n            pass\n\n    def outer(self):\n        pass\n",
+        );
+        assert!(
+            python.iter().any(|symbol| symbol.parent.is_some()),
+            "Python fixture must exercise child insertion"
+        );
+        assert_indexed_matches_reference("Python parser output", &python);
     }
 
     #[test]
