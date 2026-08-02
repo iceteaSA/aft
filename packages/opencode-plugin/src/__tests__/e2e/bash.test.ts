@@ -1,7 +1,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
@@ -344,6 +344,8 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const h = await harness({ experimental_bash_rewrite: true });
     await mkdir(h.path("src"));
     await writeFile(h.path("src", "lib.ts"), "needle\nhaystack\n", "utf8");
+    const old = new Date(Date.now() - 61_000);
+    await utimes(h.path("src"), old, old);
 
     const response = await h.bridge.send("bash", {
       command: `grep -r needle ${h.path("src")}`,

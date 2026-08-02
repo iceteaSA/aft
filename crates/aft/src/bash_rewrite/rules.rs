@@ -1,6 +1,9 @@
 use serde_json::{json, Value};
+use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+const GREP_FOOTER_FRESHNESS_WINDOW: Duration = Duration::from_secs(60);
 
 use crate::bash_rewrite::footer::{add_footer, add_grep_footer};
 use crate::bash_rewrite::parser::parse;
@@ -32,9 +35,14 @@ impl RewriteRule for GrepRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = grep_request(command, "grep").ok_or("not a grep rewrite")?;
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         try_call_and_grep_footer(
             crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
             ctx,
+            path.as_deref(),
         )
     }
 }
@@ -55,9 +63,14 @@ impl RewriteRule for RgRule {
         ctx: &AppContext,
     ) -> Result<Response, String> {
         let params = grep_request(command, "rg").ok_or("not an rg rewrite")?;
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         try_call_and_grep_footer(
             crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
             ctx,
+            path.as_deref(),
         )
     }
 }
@@ -204,13 +217,60 @@ fn try_call_and_footer(response: Response, replacement_tool: &str) -> Result<Res
 
 /// Grep/rg variant: same decline handling, but the footer is the enforced
 /// code-search redirect, steering to `aft_search` when it's registered.
-fn try_call_and_grep_footer(response: Response, ctx: &AppContext) -> Result<Response, String> {
+fn try_call_and_grep_footer(
+    response: Response,
+    ctx: &AppContext,
+    path: Option<&str>,
+) -> Result<Response, String> {
     if let Some(err) = declined_error(&response, "grep") {
         return Err(err);
     }
     let output = response_output(&response.data);
-    let footered = add_grep_footer(&output, ctx.config().aft_search_registered);
+    let footered = if should_suppress_grep_footer(path, &grep_project_root(ctx)) {
+        output
+    } else {
+        add_grep_footer(&output, ctx.config().aft_search_registered)
+    };
     Ok(apply_footer(response, footered))
+}
+
+fn grep_project_root(ctx: &AppContext) -> std::path::PathBuf {
+    let configured = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    std::fs::canonicalize(&configured).unwrap_or(configured)
+}
+
+fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let target = Path::new(path);
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        project_root.join(target)
+    };
+    let Ok(target) = std::fs::canonicalize(target) else {
+        return false;
+    };
+    if !target.starts_with(project_root) {
+        return true;
+    }
+    let Ok(metadata) = std::fs::metadata(&target) else {
+        return false;
+    };
+    if metadata.is_file() {
+        return true;
+    }
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age < GREP_FOOTER_FRESHNESS_WINDOW)
 }
 
 fn declined_error(response: &Response, replacement_tool: &str) -> Option<String> {
@@ -502,9 +562,84 @@ fn ls_request(command: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
     use serde_json::json;
 
-    use super::find_request;
+    use super::{find_request, should_suppress_grep_footer};
+
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/app.ts"), "foo\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn single_named_file_suppresses_grep_footer() {
+        let dir = fixture();
+        assert!(should_suppress_grep_footer(Some("src/app.ts"), dir.path()));
+    }
+
+    #[test]
+    fn directory_path_keeps_grep_footer() {
+        let dir = fixture();
+        filetime::set_file_mtime(
+            dir.path().join("src"),
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
+        )
+        .unwrap();
+        assert!(!should_suppress_grep_footer(Some("src"), dir.path()));
+    }
+
+    #[test]
+    fn no_path_keeps_grep_footer() {
+        let dir = fixture();
+        assert!(!should_suppress_grep_footer(None, dir.path()));
+    }
+
+    #[test]
+    fn external_file_suppresses_grep_footer() {
+        let dir = fixture();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        assert!(should_suppress_grep_footer(
+            external.path().to_str(),
+            dir.path()
+        ));
+    }
+
+    #[test]
+    fn freshly_modified_file_suppresses_grep_footer() {
+        let dir = fixture();
+        let file = dir.path().join("src/app.ts");
+        fs::write(&file, "foo\nbar\n").unwrap();
+        assert!(should_suppress_grep_footer(file.to_str(), dir.path()));
+    }
+
+    #[test]
+    fn old_directory_inside_project_root_keeps_grep_footer() {
+        let dir = fixture();
+        let directory = dir.path().join("src");
+        filetime::set_file_mtime(
+            &directory,
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
+        )
+        .unwrap();
+        assert!(!should_suppress_grep_footer(Some("src"), dir.path()));
+    }
+
+    #[test]
+    fn old_file_inside_project_root_suppresses_grep_footer() {
+        let dir = fixture();
+        let file = dir.path().join("src/app.ts");
+        filetime::set_file_mtime(
+            &file,
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
+        )
+        .unwrap();
+        assert!(should_suppress_grep_footer(Some("src/app.ts"), dir.path()));
+    }
 
     #[test]
     fn find_absolute_path_uses_glob_path_arg() {

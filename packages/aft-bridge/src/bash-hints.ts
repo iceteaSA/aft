@@ -1,7 +1,8 @@
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-// Pure helpers for the bash-output hint nudges appended to bash tool results.
+// Helpers for the bash-output hint nudges appended to bash tool results.
 //
 // Shared across harnesses (OpenCode applies it in `tool.execute.after`; Pi
 // applies it inside its hoisted bash tool). Returns the new output string (or
@@ -18,6 +19,7 @@ const GREP_SEARCH_GREP_HINT =
   "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `grep` tool instead (indexed and ranked).";
 
 const GREP_SEARCH_HINT_PREFIX = "DO NOT search code by running grep/rg in bash —";
+const GREP_SEARCH_FRESHNESS_WINDOW_MS = 60_000;
 
 type Quote = "none" | "single" | "double";
 
@@ -133,11 +135,16 @@ function shouldSuppressGrepSearchHint(command: string, projectRoot: string | und
     const operands = collectPathOperands(firstStage, firstToken.end);
     // No path operands → grep reads stdin or searches the (in-project) cwd.
     if (operands.length === 0) return false;
+    let sawInProjectOperand = false;
     for (const operand of operands) {
       if (isDynamicPathOperand(operand)) continue;
-      if (isPathInsideProject(resolvedRoot, effectiveCwd, operand)) return false;
+      const resolvedOperand = resolvePathOperand(effectiveCwd, operand);
+      if (!isPathInsideProject(resolvedRoot, effectiveCwd, operand)) continue;
+      sawInProjectOperand = true;
+      if (shouldSuppressResolvedPath(resolvedOperand)) return true;
     }
     // All operands resolve outside the project → this grep is external.
+    if (sawInProjectOperand) return false;
   }
 
   return sawCodeSearchStatement;
@@ -253,6 +260,17 @@ function isPathInsideProject(resolvedRoot: string, baseCwd: string, operand: str
   const resolved = resolvePathOperand(baseCwd, operand);
   const rel = path.relative(resolvedRoot, resolved);
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function shouldSuppressResolvedPath(resolved: string): boolean {
+  try {
+    const stats = fs.statSync(resolved);
+    if (stats.isFile()) return true;
+    const ageMs = Date.now() - stats.mtimeMs;
+    return ageMs >= 0 && ageMs < GREP_SEARCH_FRESHNESS_WINDOW_MS;
+  } catch {
+    return false;
+  }
 }
 
 /**

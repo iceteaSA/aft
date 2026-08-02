@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   commandInvokesCodeSearch,
   maybeAppendConflictsHint,
@@ -231,6 +234,78 @@ describe("maybeAppendGrepSearchHint", () => {
     expect(maybeAppendGrepSearchHint(output, "grep x src/file.ts", true, "   ")).toBe(
       `${output}\n\n${AFT_SEARCH_HINT}`,
     );
+  });
+
+  test("suppresses a piped grep targeting an in-project file", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
+    try {
+      fs.mkdirSync(path.join(root, "src"));
+      const file = path.join(root, "src/app.ts");
+      fs.writeFileSync(file, "foo\n");
+      const old = new Date(Date.now() - 61_000);
+      fs.utimesSync(file, old, old);
+      expect(maybeAppendGrepSearchHint("hit", "grep -n foo src/app.ts | head -5", true, root)).toBe(
+        "hit",
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the lecture for a piped old in-project directory search", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
+    try {
+      const src = path.join(root, "src");
+      fs.mkdirSync(src);
+      fs.writeFileSync(path.join(src, "app.ts"), "foo\n");
+      const old = new Date(Date.now() - 61_000);
+      fs.utimesSync(src, old, old);
+      expect(maybeAppendGrepSearchHint("hit", "grep -n foo src | head -5", true, root)).toContain(
+        AFT_SEARCH_HINT,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("suppresses a piped grep targeting a fresh in-project file", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
+    try {
+      fs.mkdirSync(path.join(root, "src"));
+      fs.writeFileSync(path.join(root, "src/app.ts"), "foo\n");
+      expect(maybeAppendGrepSearchHint("hit", "grep -n foo src/app.ts | head -5", true, root)).toBe(
+        "hit",
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the lecture for a piped grep targeting a nonexistent path", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
+    try {
+      expect(
+        maybeAppendGrepSearchHint("hit", "grep -n foo src/missing.ts | head -5", true, root),
+      ).toContain(AFT_SEARCH_HINT);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("suppresses a multi-operand grep when any operand is an existing file", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
+    try {
+      const src = path.join(root, "src");
+      fs.mkdirSync(src);
+      fs.writeFileSync(path.join(src, "app.ts"), "foo\n");
+      const old = new Date(Date.now() - 61_000);
+      fs.utimesSync(src, old, old);
+      expect(
+        maybeAppendGrepSearchHint("hit", "grep -n foo src/app.ts src/ | head -5", true, root),
+      ).toBe("hit");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

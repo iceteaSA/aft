@@ -9,7 +9,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, realpath, writeFile } from "node:fs/promises";
+import { mkdir, realpath, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
 import { withEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
@@ -306,6 +306,8 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     const h = await harness({ rewrite: true });
     await mkdir(h.path("src"));
     await writeFile(h.path("src", "lib.ts"), "needle\nhaystack\n", "utf8");
+    const old = new Date(Date.now() - 61_000);
+    await utimes(h.path("src"), old, old);
 
     const response = await h.bridge.send("bash", {
       command: `grep -r needle ${h.path("src")}`,

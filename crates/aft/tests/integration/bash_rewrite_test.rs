@@ -11,6 +11,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use aft::bash_rewrite::{parser, try_rewrite};
 use aft::commands::edit_match::handle_edit_match;
@@ -104,6 +105,11 @@ fn rewrites_grep_and_rejects_pipes() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn Needle() {}\n").unwrap();
+    filetime::set_file_mtime(
+        dir.path().join("src"),
+        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
+    )
+    .unwrap();
     let ctx = context(dir.path(), true);
 
     let data = rewrite(
@@ -127,6 +133,16 @@ fn grep_footer_steers_to_aft_search_when_registered() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn needle() {}\n").unwrap();
+    filetime::set_file_mtime(
+        dir.path(),
+        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
+    )
+    .unwrap();
+    filetime::set_file_mtime(
+        dir.path().join("src"),
+        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
+    )
+    .unwrap();
     let target = format!("grep -ni needle {}", dir.path().join("src").display());
 
     // Registered → footer names `aft_search`, not the grep tool.
@@ -158,6 +174,11 @@ fn grep_rewrite_rejects_oversized_regex_programs() {
 fn rewrites_rg_and_rejects_chains() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("notes.txt"), "alpha beta\n").unwrap();
+    filetime::set_file_mtime(
+        dir.path(),
+        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
+    )
+    .unwrap();
     let ctx = context(dir.path(), true);
 
     let data =
