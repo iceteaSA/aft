@@ -21,13 +21,17 @@
  * declares for `ToolContext["ask"]`.
  */
 import { describe, expect, test } from "bun:test";
+import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import {
   askEditPermission,
   askGlobPermission,
   askGrepPermission,
+  permissionPath,
   runAsk,
 } from "../tools/permissions.js";
+import { hoistedTools } from "../tools/hoisted.js";
+import type { PluginContext } from "../types.js";
 
 describe("runAsk + Promise", () => {
   test("a resolving Promise body actually runs through runAsk (allow path)", async () => {
@@ -88,6 +92,105 @@ describe("runAsk + Promise", () => {
     });
     await askEditPermission(ctx, ["src/foo.ts"]);
     expect(askWasInvoked).toBe(true);
+  });
+});
+
+describe("hoisted write permission patterns", () => {
+  test("passes an absolute outside-root path to askEditPermission", async () => {
+    let observed: { patterns?: string[] } = {};
+    const bridge = {
+      toolCall: async (
+        _sessionID: string | undefined,
+        _name: string,
+        _args: Record<string, unknown>,
+        options?: { preview?: boolean },
+      ) =>
+        options?.preview === true
+          ? { success: true, preview: true, preview_diff: "" }
+          : { success: true, text: "Created new file." },
+    };
+    const pluginContext = {
+      pool: { getBridge: () => bridge } as unknown as BridgePool,
+      client: {},
+      config: {},
+      storageDir: process.cwd(),
+    } as unknown as PluginContext;
+    const context = {
+      ...makeMockContext(async (input) => {
+        observed = input as typeof observed;
+      }),
+      sessionID: "outside-root-write-permission-test",
+      directory: process.cwd(),
+      worktree: process.cwd(),
+    };
+
+    await hoistedTools(pluginContext).write.execute(
+      { path: "/tmp/x", content: "content\n" },
+      context,
+    );
+
+    expect(observed.patterns).toEqual(["/tmp/x"]);
+  });
+
+  test("uses apply_patch absolute affected paths for outside-root permission asks", async () => {
+    let observed: { patterns?: string[] } = {};
+    const bridge = {
+      toolCall: async (
+        _sessionID: string | undefined,
+        _name: string,
+        _args: Record<string, unknown>,
+        options?: { preview?: boolean },
+      ) =>
+        options?.preview === true
+          ? {
+              success: true,
+              preview: true,
+              preview_diff: "",
+              affected_paths: ["/tmp/report.md"],
+              affected_rel_paths: ["../../../../tmp/report.md"],
+            }
+          : { success: true, text: "Applied patch." },
+    };
+    const pluginContext = {
+      pool: { getBridge: () => bridge } as unknown as BridgePool,
+      client: {},
+      config: {},
+      storageDir: process.cwd(),
+    } as unknown as PluginContext;
+    const context = {
+      ...makeMockContext(async (input) => {
+        observed = input as typeof observed;
+      }),
+      sessionID: "outside-root-apply-patch-permission-test",
+      directory: process.cwd(),
+      worktree: process.cwd(),
+    };
+
+    await hoistedTools(pluginContext).apply_patch.execute(
+      { patchText: "*** Begin Patch\n*** End Patch" },
+      context,
+    );
+
+    expect(observed.patterns).toEqual(["/tmp/report.md"]);
+  });
+});
+
+describe("permissionPath", () => {
+  test("keeps in-project paths relative and root worktrees absolute", () => {
+    const projectContext = {
+      ...makeMockContext(async () => {}),
+      directory: "/workspace/project",
+      worktree: "/workspace/project",
+    };
+    const rootContext = {
+      ...makeMockContext(async () => {}),
+      directory: "/",
+      worktree: "/",
+    };
+
+    expect(permissionPath(projectContext, "src/foo.ts")).toBe("src/foo.ts");
+    expect(permissionPath(projectContext, "/tmp/x")).toBe("/tmp/x");
+    expect(permissionPath(rootContext, "/tmp/x")).toBe("/tmp/x");
   });
 });
 

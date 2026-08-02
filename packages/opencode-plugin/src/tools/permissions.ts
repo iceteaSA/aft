@@ -83,15 +83,33 @@ export function resolveAbsolutePath(context: ToolContext, target: string): strin
   return path.isAbsolute(expanded) ? expanded : path.resolve(projectRootFor(context), expanded);
 }
 
+export function permissionPath(context: ToolContext, target: string): string {
+  const projectRoot = path.resolve(projectRootFor(context));
+  const absolutePath = path.resolve(resolveAbsolutePath(context, target));
+  if (projectRoot === path.parse(projectRoot).root) return absolutePath;
+
+  const relativePath = path.relative(projectRoot, absolutePath);
+  if (
+    relativePath !== "" &&
+    relativePath !== ".." &&
+    !relativePath.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relativePath)
+  ) {
+    return relativePath;
+  }
+
+  return relativePath === "" ? "." : absolutePath;
+}
+
 export function resolveRelativePattern(context: ToolContext, target: string): string {
-  return path.relative(projectRootFor(context), resolveAbsolutePath(context, target)) || ".";
+  return permissionPath(context, target);
 }
 
 export function resolveRelativePatternFromAbsolute(
   context: ToolContext,
   absolutePath: string,
 ): string {
-  return path.relative(projectRootFor(context), absolutePath) || ".";
+  return permissionPath(context, absolutePath);
 }
 
 export function resolveRelativePatterns(context: ToolContext, targets: string[]): string[] {

@@ -29,6 +29,7 @@ import { createBashWriteTool } from "./bash_write.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
+  permissionPath,
   permissionDeniedResponse,
   runAsk,
 } from "./permissions.js";
@@ -472,7 +473,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       const filePath = resolvePathFromProjectRoot(projectRoot, file);
       persistFilePathAlias(argsRecord, context);
 
-      const relPath = path.relative(projectRoot, filePath);
+      const permissionPattern = permissionPath(context, filePath);
 
       // External-directory check first (mirrors opencode-native write.ts:43).
       {
@@ -487,7 +488,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         throw toolErrorFromResponse("write", preview);
       }
 
-      const denial = await askEditPermission(context, [relPath], {
+      const denial = await askEditPermission(context, [permissionPattern], {
         filepath: filePath,
         diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
       });
@@ -675,7 +676,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       const filePath = resolvePathFromProjectRoot(projectRoot, file);
       persistFilePathAlias(argsRecord, context);
 
-      const relPath = path.relative(projectRoot, filePath);
+      const permissionPattern = permissionPath(context, filePath);
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
@@ -693,7 +694,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         throw toolErrorFromResponse("edit", preview);
       }
 
-      const denial = await askEditPermission(context, [relPath], {
+      const denial = await askEditPermission(context, [permissionPattern], {
         filepath: filePath,
         diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
       });
@@ -852,9 +853,16 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       }
 
       const affectedRelPaths = stringArray(preview.affected_rel_paths);
-      const denial = await askEditPermission(context, affectedRelPaths, {
+      const affectedPaths = stringArray(preview.affected_paths);
+      const permissionPatterns = (
+        affectedPaths.length > 0 ? affectedPaths : affectedRelPaths
+      ).map((filePath) => permissionPath(context, filePath));
+      const denial = await askEditPermission(context, permissionPatterns, {
         diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
-        filepath: typeof preview.filepath === "string" ? preview.filepath : affectedRelPaths[0],
+        filepath:
+          typeof preview.filepath === "string"
+            ? preview.filepath
+            : affectedPaths[0] ?? affectedRelPaths[0],
       });
       if (denial) return permissionDeniedResponse(denial);
 
