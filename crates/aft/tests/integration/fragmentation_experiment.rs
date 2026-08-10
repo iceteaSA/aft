@@ -367,6 +367,14 @@ fn assert_workload_preconditions(peak_threads: u64, end: &Marker) {
          impossible and this run measures something other than aft"
     );
 
+    // Skipped when the arena count is capped by configuration: there, a low
+    // arena count is the TREATMENT, not evidence the workload failed to run.
+    // Asserting it unconditionally would fail the one arm that manipulates the
+    // variable directly — which is what the first version of this gate did.
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+
     let arenas = end
         .malloc_info
         .as_ref()
