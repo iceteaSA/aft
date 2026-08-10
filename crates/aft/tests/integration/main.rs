@@ -74,6 +74,7 @@ mod lsp_hints_test;
 mod lsp_inspect_test;
 mod lsp_manager_test;
 mod lsp_rename_test;
+mod malloc_info_probe;
 mod markdown_test;
 mod migrate_storage_test;
 mod move_file_test;
