@@ -69,7 +69,7 @@ struct SyntheticRawWatcher(
 );
 
 #[derive(Clone, Debug)]
-struct StormScale {
+pub(super) struct StormScale {
     roots: usize,
     sessions_per_root: usize,
     storm_for: Duration,
@@ -123,7 +123,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 impl StormScale {
-    fn from_env() -> Self {
+    pub(super) fn from_env() -> Self {
         let mut scale = Self {
             roots: 4,
             sessions_per_root: 2,
@@ -285,7 +285,7 @@ fn handle_embedding_request(mut stream: std::net::TcpStream, delay: Duration) {
         .expect("write embedding response");
 }
 
-fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+pub(super) fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => {
             if let Some(delay) = configure_sleep_delay(&req) {
@@ -1278,7 +1278,7 @@ async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
     send_goodbye_and_wait(&tx).await;
 }
 
-async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
+pub(super) async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
     let delay_ms = std::env::var("AFT_STORM_EMBED_DELAY_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())

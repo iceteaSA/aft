@@ -50,9 +50,12 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::malloc_info_probe::{self, MallocInfoSnapshot};
+use crate::subc_bridge_test;
 
 /// Which arm this process is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +191,7 @@ fn parse_kb(value: &str) -> u64 {
 }
 
 /// Render the start/end pair as the report the experiment consumes.
-fn render_report(arm: &str, start: &Marker, end: &Marker) -> String {
+fn render_report(arm: &str, start: &Marker, end: &Marker, peak_threads: u64) -> String {
     let mut out = String::new();
     out.push_str(&format!("# fragmentation experiment — arm {arm}\n\n"));
     out.push_str(ARM_C_ABSENCE_HEADER);
@@ -201,8 +204,11 @@ fn render_report(arm: &str, start: &Marker, end: &Marker) -> String {
         std::env::var("AFT_INSPECT_POOL_THREADS").unwrap_or_else(|_| "unset".into())
     ));
     out.push_str(&format!(
-        "malloc_arena_max_env = {}\n\n",
+        "malloc_arena_max_env = {}\n",
         std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "unset".into())
+    ));
+    out.push_str(&format!(
+        "peak_threads_during_workload = {peak_threads}\n\n"
     ));
 
     out.push_str("## process\n\n");
@@ -296,6 +302,101 @@ fn report_path(arm: &str) -> PathBuf {
     Path::new(&dir).join(format!("arm-{arm}.md"))
 }
 
+/// Peak thread count observed while the workload ran.
+///
+/// Sampled rather than read at the end, because the harness tears its runtime
+/// down before control returns and an end-of-run reading shows the process at
+/// rest — precisely the reading that let run 1's empty arms pass unnoticed.
+struct ThreadPeakSampler {
+    peak: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ThreadPeakSampler {
+    fn start() -> Self {
+        let peak = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler_peak = Arc::clone(&peak);
+        let sampler_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !sampler_stop.load(Ordering::Relaxed) {
+                let (_, _, threads) = read_status();
+                sampler_peak.fetch_max(threads, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Self {
+            peak,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+/// Below this, threads cannot contend enough for glibc to split arenas. A bare
+/// test binary sits at 2, which is what run 1 measured.
+const MIN_PEAK_THREADS: u64 = 8;
+
+/// The main arena plus at least one per-thread arena.
+const MIN_ARENAS: usize = 2;
+
+/// Structural preconditions for the mechanism under investigation.
+///
+/// Run 1 produced three arms of plausible-looking deltas from a workload that
+/// never touched aft: 2 threads and 2 arenas in every arm, so arena
+/// multiplication was structurally impossible and A-vs-D compared two identical
+/// code paths. The number saying so was printed at the top of every report and
+/// read past three times. A gate cannot read past it.
+fn assert_workload_preconditions(peak_threads: u64, end: &Marker) {
+    // glibc allocates arenas per CONTENDING thread. A process that never gets
+    // concurrent threads cannot exhibit the mechanism, so whatever it measures
+    // is not the thing under investigation.
+    assert!(
+        peak_threads >= MIN_PEAK_THREADS,
+        "workload arm peaked at {peak_threads} threads (need >= {MIN_PEAK_THREADS}): \
+         the daemon workload did not start, so arena multiplication is structurally \
+         impossible and this run measures something other than aft"
+    );
+
+    let arenas = end
+        .malloc_info
+        .as_ref()
+        .map(|info| info.arena_count())
+        .unwrap_or(0);
+    assert!(
+        arenas > MIN_ARENAS,
+        "workload arm ended with {arenas} arenas (need > {MIN_ARENAS}): \
+         the allocator never created per-thread arenas, so there is no arena \
+         distribution to measure"
+    );
+}
+
+/// Drive real aft: fake daemon, real `AppContext`s, real route binds, real tool
+/// traffic and watcher churn across N roots.
+///
+/// This is the storm harness the design named. Run 1 substituted a
+/// self-contained `Vec<u8>` loop for it, which is why every arm reported 2
+/// threads and 2 arenas.
+fn drive_real_aft_workload() {
+    let scale = crate::subc_storm_test::StormScale::from_env();
+    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+        "fragmentation_experiment_workload",
+        workload_duration() + Duration::from_secs(120),
+        move |input| crate::subc_storm_test::drive_storm_daemon(input, scale),
+        |_, _, _| {},
+        crate::subc_storm_test::storm_dispatch,
+    );
+}
+
 /// The experiment. Skips unless `AFT_FRAG_ARM` selects an arm, so it stays
 /// inert in the normal test suite and only runs when driven deliberately.
 #[test]
@@ -316,26 +417,34 @@ fn fragmentation_arm() {
     }
 
     let start = Marker::take();
+    let sampler = ThreadPeakSampler::start();
 
     match arm {
         Arm::Scaffolding => {
             // Arm 0 deliberately does no work. It measures what the harness
             // itself allocates over the same wall-clock window, which is the
             // number that decides whether the in-process deltas of the other
-            // arms are trustworthy.
+            // arms are trustworthy. Its preconditions are the INVERSE of a
+            // workload arm's, so it is not gated below.
             std::thread::sleep(workload_duration());
         }
-        Arm::Stock => drive_churn_workload(),
+        Arm::Stock => drive_real_aft_workload(),
     }
 
+    let peak_threads = sampler.finish();
     let end = Marker::take();
 
-    let report = render_report(&label, &start, &end);
+    let report = render_report(&label, &start, &end, peak_threads);
     let path = report_path(&label);
     std::fs::write(&path, &report).expect("write experiment report");
-
     eprintln!("{report}");
     eprintln!("report written to {}", path.display());
+
+    // After writing the report, so a failed gate still leaves the evidence that
+    // explains why it failed.
+    if arm == Arm::Stock {
+        assert_workload_preconditions(peak_threads, &end);
+    }
 }
 
 fn workload_duration() -> Duration {
@@ -345,55 +454,6 @@ fn workload_duration() -> Duration {
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(120),
     )
-}
-
-/// Drive allocation churn of the shape the production hoard tracks.
-///
-/// Deliberately NOT idle: the live series showed the hoard grows with churn and
-/// plateaus across idle hours, so a sleeping process reproduces nothing. The
-/// shape that matters is many large, long-lived, differently-sized buffers
-/// arriving and departing on independent schedules — which is what per-root
-/// artifacts do under bind, watcher churn, and eviction.
-fn drive_churn_workload() {
-    let deadline = Instant::now() + workload_duration();
-    let mut retained: Vec<Vec<u8>> = Vec::new();
-    let mut round = 0usize;
-
-    while Instant::now() < deadline {
-        round += 1;
-
-        // Sizes spanning KBs to hundreds of MB, mirroring the artifact mix
-        // (symbol caches through search-index postings blobs).
-        let size = match round % 6 {
-            0 => 4 * 1024,
-            1 => 64 * 1024,
-            2 => 1024 * 1024,
-            3 => 8 * 1024 * 1024,
-            4 => 32 * 1024 * 1024,
-            _ => 512 * 1024,
-        };
-
-        let mut buffer = vec![0u8; size];
-        // Touch every page: an untouched allocation is reserved, not committed,
-        // and reserved space is exactly what misled the first reading of this
-        // problem.
-        for page in buffer.chunks_mut(4096) {
-            page[0] = round as u8;
-        }
-        retained.push(buffer);
-
-        // Release out of order and on a different cadence from allocation, so
-        // free chunks land beneath live ones rather than at the top of a heap.
-        // Freeing in LIFO order would let malloc_trim reclaim everything and
-        // would not reproduce the pinning.
-        if retained.len() > 24 {
-            let victim = (round * 7) % retained.len();
-            retained.swap_remove(victim);
-        }
-    }
-
-    // Keep the retained set alive to the end of the measurement window.
-    std::hint::black_box(&retained);
 }
 
 #[cfg(test)]
@@ -454,7 +514,7 @@ mod tests {
             large_anon_swap_kb: 0,
         };
 
-        let report = render_report("A", &marker(), &marker());
+        let report = render_report("A", &marker(), &marker(), 4);
 
         assert!(report.contains("# fragmentation experiment — arm A"));
         assert!(report.contains("malloc_info unavailable"));
@@ -475,7 +535,7 @@ mod tests {
             large_anon_swap_kb: 0,
         };
 
-        let report = render_report("D", &marker(), &marker());
+        let report = render_report("D", &marker(), &marker(), 4);
 
         assert!(report.contains("Arm C (decay-purging allocator) was NOT run"));
         assert!(report.contains("CANNOT say"));
