@@ -599,12 +599,15 @@ mod tests {
                 operations: vec![ManagementOperation {
                     name: operation.to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 }],
                 config_schema: Value::Null,
                 observability: Vec::new(),
                 identity_scope: Vec::new(),
+                concurrency: subc_protocol::manifest::Concurrency::default(),
             }],
             control_ops: Vec::new(),
+            capabilities: None,
         }
     }
 

@@ -48,3 +48,13 @@ debug = 1
 # entire aft process and takes down all tools. With "unwind", the
 # catch_unwind in configure.rs catches it and degrades gracefully.
 panic = "unwind"
+
+# Fork-local: build against the subconscious Phase-1 pin (86953f3) so the
+# decoder accepts daemon-origin envelope flag bit 6 before the daemon stamps
+# it, and so ManifestProvenance is available to declare. These versions are
+# not published to crates.io yet; drop this patch once they are.
+[patch.crates-io]
+subc-protocol = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-protocol" }
+subc-transport = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-transport" }
+subc-client-rs = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-client-rs" }
+subc-control = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-control" }
