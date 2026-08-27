@@ -6,6 +6,7 @@ use super::{
     StorageBinding, StorageKind, StorageScope, Tool, TrustTier, Value,
     MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
 };
+use subc_protocol::manifest::{BuildGitShaSource, ManifestProvenance};
 
 pub(super) fn is_bash_family_tool(name: &str) -> bool {
     name == "bash" || name == "powershell" || name.starts_with("bash_")
@@ -325,7 +326,35 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         }))
+        .provenance(build_provenance())
         .build()
+}
+
+/// AFT's build-verified provenance claim.
+///
+/// The SHA is declared absent with cause `NeverDerived`, and `build_lock_digest`
+/// stays `None`: this binary is compiled by hand from a working tree, and the
+/// honesty contract forbids minting a commit claim from ambient env at an
+/// arbitrary consumer compile. `NeverDerived` states that cause instead of
+/// leaving the reader to guess why the SHA is missing.
+///
+/// `wire_crate_version` is NOT a parameter: the constructor fills it from
+/// `SUBC_PROTOCOL_CRATE_VERSION`, so it always names subc-protocol's version
+/// (the decoder the census actually asks about) and never AFT's own. Passing
+/// our crate version there would score a conformant module as failing.
+///
+/// `store_schema_version` is a compile-time constant from AFT's own source, so
+/// it describes the binary rather than whatever tree sits beside it.
+///
+/// A form error yields no provenance block rather than aborting startup: the
+/// daemon renders a missing block as `declared_absent`, which is still true.
+fn build_provenance() -> Option<ManifestProvenance> {
+    subc_protocol::manifest::build_provenance_from_source(
+        BuildGitShaSource::NeverDerived,
+        None,
+        Some(&crate::db::CURRENT_SCHEMA_VERSION.to_string()),
+    )
+    .ok()
 }
 
 pub(super) fn control_ops() -> Option<Vec<String>> {
@@ -729,5 +758,78 @@ mod tests {
         assert_eq!(command_lane("hashline_preflight"), Lane::PureRead);
         assert_eq!(command_lane("bash_drain_completions"), Lane::PureRead);
         assert_eq!(command_lane("bash_ack_completions"), Lane::Mutating);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    /// The census discriminator is block-level: a manifest that carries the
+    /// block at all reads as Reported, one that omits it reads as
+    /// Unverifiable. Assert presence separately from field content so a
+    /// future field change cannot silently drop us back to Unverifiable.
+    #[test]
+    fn manifest_declares_a_provenance_block() {
+        assert!(
+            build_manifest().provenance.is_some(),
+            "manifest must carry a provenance block or the fleet census reads AFT as \
+             Unverifiable and escalates to the induced-disconnect probe"
+        );
+    }
+
+    /// `wire_crate_version` names SUBC-PROTOCOL's version, never AFT's own.
+    /// Two numbering spaces share one field name, and declaring the wrong one
+    /// scores a conformant module as failing. Phase 1 bumped subc-protocol to
+    /// 0.13.0, so this comparison IS the Phase-2 readiness gate.
+    #[test]
+    fn wire_crate_version_names_subc_protocol_not_aft() {
+        let provenance = build_manifest().provenance.expect("block present");
+        let wire = provenance.wire_crate_version.expect("wire version declared");
+
+        assert_ne!(
+            wire,
+            env!("CARGO_PKG_VERSION"),
+            "wire_crate_version must not be AFT's own crate version"
+        );
+
+        let (major, minor) = wire
+            .split_once('.')
+            .and_then(|(major, rest)| {
+                let minor = rest.split('.').next()?;
+                Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?))
+            })
+            .unwrap_or_else(|| panic!("unparseable wire_crate_version: {wire}"));
+
+        assert!(
+            (major, minor) >= (0, 13),
+            "wire_crate_version {wire} is below the 0.13.0 daemon-origin gate"
+        );
+    }
+
+    /// The honesty contract forbids minting a commit claim from a hand-built
+    /// worktree compile. Absence is the correct answer here, and the daemon
+    /// renders it as `declared_absent`.
+    #[test]
+    fn commit_identity_is_declared_absent_not_invented() {
+        let provenance = build_manifest().provenance.expect("block present");
+        assert_eq!(provenance.build_git_sha, None);
+        assert_eq!(provenance.build_lock_digest, None);
+        assert_eq!(
+            provenance.build_git_sha_absence_reason,
+            Some(subc_protocol::manifest::BuildGitShaAbsenceReason::NeverDerived),
+            "the absence must carry its cause, not be left for the reader to guess"
+        );
+    }
+
+    /// Compiled-in constant, so it describes the binary rather than whatever
+    /// source tree happens to sit beside it.
+    #[test]
+    fn store_schema_version_matches_the_compiled_constant() {
+        let provenance = build_manifest().provenance.expect("block present");
+        assert_eq!(
+            provenance.store_schema_version,
+            Some(crate::db::CURRENT_SCHEMA_VERSION.to_string())
+        );
     }
 }
