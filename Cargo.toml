@@ -54,7 +54,7 @@ panic = "unwind"
 # it, and so ManifestProvenance is available to declare. These versions are
 # not published to crates.io yet; drop this patch once they are.
 [patch.crates-io]
-subc-protocol = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-protocol" }
-subc-transport = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-transport" }
-subc-client-rs = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-client-rs" }
-subc-control = { path = "/home/icetea/worktrees/subc-pin-86953f3/crates/subc-control" }
+subc-protocol = { path = "/home/icetea/worktrees/subc-pin-5a9d02aa/crates/subc-protocol" }
+subc-transport = { path = "/home/icetea/worktrees/subc-pin-5a9d02aa/crates/subc-transport" }
+subc-client-rs = { path = "/home/icetea/worktrees/subc-pin-5a9d02aa/crates/subc-client-rs" }
+subc-control = { path = "/home/icetea/worktrees/subc-pin-5a9d02aa/crates/subc-control" }
