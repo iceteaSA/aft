@@ -3560,6 +3560,32 @@ mod tests {
         );
     }
 
+    /// Some models always send every optional field, so `path: ""` arrives on
+    /// question-mode calls that specify no file at all. An empty string must read
+    /// as absent: treating it as present trips the one-mode check and rejects a
+    /// valid question call. Upstream shipped this same fix for the shared tools
+    /// in #288 after it broke every search for those sessions; gather carries its
+    /// own argument reader, so it needs its own guard and its own test.
+    #[test]
+    fn gather_treats_an_empty_path_as_absent_in_question_mode() {
+        let translated = subc_translate_owned(
+            "gather",
+            serde_json::json!({
+                "question": "how does the executor admit writers",
+                "path": ""
+            }),
+            Path::new("/project"),
+        )
+        .expect("an empty optional 'path' must not trip the one-mode check");
+
+        assert_eq!(translated.command, "gather");
+        assert!(
+            translated.args.get("filePath").is_none(),
+            "an empty 'path' must not be written out as a resolved filePath: {:?}",
+            translated.args.get("filePath")
+        );
+    }
+
     #[test]
     fn gather_preserves_include_tests() {
         let translated = subc_translate_owned(
