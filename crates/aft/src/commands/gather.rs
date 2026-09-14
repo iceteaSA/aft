@@ -769,8 +769,14 @@ fn render_symbol_section(
     let lang = detect_language(&file_path);
     let kind_str = symbol_kind_string(&target_symbol.kind);
 
-    let rendered =
-        render_symbol_within_budget(target_symbol, &lines, lang, None, per_symbol_budget);
+    let rendered = render_symbol_within_budget(
+        target_symbol,
+        &lines,
+        lang,
+        None,
+        per_symbol_budget,
+        ctx.tool_enabled("aft_zoom"),
+    );
     let body = rendered.content.trim().to_string();
     if body.is_empty() {
         return Err(format!(
