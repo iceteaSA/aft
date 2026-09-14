@@ -21,12 +21,7 @@ import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
-const ALL_ONLY_TOOLS = [
-  "aft_callgraph",
-  "aft_gather_context",
-  "aft_delete",
-  "aft_move",
-] as const;
+const ALL_ONLY_TOOLS = ["aft_callgraph", "aft_gather_context", "aft_delete", "aft_move"] as const;
 const V2_BUILTIN_REPLACEMENTS = new Set(["read", "edit", "write", "apply_patch"]);
 
 export interface V2ToolEditor {

@@ -272,10 +272,12 @@ pub(super) fn build_manifest() -> ModuleManifest {
                     ManagementOperation {
                         name: crate::commands::health_digest::HEALTH_DIGEST_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
+                        description: None,
                     },
                     ManagementOperation {
                         name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
+                        description: None,
                     },
                 ],
                 config_schema: json!({
@@ -285,6 +287,13 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 }),
                 observability: Vec::new(),
                 identity_scope: Vec::new(),
+                // The fork's pinned subc-protocol carries a `concurrency` field
+                // that upstream's manifest predates. Its Default is pinned by
+                // history to `ModuleManaged`, which is the delivery every
+                // ManagementSurface received before the field existed, so
+                // taking the default reproduces upstream's wire shape exactly
+                // rather than silently re-declaring delivery semantics.
+                concurrency: Concurrency::default(),
             },
         ],
         consumes: Vec::new(),
