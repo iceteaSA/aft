@@ -700,6 +700,39 @@ mod tests {
         // `subc::readiness`); this is the only field readiness adds.
         let top = expected.as_object_mut().expect("manifest object");
         assert_eq!(top.insert("ready".to_string(), json!(false)), None);
+        // Fork additions (gather-context-pack), applied explicitly like the
+        // protocol differences above so any other drift still fails: the
+        // `gather` tool, declared right after `search`, and the provenance
+        // block. The provenance tests below pin each provenance field.
+        let tools = expected["provides"][0]["tools"]
+            .as_array_mut()
+            .expect("tool provider tools");
+        let after_search = tools
+            .iter()
+            .position(|tool| tool["name"] == json!("search"))
+            .expect("search in snapshot")
+            + 1;
+        tools.insert(
+            after_search,
+            json!({
+                "name": "gather",
+                "execution_mode": "pure",
+                "schema": "<embedded schema>",
+                "description": "<embedded description>",
+            }),
+        );
+        let top = expected.as_object_mut().expect("manifest object");
+        assert_eq!(
+            top.insert(
+                "provenance".to_string(),
+                json!({
+                    "build_git_sha_absence_reason": "never_derived",
+                    "wire_crate_version": subc_protocol::SUBC_PROTOCOL_CRATE_VERSION,
+                    "store_schema_version": crate::db::CURRENT_SCHEMA_VERSION.to_string(),
+                }),
+            ),
+            None
+        );
         assert_eq!(actual, expected);
     }
 
@@ -785,7 +818,9 @@ mod provenance_tests {
     #[test]
     fn wire_crate_version_names_subc_protocol_not_aft() {
         let provenance = build_manifest().provenance.expect("block present");
-        let wire = provenance.wire_crate_version.expect("wire version declared");
+        let wire = provenance
+            .wire_crate_version
+            .expect("wire version declared");
 
         assert_ne!(
             wire,
